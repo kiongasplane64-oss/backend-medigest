@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+pydantic
+python-jose
+passlib[bcrypt]
+python-dotenv
+# Pour génération PDF
+wkhtmltopdf==0.12.6  # Installation système requise
+weasyprint==61.0  # Alternative moderne
+reportlab==4.0.4  # Fallback basique
+jinja2==3.1.2  # Templates HTML
+openpyxl==3.1.2  # Export Excel
+pandas==2.1.4  # Manipulation données (optionnel)
