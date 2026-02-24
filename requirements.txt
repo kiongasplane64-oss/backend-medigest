@@ -19,3 +19,4 @@ termii
 prometheus_client
 email-validator
 redis
+alembic
