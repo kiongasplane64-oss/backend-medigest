@@ -17,3 +17,4 @@ pydantic-settings
 twilio
 termii
 prometheus_client
+email-validator
