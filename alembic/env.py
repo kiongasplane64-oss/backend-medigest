@@ -1,23 +1,22 @@
-# alembic/env.py
-import sys
-import os
-from logging.config import fileConfig
-
 from sqlalchemy import engine_from_config, pool
 from alembic import context
-
+import sys
+import os
+from dotenv import load_dotenv 
+from logging.config import fileConfig
 # =============================
 # Ajouter le chemin du projet
 # =============================
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# --- CHARGEMENT DU .ENV ---
+# Cela chargera les variables du fichier .env dans os.environ
+load_dotenv() 
+
 # =============================
 # Importer Base et modèles
 # =============================
 from app.db.base import Base  # noqa: E402
-
-# IMPORTANT: importer les modèles pour remplir Base.metadata
-# Garde ton import si ça marche, sinon importe explicitement tes modules models.*
 from app import models  # noqa: F401, E402
 
 # =============================
@@ -30,15 +29,21 @@ if config.config_file_name is not None:
 
 
 def _database_url() -> str:
+    # Maintenant os.getenv ira chercher dans votre fichier .env local
     url = os.getenv("DATABASE_URL")
+    
     if not url:
         raise RuntimeError(
             "DATABASE_URL manquante pour Alembic. "
-            "Sur Render: ajoute DATABASE_URL dans Environment."
+            "Vérifiez votre fichier .env en local ou l'Environment sur Render."
         )
-    # compat Render / SQLAlchemy
+    
+    # Correction pour SQLAlchemy 2.0+ (PostgreSQL)
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    elif url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg2://", 1)
+        
     return url
 
 

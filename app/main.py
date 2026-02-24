@@ -23,8 +23,7 @@ from app.middleware.tenant_context import TenantContextMiddleware
 from app.middleware.rate_limit_middleware import RateLimitMiddleware
 from app.middleware.audit_middleware import AuditMiddleware
 from app.middleware.auth_middleware import AuthMiddleware
-from app.db.base import Base
-from app.db.session import engine
+
 
 app = FastAPI(
     title="MEDIGEST API",
@@ -34,8 +33,7 @@ app = FastAPI(
     docs_url="/api/docs",
     redoc_url="/api/redoc"
 )
-if os.getenv("AUTO_CREATE_DB", "false").lower() in ("1", "true", "yes"):
-    Base.metadata.create_all(bind=engine)
+
 # Configuration CORS - À PLACER EN PREMIER
 app.add_middleware(
     CORSMiddleware,
