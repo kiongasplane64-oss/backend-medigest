@@ -828,7 +828,7 @@ async def generate_import_template(
 @require_permission("import_data")
 async def import_products(
     file_data: dict,  # À adapter pour recevoir un fichier
-    import_mode: str = Query("add", regex="^(add|replace|update)$"),
+    import_mode: str = Query("add", pattern="^(add|replace|update)$"),
     db: Session = Depends(get_db),
     current_tenant: Tenant = Depends(get_current_tenant),
     current_user: User = Depends(get_current_user)
