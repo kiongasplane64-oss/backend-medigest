@@ -1,63 +1,80 @@
 # app/models/__init__.py
 """
-Fichier d'initialisation des modèles - Importez UNIQUEMENT les modèles qui existent
+Initialisation des modèles.
+Objectif: importer les modèles pour enregistrer les tables dans Base.metadata
+(et pour qu'Alembic les détecte).
 """
 
-# =====================================
-# MODÈLES DE BASE 
-# =====================================
+# =========================
+# Modèles SaaS / Core
+# =========================
 from .tenant import Tenant
 from .user import User
-from .cost import Cost, Budget, Supplier
-from .sync_log import SyncLog
 from .subscription import Subscription
 from .pharmacy import Pharmacy
 from .user_pharmacy import UserPharmacy
-# =====================================
-# MODÈLES OPTIONNELS 
-# =====================================
+from .sync_log import SyncLog
 
+# =========================
+# Gestion / Business
+# =========================
 from .client import Client
 from .product import Product
 from .sale import Sale
+
+from .invoice import Invoice, InvoiceItem
+from .invoice_payment import InvoicePayment
+
+from .purchase import Purchase, PurchaseItem, PurchasePayment
+
+from .inventory import PhysicalInventory, InventoryItem, InventorySchedule
+
+from .finance import FinancialPeriod, FinancialTransaction, Capital, Expense
+from .cost import Cost, Budget, Supplier
+
+from .audit_log import AuditLog
+from .refund import Refund
 from .debt import Debt
 from .debt_payment import DebtPayment
-from .invoice import Invoice, InvoiceItem
-from .inventory import PhysicalInventory, InventoryItem, InventorySchedule  
-from .finance import FinancialPeriod, FinancialTransaction, Capital, Expense  
-from .audit_log import AuditLog 
-from .refund import Refund, relationship
-from .product import Product
-from .purchase import Purchase, PurchaseItem, PurchasePayment
-from .transfert import ProductTransfer, TransferItem, TransferStatus, TransferType
-from .invoice_payment import InvoicePayment
 from .payment import Payment
 
+from .transfert import ProductTransfer, TransferItem, TransferStatus, TransferType
 
-# =====================================
-# LISTE DES MODÈLES DISPONIBLES
-# =====================================
 __all__ = [
-    'Tenant',
-    'User',
-    'Cost',
-    'Budget',
-    'Supplier',
-    'Client',
-    'Product',
-    'Sale',
-    'Refund',
-    'Debt',
-    'DebtPayment',
-    "Purchase",
-    "PurchaseItem", 
-    "PurchasePayment",
+    # Core
+    "Tenant",
+    "User",
+    "Subscription",
     "Pharmacy",
     "UserPharmacy",
-    'ProductTransfer',
-    'TransferItem',
-    'Payment',
-    'InvoicePayment',
-    'InvoiceItem'
-    
+    "SyncLog",
+    # Business
+    "Client",
+    "Product",
+    "Sale",
+    "Invoice",
+    "InvoiceItem",
+    "InvoicePayment",
+    "Purchase",
+    "PurchaseItem",
+    "PurchasePayment",
+    "PhysicalInventory",
+    "InventoryItem",
+    "InventorySchedule",
+    "FinancialPeriod",
+    "FinancialTransaction",
+    "Capital",
+    "Expense",
+    "Cost",
+    "Budget",
+    "Supplier",
+    "AuditLog",
+    "Refund",
+    "Debt",
+    "DebtPayment",
+    "Payment",
+    "ProductTransfer",
+    "TransferItem",
+    "TransferStatus",
+    "TransferType",
 ]
