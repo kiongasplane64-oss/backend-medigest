@@ -16,3 +16,4 @@ gunicorn
 pydantic-settings
 twilio
 termii
+prometheus_client
