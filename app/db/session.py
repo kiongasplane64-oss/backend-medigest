@@ -1,13 +1,14 @@
 #/app/db/session.py
 from typing import Generator
 import logging
+import os
 
 from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.exc import SQLAlchemyError
 
-DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/pharma_saas"
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 logger = logging.getLogger(__name__)
 
