@@ -13,3 +13,4 @@ jinja2
 openpyxl
 pandas
 gunicorn
+pydantic-settings
