@@ -9,34 +9,44 @@ from alembic import context
 # =============================
 # Ajouter le chemin du projet
 # =============================
-# Ceci permet à Alembic de trouver ton module "app"
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # =============================
 # Importer Base et modèles
 # =============================
-from app.db.base import Base
-from app.models import *  # Tous les modèles
-from app.core.config import settings  # settings avec DATABASE_URL
+from app.db.base import Base  # noqa: E402
+
+# IMPORTANT: importer les modèles pour remplir Base.metadata
+# Garde ton import si ça marche, sinon importe explicitement tes modules models.*
+from app import models  # noqa: F401, E402
 
 # =============================
 # Config Alembic
 # =============================
 config = context.config
 
-# Configurer logging
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Forcer Alembic à utiliser l'URL de la base de données depuis settings
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
-# Metadata cible pour autogenerate
+def _database_url() -> str:
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL manquante pour Alembic. "
+            "Sur Render: ajoute DATABASE_URL dans Environment."
+        )
+    # compat Render / SQLAlchemy
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    return url
+
+
+config.set_main_option("sqlalchemy.url", _database_url())
+
 target_metadata = Base.metadata
 
-# =============================
-# Migrations offline
-# =============================
+
 def run_migrations_offline():
     url = config.get_main_option("sqlalchemy.url")
     context.configure(
@@ -51,9 +61,6 @@ def run_migrations_offline():
         context.run_migrations()
 
 
-# =============================
-# Migrations online
-# =============================
 def run_migrations_online():
     connectable = engine_from_config(
         config.get_section(config.config_ini_section),
@@ -73,9 +80,6 @@ def run_migrations_online():
             context.run_migrations()
 
 
-# =============================
-# Exécution
-# =============================
 if context.is_offline_mode():
     run_migrations_offline()
 else:
