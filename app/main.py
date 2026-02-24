@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import datetime
-
+import os
 # Import des routeurs
 from app.api.v1.tenants import router as tenant_router
 from app.api.v1.auth import router as auth_router
@@ -34,7 +34,8 @@ app = FastAPI(
     docs_url="/api/docs",
     redoc_url="/api/redoc"
 )
-Base.metadata.create_all(bind=engine)
+if os.getenv("AUTO_CREATE_DB", "false").lower() in ("1", "true", "yes"):
+    Base.metadata.create_all(bind=engine)
 # Configuration CORS - À PLACER EN PREMIER
 app.add_middleware(
     CORSMiddleware,
