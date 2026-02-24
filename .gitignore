@@ -4,3 +4,4 @@ venv/
 *.db 
 app.log
 *.log
+.env.*
