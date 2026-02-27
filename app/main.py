@@ -17,6 +17,8 @@ from app.api.routes.pharmacies import router as pharmacies_router
 from app.api.routes.tenants import router as admin_tenants_router
 from app.api.v1.endpoints.products import router as products_router
 from app.api.v1 import users
+from sqlalchemy import text
+from app.db.session import engine  
 
 # Middlewares
 from app.middleware.tenant_context import TenantContextMiddleware
@@ -104,3 +106,16 @@ app.include_router(
     prefix="/api/v1",
     tags=["Products"]
 )
+
+
+
+@app.get("/debug/tables")
+def debug_tables():
+    with engine.connect() as c:
+        rows = c.execute(text("""
+            SELECT tablename
+            FROM pg_tables
+            WHERE schemaname = 'public'
+            ORDER BY tablename;
+        """)).fetchall()
+    return {"tables": [r[0] for r in rows]}
