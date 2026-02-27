@@ -694,7 +694,7 @@ class ProductStock(Base):
     
     stock_movements = relationship(
         "StockMovement",
-        back_populates="product",
+        back_populates="product_stock", 
         cascade="all, delete-orphan",
         lazy="selectin"
     )

@@ -20,6 +20,9 @@ class StockMovement(Base):
 
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True)
     product_id = Column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=False, index=True)
+    # Dans la classe StockMovement
+    product_stock_id = Column(UUID(as_uuid=True), ForeignKey("product_stocks.id"), nullable=True)
+    product_stock = relationship("ProductStock", back_populates="stock_movements")
 
     # Quantités
     quantity_before = Column(DECIMAL(15, 3), nullable=False, default=0)
