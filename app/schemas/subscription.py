@@ -94,7 +94,7 @@ class SubscriptionBase(BaseModel):
     # Configuration
     auto_renew: bool = Field(default=True, description="Renouvellement automatique")
     notes: Optional[str] = Field(None, description="Notes internes")
-    metadata: Optional[Dict[str, Any]] = Field(None, description="Métadonnées additionnelles")
+    subscribe_metadata: Optional[Dict[str, Any]] = Field(None, description="Métadonnées additionnelles")
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -260,7 +260,7 @@ class SubscriptionUpdate(BaseModel):
     # Configuration
     auto_renew: Optional[bool] = None
     notes: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
+    subscribe_metadata: Optional[Dict[str, Any]] = None
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -436,7 +436,7 @@ class PaymentBase(BaseModel):
     # Métadonnées
     description: Optional[str] = Field(None, description="Description")
     notes: Optional[str] = Field(None, description="Notes")
-    metadata: Optional[Dict[str, Any]] = Field(None, description="Métadonnées additionnelles")
+    subscribe_metadata: Optional[Dict[str, Any]] = Field(None, description="Métadonnées additionnelles")
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -481,7 +481,7 @@ class PaymentUpdate(BaseModel):
     payment_reference: Optional[str] = Field(None, max_length=100)
     description: Optional[str] = None
     notes: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
+    subscribe_metadata: Optional[Dict[str, Any]] = None
     paid_at: Optional[datetime] = Field(None, description="Date de paiement effectif")
     
     model_config = ConfigDict(from_attributes=True)

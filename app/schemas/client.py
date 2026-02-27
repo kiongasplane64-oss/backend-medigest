@@ -108,7 +108,7 @@ class ClientInDB(ClientBase):
     is_active: bool
     blacklisted: bool
     blacklist_reason: Optional[str]
-    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    client_metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
     
     # Propriétés calculées
     credit_available: float

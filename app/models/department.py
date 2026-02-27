@@ -104,7 +104,7 @@ class Department(Base):
     # =====================================
     # MÉTADONNÉES
     # =====================================
-    metadata = Column(JSON, default=dict)
+    extra_metadata = Column(JSON, default=dict)
     settings = Column(JSON, default=dict)
     
     # =====================================

@@ -171,7 +171,7 @@ class TenantBase(BaseModel):
     max_api_calls_per_day: int = Field(default=1000, ge=10, description="Appels API maximum par jour")
     
     # Métadonnées
-    metadata: Dict[str, Any] = Field(default_factory=dict, description="Métadonnées personnalisées")
+    tenants_metadata: Dict[str, Any] = Field(default_factory=dict, description="Métadonnées personnalisées")
     tags: List[str] = Field(default_factory=list, description="Tags de classification")
     notes: Optional[str] = Field(None, description="Notes internes")
     
@@ -529,7 +529,7 @@ class TenantUpdate(BaseModel):
     max_api_calls_per_day: Optional[int] = Field(None, ge=10)
     
     # Métadonnées
-    metadata: Optional[Dict[str, Any]] = None
+    tenants_metadata: Optional[Dict[str, Any]] = None
     tags: Optional[List[str]] = None
     notes: Optional[str] = None
     
@@ -674,7 +674,7 @@ class TenantResponse(BaseModel):
     total_inventory_value: Optional[float] = 0.0
     
     # Métadonnées
-    metadata: Dict[str, Any]
+    tenants_metadata: Dict[str, Any]
     tags: List[str]
     notes: Optional[str]
     

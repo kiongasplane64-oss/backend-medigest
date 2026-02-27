@@ -149,7 +149,7 @@ class Project(Base):
     # =====================================
     # MÉTADONNÉES
     # =====================================
-    metadata = Column(JSON, default=dict)
+    project_metadata = Column(JSON, default=dict)
     attachments = Column(JSON, default=list)
     notes = Column(Text, nullable=True)
     

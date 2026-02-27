@@ -67,7 +67,7 @@ def paginate(
     items = query.offset(offset).limit(size).all()
     
     # Métadonnées
-    metadata = {
+    pagina_metadata = {
         "page": page,
         "size": size,
         "total": total,
@@ -78,7 +78,7 @@ def paginate(
         "previous_page": page - 1 if page > 1 else None
     }
     
-    return items, total, metadata
+    return items, total, pagina_metadata
 
 
 def paginate_with_model(

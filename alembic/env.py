@@ -1,58 +1,60 @@
-from sqlalchemy import engine_from_config, pool
-from alembic import context
-import sys
+from __future__ import annotations
+
 import os
-from dotenv import load_dotenv 
+import sys
+import pkgutil
+import importlib
 from logging.config import fileConfig
-# =============================
-# Ajouter le chemin du projet
-# =============================
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# --- CHARGEMENT DU .ENV ---
-# Cela chargera les variables du fichier .env dans os.environ
-load_dotenv() 
+from alembic import context
+from sqlalchemy import engine_from_config, pool
+from dotenv import load_dotenv
 
 # =============================
-# Importer Base et modèles
+# Ajouter la racine du projet (contient /app)
 # =============================
-from app.db.base import Base  # noqa: E402
-from app import models  # noqa: F401, E402
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-# =============================
-# Config Alembic
-# =============================
+# Charger .env en local (Render ignore si variables déjà présentes)
+load_dotenv()
+
 config = context.config
-
-if config.config_file_name is not None:
+if config.config_file_name:
     fileConfig(config.config_file_name)
 
+from app.db.base import Base  # noqa: E402
 
-def _database_url() -> str:
-    # Maintenant os.getenv ira chercher dans votre fichier .env local
-    url = os.getenv("DATABASE_URL")
-    
+
+def database_url() -> str:
+    url = (os.getenv("DATABASE_URL") or "").strip()
     if not url:
-        raise RuntimeError(
-            "DATABASE_URL manquante pour Alembic. "
-            "Vérifiez votre fichier .env en local ou l'Environment sur Render."
-        )
-    
-    # Correction pour SQLAlchemy 2.0+ (PostgreSQL)
-    if url.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    elif url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql+psycopg2://", 1)
-        
+        raise RuntimeError("DATABASE_URL manquante (local: .env / Render: Environment).")
+
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+
     return url
 
 
-config.set_main_option("sqlalchemy.url", _database_url())
+def load_all_models() -> None:
+    """
+    Importe tous les modules app.models.* pour remplir Base.metadata.
+    """
+    import app.models  # noqa: F401
 
+    for _, module_name, _ in pkgutil.walk_packages(app.models.__path__, app.models.__name__ + "."):
+        importlib.import_module(module_name)
+
+
+config.set_main_option("sqlalchemy.url", database_url())
+
+load_all_models()
 target_metadata = Base.metadata
 
 
-def run_migrations_offline():
+def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")
     context.configure(
         url=url,
@@ -61,18 +63,16 @@ def run_migrations_offline():
         compare_type=True,
         compare_server_default=True,
     )
-
     with context.begin_transaction():
         context.run_migrations()
 
 
-def run_migrations_online():
+def run_migrations_online() -> None:
     connectable = engine_from_config(
-        config.get_section(config.config_ini_section),
+        config.get_section(config.config_ini_section) or {},
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
-
     with connectable.connect() as connection:
         context.configure(
             connection=connection,
@@ -80,7 +80,6 @@ def run_migrations_online():
             compare_type=True,
             compare_server_default=True,
         )
-
         with context.begin_transaction():
             context.run_migrations()
 
