@@ -1,29 +1,18 @@
 # app/models/stock_movement.py
-from __future__ import annotations
-
 import uuid
 from datetime import datetime, date
 from sqlalchemy import (
-    Column,
-    String,
-    Integer,
-    DateTime,
-    Date,
-    ForeignKey,
-    Text,
-    Index,
-    DECIMAL,
+    Column, String, Integer, DateTime, ForeignKey, Text, Date, Index, DECIMAL
 )
-from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
 
 from app.db.base import Base
 
 
 class StockMovement(Base):
     """
-    Suivi des mouvements de stock.
-    Types possibles: initial, purchase, sale, adjustment, return, transfer, expiry, correction
+    Modèle pour suivre les mouvements de stock
     """
     __tablename__ = "stock_movements"
 
@@ -33,20 +22,19 @@ class StockMovement(Base):
     product_id = Column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=False, index=True)
 
     # Quantités
-    quantity_before = Column(DECIMAL(15, 3), nullable=False, default=0.0)
-    quantity_after = Column(DECIMAL(15, 3), nullable=False, default=0.0)
-    quantity_change = Column(DECIMAL(15, 3), nullable=False, default=0.0)
+    quantity_before = Column(DECIMAL(15, 3), nullable=False, default=0)
+    quantity_after = Column(DECIMAL(15, 3), nullable=False, default=0)
+    quantity_change = Column(DECIMAL(15, 3), nullable=False, default=0)
 
     # Prix
     unit_price = Column(DECIMAL(15, 2), nullable=True)
     total_price = Column(DECIMAL(15, 2), nullable=True)
 
-    # Type de mouvement
     movement_type = Column(
         String(50),
         nullable=False,
         index=True,
-        comment="initial, purchase, sale, adjustment, return, transfer, expiry, correction",
+        comment="initial, purchase, sale, adjustment, return, transfer, expiry, correction"
     )
 
     # Références
@@ -56,7 +44,7 @@ class StockMovement(Base):
     location_from = Column(String(100), nullable=True)
     location_to = Column(String(100), nullable=True)
 
-    # Raison / notes
+    # Raison et notes
     reason = Column(String(200), nullable=True)
     notes = Column(Text, nullable=True)
 
@@ -71,7 +59,6 @@ class StockMovement(Base):
     # Relations
     # =======================
     tenant = relationship("Tenant")
-    # IMPORTANT: correspondre à Product.stock_movements = relationship(... back_populates="product")
     product = relationship("Product", back_populates="stock_movements")
     user = relationship("User", foreign_keys=[created_by])
 
@@ -85,9 +72,8 @@ class StockMovement(Base):
     def to_dict(self) -> dict:
         return {
             "id": str(self.id),
-            "tenant_id": str(self.tenant_id),
             "product_id": str(self.product_id),
-            "product_name": self.product.name if self.product else None,
+            "product_name": getattr(self.product, "name", None),
             "quantity_before": float(self.quantity_before or 0),
             "quantity_after": float(self.quantity_after or 0),
             "quantity_change": float(self.quantity_change or 0),
@@ -97,23 +83,21 @@ class StockMovement(Base):
             "reference": self.reference,
             "document_number": self.document_number,
             "batch_number": self.batch_number,
-            "location_from": self.location_from,
-            "location_to": self.location_to,
             "reason": self.reason,
             "notes": self.notes,
             "created_by": str(self.created_by),
-            "created_by_name": getattr(self.user, "nom_complet", None) if self.user else None,
+            "created_by_name": getattr(self.user, "nom_complet", None),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "expiration_date": self.expiration_date.isoformat() if self.expiration_date else None,
         }
 
-    def __repr__(self) -> str:
+    def __repr__(self):
         return f"<StockMovement {self.movement_type} {self.quantity_change:+} for {self.product_id}>"
 
 
 class InventoryCount(Base):
     """
-    Inventaire physique (session d'inventaire).
+    Modèle pour les inventaires physiques
     """
     __tablename__ = "inventory_counts"
 
@@ -121,24 +105,26 @@ class InventoryCount(Base):
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True)
 
     count_number = Column(String(50), nullable=False, unique=True, index=True)
-    # Utiliser une fonction (callable) plutôt que datetime.utcnow().date évalué à l'import
+
+    # IMPORTANT : ne mets PAS datetime.utcnow().date (ça s’évalue au chargement du module)
     count_date = Column(Date, nullable=False, default=date.today, index=True)
+
     location = Column(String(100), nullable=True)
 
     total_products = Column(Integer, nullable=False, default=0)
     counted_products = Column(Integer, nullable=False, default=0)
     discrepancies = Column(Integer, nullable=False, default=0)
 
-    theoretical_value = Column(DECIMAL(15, 2), nullable=False, default=0.0)
-    actual_value = Column(DECIMAL(15, 2), nullable=False, default=0.0)
-    difference_value = Column(DECIMAL(15, 2), nullable=False, default=0.0)
+    theoretical_value = Column(DECIMAL(15, 2), nullable=False, default=0)
+    actual_value = Column(DECIMAL(15, 2), nullable=False, default=0)
+    difference_value = Column(DECIMAL(15, 2), nullable=False, default=0)
 
     status = Column(
         String(20),
         nullable=False,
         default="pending",
         index=True,
-        comment="pending, in_progress, completed, validated, cancelled",
+        comment="pending, in_progress, completed, validated, cancelled"
     )
 
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
@@ -151,9 +137,6 @@ class InventoryCount(Base):
 
     notes = Column(Text, nullable=True)
 
-    # =======================
-    # Relations
-    # =======================
     tenant = relationship("Tenant")
     creator = relationship("User", foreign_keys=[created_by])
     validator = relationship("User", foreign_keys=[validated_by])
@@ -165,20 +148,19 @@ class InventoryCount(Base):
 
     @property
     def progress_percentage(self) -> float:
-        if self.total_products == 0:
+        if not self.total_products:
             return 0.0
-        return (self.counted_products / self.total_products) * 100
+        return (self.counted_products / self.total_products) * 100.0
 
     @property
     def difference_percentage(self) -> float:
-        if float(self.theoretical_value or 0) == 0:
+        if not self.theoretical_value:
             return 0.0
-        return (float(self.difference_value) / float(self.theoretical_value)) * 100
+        return (float(self.difference_value or 0) / float(self.theoretical_value)) * 100.0
 
     def to_dict(self) -> dict:
         return {
             "id": str(self.id),
-            "tenant_id": str(self.tenant_id),
             "count_number": self.count_number,
             "count_date": self.count_date.isoformat() if self.count_date else None,
             "location": self.location,
@@ -199,44 +181,38 @@ class InventoryCount(Base):
             "notes": self.notes,
         }
 
-    def __repr__(self) -> str:
+    def __repr__(self):
         return f"<InventoryCount {self.count_number} - {self.status}>"
 
 
 class InventoryCountItem(Base):
     """
-    Items (lignes) d'un inventaire physique.
+    Articles d'un inventaire physique
     """
     __tablename__ = "inventory_count_items"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-
-    inventory_count_id = Column(
-        UUID(as_uuid=True), ForeignKey("inventory_counts.id"), nullable=False, index=True
-    )
+    inventory_count_id = Column(UUID(as_uuid=True), ForeignKey("inventory_counts.id"), nullable=False, index=True)
     product_id = Column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=False, index=True)
 
-    theoretical_quantity = Column(DECIMAL(15, 3), nullable=False, default=0.0)
-    actual_quantity = Column(DECIMAL(15, 3), nullable=False, default=0.0)
-    quantity_difference = Column(DECIMAL(15, 3), nullable=False, default=0.0)
+    theoretical_quantity = Column(DECIMAL(15, 3), nullable=False, default=0)
+    actual_quantity = Column(DECIMAL(15, 3), nullable=False, default=0)
+    quantity_difference = Column(DECIMAL(15, 3), nullable=False, default=0)
 
-    unit_price = Column(DECIMAL(15, 2), nullable=False, default=0.0)
-    theoretical_value = Column(DECIMAL(15, 2), nullable=False, default=0.0)
-    actual_value = Column(DECIMAL(15, 2), nullable=False, default=0.0)
-    value_difference = Column(DECIMAL(15, 2), nullable=False, default=0.0)
+    unit_price = Column(DECIMAL(15, 2), nullable=False, default=0)
+    theoretical_value = Column(DECIMAL(15, 2), nullable=False, default=0)
+    actual_value = Column(DECIMAL(15, 2), nullable=False, default=0)
+    value_difference = Column(DECIMAL(15, 2), nullable=False, default=0)
 
     batch_number = Column(String(100), nullable=True)
     location = Column(String(100), nullable=True)
 
     status = Column(String(20), nullable=False, default="pending", comment="pending, counted, validated")
-
     comments = Column(Text, nullable=True)
+
     counted_at = Column(DateTime, nullable=True)
     validated_at = Column(DateTime, nullable=True)
 
-    # =======================
-    # Relations
-    # =======================
     inventory_count = relationship("InventoryCount", backref="items")
     product = relationship("Product")
 
@@ -250,17 +226,19 @@ class InventoryCountItem(Base):
 
     @property
     def discrepancy_percentage(self) -> float:
-        if float(self.theoretical_quantity or 0) == 0:
-            return 100.0 if float(self.actual_quantity or 0) > 0 else 0.0
-        return (float(abs(self.quantity_difference)) / float(self.theoretical_quantity)) * 100
+        tq = float(self.theoretical_quantity or 0)
+        dq = float(self.quantity_difference or 0)
+        aq = float(self.actual_quantity or 0)
+        if tq == 0:
+            return 100.0 if aq > 0 else 0.0
+        return (abs(dq) / tq) * 100.0
 
     def to_dict(self) -> dict:
         return {
             "id": str(self.id),
-            "inventory_count_id": str(self.inventory_count_id),
             "product_id": str(self.product_id),
-            "product_code": self.product.code if self.product else None,
-            "product_name": self.product.name if self.product else None,
+            "product_code": getattr(self.product, "code", None),
+            "product_name": getattr(self.product, "name", None),
             "theoretical_quantity": float(self.theoretical_quantity or 0),
             "actual_quantity": float(self.actual_quantity or 0),
             "quantity_difference": float(self.quantity_difference or 0),
@@ -278,5 +256,5 @@ class InventoryCountItem(Base):
             "validated_at": self.validated_at.isoformat() if self.validated_at else None,
         }
 
-    def __repr__(self) -> str:
+    def __repr__(self):
         return f"<InventoryCountItem {self.product_id} diff: {self.quantity_difference}>"

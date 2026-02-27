@@ -7,8 +7,8 @@ from datetime import datetime, timedelta
 import logging
 
 from app.db.session import get_db
-from app.models.product import Product, InventoryCount
-from app.models.stock_movement import StockMovement
+from app.models.product import Product
+from app.models.stock_movement import StockMovement, InventoryCount
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.schemas.stock import (

@@ -694,6 +694,8 @@ class ProductStock(Base):
     
     stock_movements = relationship(
         "StockMovement",
+        back_populates="product",
         cascade="all, delete-orphan",
         lazy="selectin"
     )
+from app.models import stock_movement as _stock_movement 
