@@ -6,7 +6,8 @@ from uuid import UUID
 import logging
 
 from app.db.session import get_db
-from app.models.product import Product, StockMovement
+from app.models.product import Product
+from app.models.stock_movement import StockMovement
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.schemas.stock import (

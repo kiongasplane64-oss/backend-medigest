@@ -4,7 +4,8 @@ from typing import Optional, Dict, Any
 from uuid import UUID
 from sqlalchemy.orm import Session
 
-from app.models.product import Product, StockMovement
+from app.models.product import Product
+from app.models.stock_movement import StockMovement
 from app.models.user import User
 
 logger = logging.getLogger(__name__)
