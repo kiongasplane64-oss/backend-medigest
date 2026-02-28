@@ -39,6 +39,7 @@ from .debt_payment import DebtPayment
 from .payment import Payment
 
 from .transfert import ProductTransfer, TransferItem, TransferStatus, TransferType
+from .stock_movement import StockMovement, InventoryCount, InventoryCountItem
 
 __all__ = [
     # Core
@@ -55,6 +56,8 @@ __all__ = [
     "Invoice",
     "InvoiceItem",
     "InvoicePayment",
+    "InventoryCount",
+    "InventoryCountItem",
     "Purchase",
     "PurchaseItem",
     "PurchasePayment",
