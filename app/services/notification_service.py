@@ -36,7 +36,7 @@ class NotificationService:
         """Initialise les clients de notification"""
         try:
             # Initialisation Twilio avec fallback
-            twilio_sid = os.getenv("TWILIO_SID")
+            twilio_sid = os.getenv("TWILIO_ACCOUNT_SID") or os.getenv("TWILIO_SID")
             twilio_auth = os.getenv("TWILIO_AUTH_TOKEN")
             
             if twilio_sid and twilio_auth:
@@ -71,8 +71,7 @@ class NotificationService:
     
     def _get_twilio_phone_number(self) -> str:
         """Retourne le numéro Twilio SMS"""
-        return os.getenv("TWILIO_PHONE_NUMBER", 
-                        getattr(settings, "TWILIO_PHONE_NUMBER", "+16414368989"))
+        return os.getenv("TWILIO_PHONE_NUMBER") or getattr(settings, "TWILIO_PHONE_NUMBER", "")
     
     def _get_twilio_whatsapp_number(self) -> str:
         """Retourne le numéro Twilio WhatsApp"""
@@ -104,6 +103,10 @@ class NotificationService:
             return result
         
         from_phone = self._get_twilio_phone_number()
+        if not from_phone:
+            result["error"] = "TWILIO_PHONE_NUMBER non configuré"
+            logger.error(result["error"])
+            return result
         
         # Essayer SMS d'abord
         try:
