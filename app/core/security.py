@@ -18,20 +18,35 @@ from app.core.config import settings
 # ===========================================
 # GESTION DES MOTS DE PASSE
 # ===========================================
+import logging
+from fastapi import HTTPException, status
+from passlib.context import CryptContext
+
+logger = logging.getLogger("uvicorn.error")
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-def get_password_hash(password: str) -> str:
-    """Hash d'un mot de passe"""
-    return pwd_context.hash(password)
+def get_password_hash(password: object) -> str:
+    pw = "" if password is None else (password if isinstance(password, str) else str(password))
+    pw = pw.strip()
 
-def hash_password(password: str) -> str:
-    """Hash d'un mot de passe (alias pour get_password_hash)"""
+    # bcrypt limite 72 bytes
+    pw_len = len(pw.encode("utf-8"))
+    if pw_len > 72:
+        logger.error("bcrypt password too long: bytes=%s", pw_len)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Mot de passe trop long (max ~72 bytes avec bcrypt)."
+        )
+
+    return pwd_context.hash(pw)
+
+def hash_password(password: object) -> str:
     return get_password_hash(password)
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Vérifie qu'un mot de passe correspond à son hash"""
-    return pwd_context.verify(plain_password, hashed_password)
-
+def verify_password(plain_password: object, hashed_password: str) -> bool:
+    pw = "" if plain_password is None else (plain_password if isinstance(plain_password, str) else str(plain_password))
+    pw = pw.strip()
+    return pwd_context.verify(pw, hashed_password)
 # ===========================================
 # JWT TOKENS - FONCTIONS MANQUANTES
 # ===========================================

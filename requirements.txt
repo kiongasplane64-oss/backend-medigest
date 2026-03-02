@@ -3,20 +3,32 @@ uvicorn
 sqlalchemy
 psycopg2-binary
 pydantic
+pydantic-settings
 python-jose
-passlib[bcrypt]
 python-dotenv
-# Pour génération PDF
+
+# Sécurité (versions fixées)
+passlib[bcrypt]==1.7.4
+bcrypt==4.1.3
+email-validator
+
+# Serveur prod
+gunicorn
+
+# DB migration
+alembic
+
+# Cache / monitoring
+redis
+prometheus_client
+
+# Notifications
+twilio
+termii
+
+# Génération documents
 weasyprint
 reportlab
 jinja2
 openpyxl
 pandas
-gunicorn
-pydantic-settings
-twilio
-termii
-prometheus_client
-email-validator
-redis
-alembic

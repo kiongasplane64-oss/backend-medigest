@@ -318,7 +318,7 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         )
 
     if len(data.password.encode('utf-8')) > 72:
-        raise HTTPException(400, "Mot de passe trop long (maximum 72 caractères)")
+        raise HTTPException(400, "Mot de passe trop long (max 72 bytes pour bcrypt).")
 
     # 2. GESTION DU PLAN D'ABONNEMENT
     # --------------------------------
@@ -405,11 +405,14 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
     # 6. CRÉATION DE L'UTILISATEUR ADMIN
     # -----------------------------------
     try:
+        pw = data.password
+        logger.info("REGISTER pw chars=%s bytes=%s", len(pw), len(pw.encode("utf-8")))
+        hashed_password = hash_password(data.password)
         admin = User(
             tenant_id=tenant.id,
             nom_complet=data.nom_complet,
             email=data.email.lower(),
-            password_hash=hash_password(data.password),
+            password_hash=hashed_password,
             role="admin",
             actif=False,
             telephone=data.telephone,
@@ -664,7 +667,6 @@ def check_availability(
     
     return results
 
-@router.post("/verify-sms")
 @router.post("/verify-sms")
 def verify_sms(data: VerifySMSSchema, db: Session = Depends(get_db)):
     """Vérification du code SMS et activation du compte"""
@@ -2250,36 +2252,26 @@ def get_current_tenant_info_v1(
 
 @router.post("/super-admin/setup", status_code=status.HTTP_201_CREATED)
 async def setup_super_admin(data: SuperAdminSetup, db: Session = Depends(get_db)):
-    # 1. Vérification de la clé d'installation
-    # Récupérée depuis le fichier .env (ex: INITIAL_SETUP_KEY=PharmaAdmin2026!)
     master_key = os.getenv("INITIAL_SETUP_KEY")
-    
     if not master_key or data.setup_key != master_key:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Clé d'installation invalide ou non configurée."
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Clé d'installation invalide ou non configurée.")
 
-    # 2. Vérifier si un Super Admin existe déjà (sécurité pour éviter les doublons)
-    existing_admin = db.query(User).filter(User.is_superuser == True).first()
+    # Ici on considère super admin = role == "super_admin"
+    existing_admin = db.query(User).filter(User.role == "super_admin").first()
     if existing_admin:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Le système est déjà initialisé. Action interdite."
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Le système est déjà initialisé.")
 
-    # 3. Création du compte
     new_admin = User(
-        email=data.email,
-        hashed_password=get_password_hash(data.password),
+        tenant_id=uuid.uuid4(),  # ⚠️ ton modèle exige tenant_id NOT NULL -> il faut un tenant “system”
+        email=data.email.lower(),
+        password_hash=get_password_hash(data.password),
         nom_complet=data.nom_complet,
-        is_active=True,
-        is_superuser=True,  # Privilèges max
-        role="SUPER_ADMIN"
+        actif=True,
+        role="super_admin",
     )
 
     db.add(new_admin)
     db.commit()
     db.refresh(new_admin)
 
-    return {"message": "Super Admin créé avec succès. Le système est maintenant sécurisé."}
+    return {"message": "Super Admin créé avec succès."}
