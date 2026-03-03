@@ -45,8 +45,8 @@ app.add_middleware(
         "http://localhost:8080",
         "http://127.0.0.1:5173",
         "http://127.0.0.1:3000",
-        "https//medigestpro.net",
-        "https//www.medigestpro.net",
+        "https://medigestpro.net",
+        "https://www.medigestpro.net",
         "https://frontend-medigest.vercel.app"
     ],
     allow_credentials=True,
