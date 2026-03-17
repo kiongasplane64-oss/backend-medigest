@@ -13,7 +13,7 @@ class User(Base):
     # Identité & Auth
     # =========================
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True, index=True)
     nom_complet = Column(String(100), nullable=False)
     email = Column(String(100), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)
@@ -83,6 +83,13 @@ class User(Base):
         back_populates="processor", 
         lazy="noload",
         overlaps="payments_processed" # Correction SAWarning
+    )
+    # Ajouter cette relation
+    subscription = relationship(
+        "UserSubscription", 
+        back_populates="user", 
+        uselist=False,
+        cascade="all, delete-orphan"
     )
 
     # =========================
@@ -163,3 +170,50 @@ class User(Base):
 
     def update_last_login(self):
         self.last_login = datetime.utcnow()
+    
+    # Méthodes pour gérer l'abonnement
+    def get_subscription_status(self):
+        """Retourne le statut complet de l'abonnement"""
+        if not self.subscription:
+            return {
+                "has_subscription": False,
+                "mode": "READ_ONLY",
+                "message": "Aucun abonnement trouvé"
+            }
+        
+        return {
+            "has_subscription": True,
+            "plan": self.subscription.plan_type,
+            "plan_name": self.subscription.plan_name,
+            "status": self.subscription.status,
+            "mode": self.subscription.get_mode(),
+            "is_active": self.subscription.is_active(),
+            "is_trial": self.subscription.is_trial(),
+            "days_remaining": self.subscription.days_remaining(),
+            "end_date": self.subscription.end_date.isoformat() if self.subscription.end_date else None,
+            "trial_end_date": self.subscription.trial_end_date.isoformat() if self.subscription.trial_end_date else None
+        }
+
+    def can_create_pharmacy(self) -> bool:
+        """Vérifie si l'admin peut créer une nouvelle pharmacie"""
+        if self.role != "admin":
+            return False
+        
+        if not self.subscription or not self.subscription.is_active():
+            return False
+        
+        # Compter les pharmacies actuelles
+        from app.models.pharmacy import Pharmacy
+        # Note: Cette méthode nécessite une session DB, à utiliser avec précaution
+        # Idéalement, on passe par un service
+        return True  # Logique à implémenter dans un service
+
+    def can_add_user(self) -> bool:
+        """Vérifie si l'admin peut ajouter un nouvel utilisateur"""
+        if self.role != "admin":
+            return False
+        
+        if not self.subscription or not self.subscription.is_active():
+            return False
+        
+        return True  # Logique à implémenter dans un service

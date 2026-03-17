@@ -26,7 +26,7 @@ from app.models.tenant import Tenant
 from app.models.pharmacy import Pharmacy
 from app.models.audit_log import AuditLog
 from app.models.user_pharmacy import UserPharmacy
-from app.api.deps import get_current_user
+from app.api.deps import get_current_active_user
 from app.core.security import hash_password, create_access_token
 from app.services.audit_service import log_action
 from app.services.notification_service import send_email, send_sms
@@ -39,12 +39,22 @@ router = APIRouter(prefix="/super-admin", tags=["Super Admin"])
 # DEPENDANCES SUPER ADMIN
 # =========================
 
-def verify_super_admin(current_user: User = Depends(get_current_user)):
+def verify_super_admin(
+    current_user: User = Depends(get_current_active_user)  # Utilisez get_current_active_user au lieu de get_current_user
+):
     """Vérifie que l'utilisateur est un super administrateur"""
-    if current_user.role != "super_admin":
+    logger.info(f"Vérification super admin - Rôle utilisateur: '{current_user.role}'")
+    
+    # Ajoutez plus de logs
+    logger.info(f"User ID: {current_user.id}")
+    logger.info(f"User email: {current_user.email}")
+    logger.info(f"User actif: {current_user.actif}")
+    
+    # Acceptez les deux variantes
+    if current_user.role not in ["superadmin", "super_admin"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Accès refusé. Droits super administrateur requis."
+            detail=f"Accès refusé. Rôle super admin requis. Rôle actuel: {current_user.role}"
         )
     return current_user
 
@@ -528,7 +538,7 @@ async def create_tenant_manual(
                 context={
                     "nom_pharmacie": tenant_data.nom_pharmacie,
                     "email": tenant_data.email_admin,
-                    "login_url": f"https://votresite.com/auth/login",
+                    "login_url": f"https://www.medigestpro.net/auth/login",
                     "plan": tenant_data.plan,
                     "trial_days": tenant_data.trial_days
                 }
@@ -2355,3 +2365,55 @@ async def initialize_super_admin(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur lors de l'initialisation: {str(e)}"
         )
+
+@router.get("/subscriptions/statistics", status_code=status.HTTP_200_OK)
+async def get_subscription_statistics(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(verify_super_admin)
+):
+    """Statistiques des abonnements pour le super admin"""
+    
+    # Statistiques par plan
+    plan_stats = db.query(
+        Tenant.current_plan,
+        func.count(Tenant.id).label('count')
+    ).group_by(Tenant.current_plan).all()
+    
+    # Statistiques par statut
+    status_stats = db.query(
+        Tenant.status,
+        func.count(Tenant.id).label('count')
+    ).group_by(Tenant.status).all()
+    
+    # Revenus estimés (si vous avez un système de paiement)
+    monthly_revenue = 0  # À calculer selon votre système
+    
+    return {
+        "plans": {plan: count for plan, count in plan_stats},
+        "status": {status: count for status, count in status_stats},
+        "total_tenants": sum(count for _, count in plan_stats),
+        "monthly_revenue_estimate": monthly_revenue,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+@router.get("/debug/whoami", status_code=status.HTTP_200_OK)
+async def debug_whoami(
+    current_user: User = Depends(get_current_active_user)  # Note: pas verify_super_admin
+):
+    """Voir l'utilisateur actuel (sans vérification de rôle)"""
+    return {
+        "user": {
+            "id": str(current_user.id),
+            "email": current_user.email,
+            "role": current_user.role,
+            "actif": current_user.actif
+        },
+        "is_super_admin": current_user.role in ["superadmin", "super_admin"]
+    }
+
+@router.get("/debug/test-auth", status_code=status.HTTP_200_OK)
+async def debug_test_auth(
+    current_user: User = Depends(verify_super_admin)  # Avec vérification
+):
+    """Teste la vérification super admin"""
+    return {"message": "Succès", "user": current_user.email}

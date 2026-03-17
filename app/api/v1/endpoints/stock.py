@@ -331,7 +331,7 @@ async def adjust_stock(
         old_quantity = product.quantity
         product.quantity = adjustment.new_quantity
         product.available_quantity = max(0, adjustment.new_quantity - product.reserved_quantity)
-        product.last_adjustment_date = datetime.utcnow()
+        product.last_adjustment_date = datetime.datetime.now(datetime.timezone.utc)
         
         # Mettre à jour les statuts
         product.update_stock_status()
@@ -388,7 +388,7 @@ async def inventory_count(
         # Mettre à jour le produit
         product.quantity = count_request.counted_quantity
         product.available_quantity = max(0, count_request.counted_quantity - product.reserved_quantity)
-        product.last_adjustment_date = datetime.utcnow()
+        product.last_adjustment_date = datetime.datetime.now(datetime.timezone.utc)
         product.update_stock_status()
         
         # Créer un enregistrement d'inventaire
@@ -764,7 +764,7 @@ async def export_stock(
                 "format": export_format.value,
                 "item_count": len(export_data),
                 "user_email": current_user.email,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.datetime.utcnow().isoformat()
             }
         
         # Retourner directement les données (pour les petits exports)

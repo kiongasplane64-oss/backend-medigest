@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "@yudiel/react-qr-scanner": "^2.5.1",
+    "react-hot-toast": "^2.6.0",
+    "react-hotkeys-hook": "^5.2.4"
+  }
+}

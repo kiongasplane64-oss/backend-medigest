@@ -780,7 +780,7 @@ def report_health_check():
     """
     return {
         "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.datetime.utcnow().isoformat(),
         "version": "1.0.0",
         "services": {
             "sales_reports": "available",

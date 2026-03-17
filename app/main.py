@@ -1,24 +1,35 @@
+from __future__ import annotations
+
+import datetime
+import logging
+from typing import Optional
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import datetime
-import os
-# Import des routeurs
+from fastapi.routing import APIRouter
+from sqlalchemy import text
+
+from app.db.session import engine
+
+# Routers v1
 from app.api.v1.tenants import router as tenant_router
 from app.api.v1.auth import router as auth_router
-from app.api.v1.subscriptions import router as subscription_router
+from app.api.v1.subscriptions import router as subscriptions_router
 from app.api.v1.payments import router as payment_router
+from app.api.v1.superadmin import router as superadmin_router
 from app.api.v1.sync import router as sync_router
 from app.api.v1.sales import router as sales_router
-from app.api.v1.stock import router as stock_router
 from app.api.v1.clients import router as clients_router
 from app.api.v1.reports import router as reports_router
 from app.api.v1.payments_saas import router as saas_payments_router
-from app.api.routes.pharmacies import router as pharmacies_router
-from app.api.routes.tenants import router as admin_tenants_router
+from app.api.v1.endpoints.stock import router as stock_router
 from app.api.v1.endpoints.products import router as products_router
 from app.api.v1 import users
-from sqlalchemy import text
-from app.db.session import engine  
+
+# Routers admin / legacy
+from app.api.routes.pharmacies import router as pharmacies_router
+from app.api.routes.tenants import router as admin_tenants_router
+from app.api.routes.inventory import router as inventory_router
 
 # Middlewares
 from app.middleware.tenant_context import TenantContextMiddleware
@@ -27,16 +38,34 @@ from app.middleware.audit_middleware import AuditMiddleware
 from app.middleware.auth_middleware import AuthMiddleware
 
 
+def utc_iso() -> str:
+    return datetime.datetime.utcnow().replace(
+        tzinfo=datetime.timezone.utc
+    ).isoformat()
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+logging.getLogger("app").setLevel(logging.INFO)
+
+
 app = FastAPI(
     title="MEDIGEST API",
     description="API pour la gestion des pharmacies MEDIGEST",
     version="1.0.0",
     openapi_url="/api/v1/openapi.json",
     docs_url="/api/docs",
-    redoc_url="/api/redoc"
+    redoc_url="/api/redoc",
 )
 
-# Configuration CORS - À PLACER EN PREMIER
+
+# ============================================================================
+# CORS
+# ============================================================================
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -47,7 +76,7 @@ app.add_middleware(
         "http://127.0.0.1:3000",
         "https://medigestpro.net",
         "https://www.medigestpro.net",
-        "https://frontend-medigest.vercel.app"
+        "https://frontend-medigest.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -55,69 +84,143 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-# Middlewares personnalisés (après CORS)
+# Middlewares personnalisés
 app.add_middleware(TenantContextMiddleware)
 app.add_middleware(RateLimitMiddleware, request_limit=100, window_seconds=60)
 app.add_middleware(AuditMiddleware)
 app.add_middleware(AuthMiddleware)
 
-# Routes de base (une seule fois chacune)
-@app.get("/")
+
+# ============================================================================
+# HELPERS ROUTERS
+# ============================================================================
+
+def include_router_auto(
+    application: FastAPI,
+    router: APIRouter,
+    *,
+    default_prefix: Optional[str] = "/api/v1",
+    tags: Optional[list[str]] = None,
+) -> None:
+    """
+    Inclut un routeur sans casser ses routes existantes.
+
+    Règles :
+    - si le routeur commence déjà par /api/v1 -> on ne rajoute rien
+    - sinon si default_prefix est défini -> on le rajoute
+    - sinon on l'inclut tel quel
+    """
+    router_prefix = getattr(router, "prefix", "") or ""
+
+    if router_prefix.startswith("/api/v1"):
+        final_prefix = None
+    elif default_prefix:
+        final_prefix = default_prefix
+    else:
+        final_prefix = None
+
+    if final_prefix:
+        application.include_router(router, prefix=final_prefix, tags=tags)
+        logger.info(
+            "✅ Router inclus: prefix ajouté=%s | router.prefix=%s",
+            final_prefix,
+            router_prefix,
+        )
+    else:
+        application.include_router(router, tags=tags)
+        logger.info(
+            "✅ Router inclus sans prefix ajouté | router.prefix=%s",
+            router_prefix,
+        )
+
+
+# ============================================================================
+# ROUTES SYSTÈME
+# ============================================================================
+
+@app.get("/", tags=["System"])
 def read_root():
     return {
         "message": "Bienvenue sur l'API MEDIGEST",
-        "version": "1.0.0",
+        "version": app.version,
         "docs": "/api/docs",
         "health": "/health",
-        "timestamp": datetime.datetime.utcnow().isoformat()
+        "timestamp": utc_iso(),
     }
 
-@app.get("/health")
+
+@app.get("/health", tags=["System"])
 def health_check():
     return {
         "status": "healthy",
         "service": "medigest-api",
-        "version": "1.0.0",
-        "timestamp": datetime.datetime.utcnow().isoformat()
+        "version": app.version,
+        "timestamp": utc_iso(),
     }
 
-# Inclusion des routeurs avec leurs préfixes
-app.include_router(saas_payments_router)
-app.include_router(tenant_router)
-app.include_router(auth_router)
-app.include_router(subscription_router)
-app.include_router(payment_router)
-app.include_router(sync_router)
-app.include_router(sales_router)
-app.include_router(stock_router)
-app.include_router(clients_router)
-app.include_router(reports_router)
-app.include_router(pharmacies_router)
-app.include_router(admin_tenants_router)
 
-# Routeur users avec préfixe
-app.include_router(
-    users.router,
-    prefix="/api/v1",
-    tags=["Users"]
-)
-
-# Routeur products avec préfixe
-app.include_router(
-    products_router,
-    prefix="/api/v1",
-    tags=["Products"]
-)
-
-
-
-@app.get("/debug/tables")
+@app.get("/debug/tables", tags=["Debug"])
 def debug_tables():
-    with engine.connect() as c:
-        rows = c.execute(text("""
-            SELECT tablename
-            FROM pg_tables
-            WHERE schemaname = 'public'
-            ORDER BY tablename;
-        """)).fetchall()
-    return {"tables": [r[0] for r in rows]}
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT tablename
+                FROM pg_tables
+                WHERE schemaname = 'public'
+                ORDER BY tablename;
+                """
+            )
+        ).fetchall()
+
+    return {"tables": [row[0] for row in rows]}
+
+
+@app.get("/debug/routes", tags=["Debug"])
+def debug_routes():
+    routes = []
+
+    for route in app.routes:
+        methods = sorted(list(route.methods)) if getattr(route, "methods", None) else []
+        routes.append(
+            {
+                "path": route.path,
+                "name": route.name,
+                "methods": methods,
+            }
+        )
+
+    return {"routes": routes}
+
+
+# ============================================================================
+# ROUTERS API V1
+# ============================================================================
+
+# Ces routeurs seront inclus automatiquement :
+# - si le router a déjà prefix="/api/v1/..." => pas de doublon
+# - sinon => on ajoute "/api/v1"
+
+include_router_auto(app, tenant_router)
+include_router_auto(app, auth_router)
+include_router_auto(app, subscriptions_router)
+include_router_auto(app, payment_router)
+include_router_auto(app, sync_router)
+include_router_auto(app, sales_router)
+include_router_auto(app, clients_router)
+include_router_auto(app, reports_router)
+include_router_auto(app, saas_payments_router)
+include_router_auto(app, superadmin_router)
+include_router_auto(app, stock_router, tags=["Stock"])
+include_router_auto(app, products_router, tags=["Products"])
+include_router_auto(app, inventory_router, tags=["Inventory"])
+include_router_auto(app, users.router, tags=["Users"])
+
+
+# ============================================================================
+# ROUTERS LEGACY / ADMIN
+# ============================================================================
+
+# Ceux-ci restent tels quels, sauf si tu veux aussi les normaliser plus tard.
+include_router_auto(app, pharmacies_router, default_prefix=None)
+include_router_auto(app, admin_tenants_router, default_prefix=None)

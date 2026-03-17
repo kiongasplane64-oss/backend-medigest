@@ -1,4 +1,9 @@
 # app/schemas/subscription.py
+"""
+Schémas Pydantic pour la gestion des abonnements.
+Définit les structures de données pour les API de souscription.
+"""
+
 from pydantic import BaseModel, Field, validator, ConfigDict
 from typing import Optional, List, Dict, Any
 from datetime import datetime, date
@@ -6,69 +11,215 @@ from uuid import UUID
 from decimal import Decimal
 from enum import Enum
 
-from app.models.subscription import (
-    SubscriptionPlan, 
-    BillingPeriod, 
-    SubscriptionStatus,
-    PaymentStatus,
-    PaymentMethod
-)
-
 
 # =======================
 # ENUMS POUR VALIDATION
 # =======================
+
 class SubscriptionPlanEnum(str, Enum):
-    starter = "starter"
-    professional = "professional"
-    enterprise = "enterprise"
-    essai = "essai"
+    """Plans d'abonnement disponibles"""
+    TRIAL = "trial"
+    STARTER = "starter"
+    PROFESSIONAL = "professional"
+    ENTERPRISE = "enterprise"
+    
+    @classmethod
+    def _missing_(cls, value):
+        """Gestion des valeurs manquantes (compatibilité)"""
+        if value == "essai":
+            return cls.TRIAL
+        return None
 
 
 class BillingPeriodEnum(str, Enum):
-    monthly = "monthly"
-    quarterly = "quarterly"
-    annual = "annual"
+    """Périodes de facturation"""
+    MONTHLY = "monthly"
+    QUARTERLY = "quarterly"
+    YEARLY = "yearly"
+    
+    @classmethod
+    def _missing_(cls, value):
+        """Gestion des valeurs manquantes (compatibilité)"""
+        if value in ["annual", "annuel", "year"]:
+            return cls.YEARLY
+        if value in ["mensuel", "mois"]:
+            return cls.MONTHLY
+        if value in ["trimestriel", "trimestre"]:
+            return cls.QUARTERLY
+        return None
 
 
 class SubscriptionStatusEnum(str, Enum):
-    active = "active"
-    pending = "pending"
-    trial = "trial"
-    expired = "expired"
-    suspended = "suspended"
-    cancelled = "cancelled"
+    """Statuts d'abonnement"""
+    ACTIVE = "active"
+    PENDING = "pending"
+    TRIAL = "trial"
+    EXPIRED = "expired"
+    SUSPENDED = "suspended"
+    CANCELLED = "cancelled"
+    
+    @classmethod
+    def _missing_(cls, value):
+        """Gestion des valeurs manquantes (compatibilité)"""
+        if value == "inactive":
+            return cls.EXPIRED
+        return None
 
 
 class PaymentStatusEnum(str, Enum):
-    pending = "pending"
-    completed = "completed"
-    failed = "failed"
-    refunded = "refunded"
-    partially_refunded = "partially_refunded"
+    """Statuts de paiement"""
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    REFUNDED = "refunded"
+    PARTIALLY_REFUNDED = "partially_refunded"
 
 
 class PaymentMethodEnum(str, Enum):
-    cash = "cash"
-    mobile_money = "mobile_money"
-    bank_transfer = "bank_transfer"
-    card = "card"
-    other = "other"
+    """Méthodes de paiement"""
+    CASH = "cash"
+    MOBILE_MONEY = "mobile_money"
+    BANK_TRANSFER = "bank_transfer"
+    CARD = "card"
+    OTHER = "other"
 
 
 # =======================
-# SCHÉMAS DE BASE
+# SCHÉMAS DE BASE (UTILISÉS DANS subscriptions.py)
 # =======================
+
+class PlanResponseSchema(BaseModel):
+    """
+    Schéma de réponse pour un plan d'abonnement.
+    Utilisé dans l'endpoint GET /subscriptions/plans
+    """
+    id: str
+    name: str
+    price_monthly: float
+    price_yearly: float
+    max_users: str
+    max_products: str
+    max_pharmacies: str
+    features: List[str]
+    is_trial: bool = False
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UpgradeSubscriptionSchema(BaseModel):
+    """
+    Schéma pour la mise à niveau d'un abonnement.
+    Utilisé dans l'endpoint POST /subscriptions/upgrade
+    """
+    plan: str = Field(..., pattern="^(starter|professional|enterprise)$")
+    billing_cycle: str = Field("monthly", pattern="^(monthly|yearly)$")
+    payment_id: Optional[str] = None
+    payment_method: Optional[str] = None
+    reference: Optional[str] = None
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ManualActivationSchema(BaseModel):
+    """
+    Schéma pour l'activation manuelle d'un abonnement (super admin).
+    Utilisé dans l'endpoint POST /super-admin/subscriptions/manual-activation
+    """
+    user_id: UUID
+    plan: str = Field(..., pattern="^(starter|professional|enterprise)$")
+    billing_cycle: str = Field("monthly", pattern="^(monthly|yearly)$")
+    payment_method: str = Field(..., pattern="^(cash|bank_transfer|mobile_money)$")
+    amount: float = Field(..., gt=0)
+    payment_id: Optional[str] = None
+    reference: Optional[str] = None
+    notes: Optional[str] = None
+    
+    @validator('amount')
+    def validate_amount(cls, v, values):
+        """
+        Vérifie que le montant correspond au plan.
+        Cette validation est optionnelle et peut être désactivée.
+        """
+        # Import conditionnel pour éviter les dépendances circulaires
+        try:
+            from app.services.subscription_service import PLAN_CONFIG
+            plan = values.get('plan')
+            if plan and plan in PLAN_CONFIG:
+                expected = float(PLAN_CONFIG[plan]['price_monthly'])
+                if abs(v - expected) > 0.01:  # Tolérance de 1 centime
+                    # Warning au lieu d'erreur pour permettre les ajustements manuels
+                    import logging
+                    logging.warning(f"Montant {v} différent du prix standard {expected} pour le plan {plan}")
+        except ImportError:
+            pass  # Ignorer la validation si le service n'est pas disponible
+        return v
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SubscriptionFilterSchema(BaseModel):
+    """
+    Schéma pour filtrer les abonnements.
+    Utilisé dans l'endpoint GET /super-admin/subscriptions
+    """
+    status: Optional[str] = Field(None, pattern="^(active|expired|trial|all)$")
+    plan: Optional[str] = Field(None, pattern="^(trial|starter|professional|enterprise)$")
+    tenant_id: Optional[UUID] = None
+    search: Optional[str] = None
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SubscriptionResponseSchema(BaseModel):
+    """
+    Schéma de réponse pour un abonnement.
+    Utilisé dans l'endpoint GET /subscriptions/my-status
+    """
+    id: UUID
+    user_id: UUID
+    tenant_id: UUID
+    plan_type: str
+    plan_name: str
+    status: str
+    is_active: bool
+    days_remaining: int
+    start_date: datetime
+    end_date: Optional[datetime]
+    trial_end_date: Optional[datetime]
+    price: float
+    currency: str
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SubscriptionDetailSchema(SubscriptionResponseSchema):
+    """
+    Schéma détaillé d'un abonnement avec informations utilisateur.
+    """
+    user_email: Optional[str] = None
+    user_name: Optional[str] = None
+    tenant_name: Optional[str] = None
+    billing_cycle: Optional[str] = None
+    auto_renew: Optional[bool] = True
+    config: Optional[Dict[str, Any]] = None
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+# =======================
+# SCHÉMAS DE BASE (MODÈLES COMPLETS)
+# =======================
+
 class SubscriptionBase(BaseModel):
     """Schéma de base pour un abonnement"""
-    plan: SubscriptionPlanEnum = Field(default=SubscriptionPlanEnum.starter, description="Plan d'abonnement")
+    plan: SubscriptionPlanEnum = Field(default=SubscriptionPlanEnum.TRIAL, description="Plan d'abonnement")
     plan_name: Optional[str] = Field(None, max_length=100, description="Nom du plan affiché")
-    billing_period: BillingPeriodEnum = Field(default=BillingPeriodEnum.monthly, description="Période de facturation")
-    status: SubscriptionStatusEnum = Field(default=SubscriptionStatusEnum.trial, description="Statut de l'abonnement")
+    billing_period: BillingPeriodEnum = Field(default=BillingPeriodEnum.MONTHLY, description="Période de facturation")
+    status: SubscriptionStatusEnum = Field(default=SubscriptionStatusEnum.TRIAL, description="Statut de l'abonnement")
     
     # Prix
     monthly_price: Decimal = Field(default=Decimal('0.00'), ge=Decimal('0.00'), description="Prix mensuel")
-    annual_price: Decimal = Field(default=Decimal('0.00'), ge=Decimal('0.00'), description="Prix annuel")
+    yearly_price: Decimal = Field(default=Decimal('0.00'), ge=Decimal('0.00'), description="Prix annuel")
     current_price: Optional[Decimal] = Field(None, ge=Decimal('0.00'), description="Prix actuel selon période")
     
     # Taxes et remises
@@ -84,9 +235,9 @@ class SubscriptionBase(BaseModel):
     cancellation_date: Optional[datetime] = Field(None, description="Date d'annulation")
     
     # Limites
-    max_users: int = Field(default=3, ge=1, description="Nombre maximum d'utilisateurs")
-    max_products: Optional[int] = Field(None, ge=0, description="Nombre maximum de produits")
-    max_storage_mb: int = Field(default=1024, ge=10, description="Stockage maximum en MB")
+    max_users: int = Field(default=1, ge=1, description="Nombre maximum d'utilisateurs")
+    max_products: int = Field(default=100, ge=0, description="Nombre maximum de produits (0 = illimité)")
+    max_pharmacies: int = Field(default=1, ge=1, description="Nombre maximum de pharmacies")
     
     # Fonctionnalités
     features: Optional[List[str]] = Field(None, description="Liste des fonctionnalités incluses")
@@ -94,7 +245,7 @@ class SubscriptionBase(BaseModel):
     # Configuration
     auto_renew: bool = Field(default=True, description="Renouvellement automatique")
     notes: Optional[str] = Field(None, description="Notes internes")
-    subscribe_metadata: Optional[Dict[str, Any]] = Field(None, description="Métadonnées additionnelles")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Métadonnées additionnelles")
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -104,12 +255,12 @@ class SubscriptionBase(BaseModel):
         if v is None and 'plan' in values:
             plan = values['plan']
             plan_names = {
-                SubscriptionPlanEnum.starter: "Starter",
-                SubscriptionPlanEnum.professional: "Professional",
-                SubscriptionPlanEnum.enterprise: "Enterprise",
-                SubscriptionPlanEnum.essai: "Essai Gratuit"
+                SubscriptionPlanEnum.TRIAL: "Essai gratuit",
+                SubscriptionPlanEnum.STARTER: "Starter",
+                SubscriptionPlanEnum.PROFESSIONAL: "Professional",
+                SubscriptionPlanEnum.ENTERPRISE: "Enterprise"
             }
-            return plan_names.get(plan, str(plan).title())
+            return plan_names.get(plan, str(plan.value).title())
         return v
     
     @validator('current_price', pre=True, always=True)
@@ -118,15 +269,17 @@ class SubscriptionBase(BaseModel):
         if v is None:
             billing_period = values.get('billing_period')
             monthly_price = values.get('monthly_price')
-            annual_price = values.get('annual_price')
+            yearly_price = values.get('yearly_price')
             
-            if billing_period == BillingPeriodEnum.monthly and monthly_price:
+            if billing_period == BillingPeriodEnum.MONTHLY and monthly_price:
                 return monthly_price
-            elif billing_period == BillingPeriodEnum.annual and annual_price:
-                return annual_price
-            elif billing_period == BillingPeriodEnum.quarterly and monthly_price:
+            elif billing_period == BillingPeriodEnum.YEARLY and yearly_price:
+                return yearly_price
+            elif billing_period == BillingPeriodEnum.QUARTERLY and monthly_price:
                 # Trimestriel = 3 x mensuel
                 return monthly_price * 3
+            elif monthly_price:
+                return monthly_price
         return v
     
     @validator('end_date')
@@ -150,38 +303,16 @@ class SubscriptionBase(BaseModel):
             if trial_days > 90:
                 raise ValueError('La période d\'essai ne peut pas dépasser 90 jours')
         return v
-    
-    @validator('max_users')
-    def validate_max_users_by_plan(cls, v, values):
-        """Validation du nombre d'utilisateurs selon le plan"""
-        plan = values.get('plan')
-        
-        if plan == SubscriptionPlanEnum.starter and v > 10:
-            raise ValueError('Le plan Starter est limité à 10 utilisateurs maximum')
-        elif plan == SubscriptionPlanEnum.professional and v > 50:
-            raise ValueError('Le plan Professional est limité à 50 utilisateurs maximum')
-        # Enterprise n'a pas de limite
-        
-        return v
-    
-    @validator('features')
-    def validate_features(cls, v):
-        """Validation de la liste des fonctionnalités"""
-        if v is not None:
-            if not isinstance(v, list):
-                raise ValueError('Les fonctionnalités doivent être une liste')
-            for feature in v:
-                if not isinstance(feature, str):
-                    raise ValueError('Chaque fonctionnalité doit être une chaîne de caractères')
-        return v
 
 
 # =======================
 # SCHÉMAS DE CRÉATION
 # =======================
+
 class SubscriptionCreate(SubscriptionBase):
     """Schéma pour la création d'un nouvel abonnement"""
     tenant_id: UUID = Field(..., description="ID du tenant (pharmacie)")
+    user_id: UUID = Field(..., description="ID de l'utilisateur")
     subscription_code: Optional[str] = Field(None, max_length=50, description="Code d'abonnement unique")
     
     @validator('subscription_code', pre=True, always=True)
@@ -189,7 +320,6 @@ class SubscriptionCreate(SubscriptionBase):
         """Génère un code d'abonnement si non fourni"""
         if v is None:
             import uuid
-            from datetime import datetime
             date_str = datetime.now().strftime('%Y%m%d')
             unique_part = uuid.uuid4().hex[:8].upper()
             return f"SUB-{date_str}-{unique_part}"
@@ -205,9 +335,11 @@ class SubscriptionCreate(SubscriptionBase):
 
 class SubscriptionTrialCreate(BaseModel):
     """Schéma pour créer un abonnement d'essai"""
-    plan: SubscriptionPlanEnum = Field(default=SubscriptionPlanEnum.essai, description="Plan d'essai")
-    trial_days: int = Field(default=14, ge=1, le=90, description="Durée de l'essai en jours")
+    user_id: UUID = Field(..., description="ID de l'utilisateur")
     tenant_id: UUID = Field(..., description="ID du tenant")
+    trial_days: int = Field(default=14, ge=1, le=90, description="Durée de l'essai en jours")
+    
+    model_config = ConfigDict(from_attributes=True)
 
 
 class SubscriptionUpgradeRequest(BaseModel):
@@ -217,6 +349,8 @@ class SubscriptionUpgradeRequest(BaseModel):
     immediate: bool = Field(default=False, description="Appliquer immédiatement")
     pro_rated: bool = Field(default=True, description="Ajustement pro-rata")
     reason: Optional[str] = Field(None, max_length=500, description="Raison de la mise à niveau")
+    
+    model_config = ConfigDict(from_attributes=True)
 
 
 class SubscriptionRenewalRequest(BaseModel):
@@ -224,11 +358,14 @@ class SubscriptionRenewalRequest(BaseModel):
     billing_period: Optional[BillingPeriodEnum] = Field(None, description="Période de facturation pour le renouvellement")
     auto_renew: Optional[bool] = Field(None, description="Activer/désactiver le renouvellement automatique")
     payment_method: Optional[PaymentMethodEnum] = Field(None, description="Méthode de paiement")
+    
+    model_config = ConfigDict(from_attributes=True)
 
 
 # =======================
 # SCHÉMAS DE MISE À JOUR
 # =======================
+
 class SubscriptionUpdate(BaseModel):
     """Schéma pour mettre à jour un abonnement existant"""
     plan: Optional[SubscriptionPlanEnum] = None
@@ -238,7 +375,7 @@ class SubscriptionUpdate(BaseModel):
     
     # Prix
     monthly_price: Optional[Decimal] = Field(None, ge=Decimal('0.00'))
-    annual_price: Optional[Decimal] = Field(None, ge=Decimal('0.00'))
+    yearly_price: Optional[Decimal] = Field(None, ge=Decimal('0.00'))
     current_price: Optional[Decimal] = Field(None, ge=Decimal('0.00'))
     
     # Taxes et remises
@@ -255,12 +392,12 @@ class SubscriptionUpdate(BaseModel):
     # Limites
     max_users: Optional[int] = Field(None, ge=1)
     max_products: Optional[int] = Field(None, ge=0)
-    max_storage_mb: Optional[int] = Field(None, ge=10)
+    max_pharmacies: Optional[int] = Field(None, ge=1)
     
     # Configuration
     auto_renew: Optional[bool] = None
     notes: Optional[str] = None
-    subscribe_metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -277,15 +414,19 @@ class SubscriptionStatusUpdate(BaseModel):
         if v and v < datetime.now():
             raise ValueError('La date d\'effet ne peut pas être dans le passé')
         return v
+    
+    model_config = ConfigDict(from_attributes=True)
 
 
 # =======================
 # SCHÉMAS DE RÉPONSE
 # =======================
+
 class SubscriptionResponse(SubscriptionBase):
     """Schéma de réponse complet pour un abonnement"""
     id: UUID
     tenant_id: UUID
+    user_id: UUID
     subscription_code: str
     
     # Calculs
@@ -300,13 +441,9 @@ class SubscriptionResponse(SubscriptionBase):
     updated_at: datetime
     created_by: Optional[UUID] = None
     
-    # Relations
-    payments_count: Optional[int] = Field(0, description="Nombre de paiements")
-    active_payments_count: Optional[int] = Field(0, description="Nombre de paiements actifs")
-    
     model_config = ConfigDict(from_attributes=True)
     
-    @validator('total_amount', pre=True)
+    @validator('total_amount', pre=True, always=True)
     def calculate_total_amount(cls, v, values):
         """Calcule le montant total automatiquement"""
         if v is None:
@@ -335,7 +472,7 @@ class SubscriptionResponse(SubscriptionBase):
             return current_price.quantize(Decimal('0.01'))
         return v
     
-    @validator('days_remaining', pre=True)
+    @validator('days_remaining', pre=True, always=True)
     def calculate_days_remaining(cls, v, values):
         """Calcule les jours restants"""
         if v is None:
@@ -347,39 +484,39 @@ class SubscriptionResponse(SubscriptionBase):
             return 0
         return v
     
-    @validator('trial_days_remaining', pre=True)
+    @validator('trial_days_remaining', pre=True, always=True)
     def calculate_trial_days_remaining(cls, v, values):
         """Calcule les jours d'essai restants"""
         if v is None:
             trial_end_date = values.get('trial_end_date')
             status = values.get('status')
-            if trial_end_date and status == SubscriptionStatusEnum.trial:
+            if trial_end_date and status == SubscriptionStatusEnum.TRIAL:
                 now = datetime.now()
                 if trial_end_date > now:
                     return (trial_end_date - now).days
             return 0
         return v
     
-    @validator('is_active', pre=True)
+    @validator('is_active', pre=True, always=True)
     def calculate_is_active(cls, v, values):
         """Détermine si l'abonnement est actif"""
         if v is None:
             status = values.get('status')
             end_date = values.get('end_date')
             if end_date:
-                return status == SubscriptionStatusEnum.active and end_date > datetime.now()
-            return status == SubscriptionStatusEnum.active
+                return status == SubscriptionStatusEnum.ACTIVE and end_date > datetime.now()
+            return status == SubscriptionStatusEnum.ACTIVE
         return v
     
-    @validator('is_trial', pre=True)
+    @validator('is_trial', pre=True, always=True)
     def calculate_is_trial(cls, v, values):
         """Détermine si l'abonnement est en essai"""
         if v is None:
             status = values.get('status')
             trial_end_date = values.get('trial_end_date')
             if trial_end_date:
-                return status == SubscriptionStatusEnum.trial and trial_end_date > datetime.now()
-            return status == SubscriptionStatusEnum.trial
+                return status == SubscriptionStatusEnum.TRIAL and trial_end_date > datetime.now()
+            return status == SubscriptionStatusEnum.TRIAL
         return v
 
 
@@ -388,6 +525,8 @@ class SubscriptionSummaryResponse(BaseModel):
     id: UUID
     subscription_code: str
     tenant_id: UUID
+    user_id: UUID
+    user_email: Optional[str] = None
     plan: str
     plan_name: str
     billing_period: str
@@ -408,24 +547,26 @@ class SubscriptionCreationResponse(BaseModel):
     subscription: SubscriptionResponse
     next_steps: List[str] = Field(
         default_factory=lambda: [
-            "1. Abonnement créé avec succès",
-            "2. Période d'essai activée",
-            "3. Limites configurées",
-            "4. Prêt à utiliser"
+            "Abonnement créé avec succès",
+            "Période d'essai activée",
+            "Limites configurées",
+            "Prêt à utiliser"
         ]
     )
+    
+    model_config = ConfigDict(from_attributes=True)
 
 
 # =======================
 # SCHÉMAS DE PAIEMENT
 # =======================
-class PaymentBase(BaseModel):
 
+class PaymentBase(BaseModel):
     """Schéma de base pour un paiement"""
     subscription_id: UUID = Field(..., description="ID de l'abonnement")
     amount: Decimal = Field(..., gt=Decimal('0.00'), description="Montant dû")
     amount_paid: Decimal = Field(default=Decimal('0.00'), ge=Decimal('0.00'), description="Montant payé")
-    status: PaymentStatusEnum = Field(default=PaymentStatusEnum.pending, description="Statut du paiement")
+    status: PaymentStatusEnum = Field(default=PaymentStatusEnum.PENDING, description="Statut du paiement")
     payment_method: PaymentMethodEnum = Field(..., description="Méthode de paiement")
     payment_reference: Optional[str] = Field(None, max_length=100, description="Référence du paiement")
     
@@ -436,7 +577,7 @@ class PaymentBase(BaseModel):
     # Métadonnées
     description: Optional[str] = Field(None, description="Description")
     notes: Optional[str] = Field(None, description="Notes")
-    subscribe_metadata: Optional[Dict[str, Any]] = Field(None, description="Métadonnées additionnelles")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Métadonnées additionnelles")
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -466,7 +607,6 @@ class PaymentCreate(PaymentBase):
         """Génère un code de paiement si non fourni"""
         if v is None:
             import uuid
-            from datetime import datetime
             date_str = datetime.now().strftime('%Y%m%d')
             unique_part = uuid.uuid4().hex[:8].upper()
             return f"PAY-{date_str}-{unique_part}"
@@ -481,7 +621,7 @@ class PaymentUpdate(BaseModel):
     payment_reference: Optional[str] = Field(None, max_length=100)
     description: Optional[str] = None
     notes: Optional[str] = None
-    subscribe_metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
     paid_at: Optional[datetime] = Field(None, description="Date de paiement effectif")
     
     model_config = ConfigDict(from_attributes=True)
@@ -503,7 +643,7 @@ class PaymentResponse(PaymentBase):
     
     model_config = ConfigDict(from_attributes=True)
     
-    @validator('is_complete', pre=True)
+    @validator('is_complete', pre=True, always=True)
     def calculate_is_complete(cls, v, values):
         """Détermine si le paiement est complet"""
         if v is None:
@@ -512,151 +652,25 @@ class PaymentResponse(PaymentBase):
             amount_paid = values.get('amount_paid')
             
             return (
-                status == PaymentStatusEnum.completed and
+                status == PaymentStatusEnum.COMPLETED and
                 amount_paid >= amount
             )
         return v
     
-    @validator('amount_due', pre=True)
+    @validator('amount_due', pre=True, always=True)
     def calculate_amount_due(cls, v, values):
         """Calcule le montant restant dû"""
         if v is None:
             amount = values.get('amount', Decimal('0.00'))
             amount_paid = values.get('amount_paid', Decimal('0.00'))
-            return amount - amount_paid
+            return (amount - amount_paid).quantize(Decimal('0.01'))
         return v
-
-
-# =======================
-# SCHÉMAS DE FACTURATION
-# =======================
-class InvoiceItem(BaseModel):
-    """Élément de facture"""
-    description: str = Field(..., max_length=200, description="Description")
-    quantity: Decimal = Field(default=Decimal('1.00'), gt=Decimal('0.00'), description="Quantité")
-    unit_price: Decimal = Field(..., gt=Decimal('0.00'), description="Prix unitaire")
-    tax_rate: Decimal = Field(default=Decimal('0.00'), ge=Decimal('0.00'), le=Decimal('100.00'), description="Taux de taxe (%)")
-    discount_percent: Decimal = Field(default=Decimal('0.00'), ge=Decimal('0.00'), le=Decimal('100.00'), description="Remise (%)")
-    
-    @property
-    def subtotal(self) -> Decimal:
-        """Sous-total avant taxes et remises"""
-        return (self.quantity * self.unit_price).quantize(Decimal('0.01'))
-    
-    @property
-    def discount_amount(self) -> Decimal:
-        """Montant de la remise"""
-        return (self.subtotal * self.discount_percent / Decimal('100')).quantize(Decimal('0.01'))
-    
-    @property
-    def taxable_amount(self) -> Decimal:
-        """Montant taxable"""
-        return (self.subtotal - self.discount_amount).quantize(Decimal('0.01'))
-    
-    @property
-    def tax_amount(self) -> Decimal:
-        """Montant de la taxe"""
-        return (self.taxable_amount * self.tax_rate / Decimal('100')).quantize(Decimal('0.01'))
-    
-    @property
-    def total(self) -> Decimal:
-        """Total de l'élément"""
-        return (self.taxable_amount + self.tax_amount).quantize(Decimal('0.01'))
-
-
-class InvoiceCreate(BaseModel):
-    """Création d'une facture"""
-    subscription_id: UUID = Field(..., description="ID de l'abonnement")
-    invoice_date: date = Field(default_factory=lambda: date.today(), description="Date de facturation")
-    due_date: date = Field(..., description="Date d'échéance")
-    items: List[InvoiceItem] = Field(..., min_items=1, description="Éléments de facturation")
-    notes: Optional[str] = Field(None, description="Notes")
-    
-    @validator('due_date')
-    def validate_due_date(cls, v, values):
-        """Validation de la date d'échéance"""
-        invoice_date = values.get('invoice_date')
-        if invoice_date and v <= invoice_date:
-            raise ValueError('La date d\'échéance doit être après la date de facturation')
-        return v
-    
-    @property
-    def subtotal(self) -> Decimal:
-        """Sous-total de la facture"""
-        total = Decimal('0.00')
-        for item in self.items:
-            total += item.subtotal
-        return total.quantize(Decimal('0.01'))
-    
-    @property
-    def total_discount(self) -> Decimal:
-        """Total des remises"""
-        total = Decimal('0.00')
-        for item in self.items:
-            total += item.discount_amount
-        return total.quantize(Decimal('0.01'))
-    
-    @property
-    def total_tax(self) -> Decimal:
-        """Total des taxes"""
-        total = Decimal('0.00')
-        for item in self.items:
-            total += item.tax_amount
-        return total.quantize(Decimal('0.01'))
-    
-    @property
-    def grand_total(self) -> Decimal:
-        """Total général"""
-        total = Decimal('0.00')
-        for item in self.items:
-            total += item.total
-        return total.quantize(Decimal('0.01'))
-
-
-class InvoiceResponse(InvoiceCreate):
-    """Réponse de facture"""
-    id: UUID
-    invoice_number: str = Field(..., description="Numéro de facture")
-    status: str = Field(..., description="Statut de la facture")
-    amount_paid: Decimal = Field(default=Decimal('0.00'), description="Montant payé")
-    
-    created_at: datetime
-    updated_at: datetime
-
-    model_config = ConfigDict(from_attributes=True)
-
-    # =======================
-    # Champs calculés
-    # =======================
-    @property
-    def subtotal(self) -> Decimal:
-        """Sous-total calculé automatiquement"""
-        return super().subtotal
-
-    @property
-    def total_discount(self) -> Decimal:
-        """Total des remises calculé automatiquement"""
-        return super().total_discount
-
-    @property
-    def total_tax(self) -> Decimal:
-        """Total des taxes calculé automatiquement"""
-        return super().total_tax
-
-    @property
-    def grand_total(self) -> Decimal:
-        """Total général calculé automatiquement"""
-        return super().grand_total
-
-    @property
-    def balance_due(self) -> Decimal:
-        """Solde restant dû"""
-        return (self.grand_total - self.amount_paid).quantize(Decimal('0.01'))
 
 
 # =======================
 # SCHÉMAS DE RAPPORT
 # =======================
+
 class SubscriptionAnalytics(BaseModel):
     """Analytics d'abonnement"""
     total_subscriptions: int = 0
@@ -700,15 +714,10 @@ class SubscriptionUsage(BaseModel):
     product_limit: Optional[int] = None
     product_usage_percent: Optional[float] = None
     
-    # Stockage
-    storage_used_mb: int = 0
-    storage_limit_mb: int = 0
-    storage_usage_percent: float = 0.0
-    
-    # API
-    api_calls_today: int = 0
-    api_calls_limit: int = 0
-    api_usage_percent: float = 0.0
+    # Pharmacies
+    pharmacy_count: int = 0
+    pharmacy_limit: int = 0
+    pharmacy_usage_percent: float = 0.0
     
     # Période
     period_start: date
@@ -717,35 +726,53 @@ class SubscriptionUsage(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-# =======================
-# SCHÉMAS D'EXPORT
-# =======================
-class SubscriptionExportRequest(BaseModel):
-    """Demande d'export des données d'abonnement"""
-    include_data: List[str] = Field(
-        default_factory=lambda: ["subscriptions", "payments", "invoices"],
-        description="Données à inclure"
-    )
-    format: str = Field(default="json", pattern="^(json|csv|excel)$", description="Format d'export")
-    period_start: Optional[date] = Field(None, description="Début de la période")
-    period_end: Optional[date] = Field(None, description="Fin de la période")
-    compress: bool = Field(default=False, description="Compresser les données")
-    
-    @validator('include_data')
-    def validate_include_data(cls, v):
-        allowed_data = ["subscriptions", "payments", "invoices", "usage", "analytics"]
-        for data_type in v:
-            if data_type not in allowed_data:
-                raise ValueError(f"Type de données non autorisé: {data_type}")
-        return v
-    
-    @validator('period_end')
-    def validate_period(cls, v, values):
-        period_start = values.get('period_start')
-        if period_start and v and v <= period_start:
-            raise ValueError('period_end doit être après period_start')
-        return 
-
 class SubscriptionInDB(SubscriptionResponse):
     """Schéma pour les données stockées en base de données"""
-    model_config = ConfigDict(from_attributes=True)
+    pass
+
+
+# =======================
+# EXPORTS
+# =======================
+
+__all__ = [
+    # Enums
+    "SubscriptionPlanEnum",
+    "BillingPeriodEnum",
+    "SubscriptionStatusEnum",
+    "PaymentStatusEnum",
+    "PaymentMethodEnum",
+    
+    # Schémas de base (utilisés dans subscriptions.py)
+    "PlanResponseSchema",
+    "UpgradeSubscriptionSchema",
+    "ManualActivationSchema",
+    "SubscriptionFilterSchema",
+    "SubscriptionResponseSchema",
+    "SubscriptionDetailSchema",
+    
+    # Schémas complets
+    "SubscriptionBase",
+    "SubscriptionCreate",
+    "SubscriptionTrialCreate",
+    "SubscriptionUpgradeRequest",
+    "SubscriptionRenewalRequest",
+    "SubscriptionUpdate",
+    "SubscriptionStatusUpdate",
+    "SubscriptionResponse",
+    "SubscriptionSummaryResponse",
+    "SubscriptionCreationResponse",
+    
+    # Paiements
+    "PaymentBase",
+    "PaymentCreate",
+    "PaymentUpdate",
+    "PaymentResponse",
+    
+    # Rapports
+    "SubscriptionAnalytics",
+    "SubscriptionUsage",
+    
+    # Compatibilité DB
+    "SubscriptionInDB"
+]

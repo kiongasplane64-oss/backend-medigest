@@ -10,7 +10,7 @@ import logging
 
 from app.db.session import get_db
 from app.models.finance import FinancialPeriod, FinancialTransaction, Capital, Expense
-from app.models.sale import Sale
+from app.models.sale import Sale, SaleItem
 from app.models.product import Product
 from app.models.tenant import Tenant
 from app.models.user import User
@@ -135,7 +135,7 @@ def get_financial_dashboard(
         monthly_target = None
         target_achievement = None
         
-        if current_tenant.config.get("monthly_sales_target"):
+        if current_tenant.config and current_tenant.config.get("monthly_sales_target"):
             monthly_target = Decimal(str(current_tenant.config["monthly_sales_target"]))
             if monthly_target > 0:
                 target_achievement = (month_to_date_sales / monthly_target) * 100
@@ -557,7 +557,7 @@ def get_stock_valuation(
                 "product_name": product.name,
                 "current_quantity": product.quantity,
                 "alert_threshold": product.alert_threshold,
-                "days_of_supply": self.calculate_days_of_supply(product, db)
+                "days_of_supply": calculate_days_of_supply(product, db)
             })
         
         return StockValuation(
@@ -703,7 +703,7 @@ def export_financial_data(
         
         # Préparer les données selon le type d'analyse
         if export_request.analysis_type == "monthly":
-            data = self.get_monthly_analysis(
+            data = get_monthly_analysis(
                 year=export_request.start_date.year if export_request.start_date else None,
                 compare_years=True,
                 db=db,
@@ -711,7 +711,7 @@ def export_financial_data(
                 current_user=current_user
             )
         elif export_request.analysis_type == "annual":
-            data = self.get_annual_analysis(
+            data = get_annual_analysis(
                 years=[],
                 include_breakdown=True,
                 db=db,
@@ -719,13 +719,13 @@ def export_financial_data(
                 current_user=current_user
             )
         elif export_request.analysis_type == "stock":
-            data = self.get_stock_valuation(
+            data = get_stock_valuation(
                 db=db,
                 current_tenant=current_tenant,
                 current_user=current_user
             )
         elif export_request.analysis_type == "capital":
-            data = self.get_capital_analysis(
+            data = get_capital_analysis(
                 db=db,
                 current_tenant=current_tenant,
                 current_user=current_user
@@ -763,7 +763,7 @@ def export_financial_data(
 # METHODES UTILITAIRES
 # ==============================================
 
-def calculate_days_of_supply(self, product, db: Session) -> Optional[int]:
+def calculate_days_of_supply(product, db: Session) -> Optional[int]:
     """
     Calcule les jours de stock restant basé sur les ventes récentes
     """
@@ -857,7 +857,7 @@ def get_detailed_kpis(
         # Marge moyenne
         avg_margin_query = db.query(
             func.avg((SaleItem.unit_price - Product.purchase_price) / Product.purchase_price * 100)
-        ).join(Product).join(Sale).filter(
+        ).join(Product, SaleItem.product_id == Product.id).join(Sale, SaleItem.sale_id == Sale.id).filter(
             Sale.tenant_id == current_tenant.id,
             Sale.created_at >= start_date,
             Sale.created_at <= end_date,

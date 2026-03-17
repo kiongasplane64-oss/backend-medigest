@@ -25,7 +25,7 @@ from app.models.user import User
 from app.models.user_pharmacy import UserPharmacy
 from app.models.payment import Payment
 from app.services.notification_service import send_sms, send_whatsapp, send_sms_with_fallback
-from app.services.subscription_service import check_subscription_status
+from app.services.subscription_service import check_subscription_status 
 from prometheus_client import Counter, Histogram
 from app.core.config import settings 
 
@@ -148,6 +148,17 @@ class SuperAdminSetup(BaseModel):
     nom_complet: str
     setup_key: str  # La clé secrète de déploiement
 
+class TokenRefreshSchema(BaseModel):
+    refresh_token: str
+
+
+class TokenPairResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    refresh_expires_in: int
+
 
 # =========================
 # FONCTIONS UTILITAIRES
@@ -265,16 +276,85 @@ def is_subscription_active(db: Session, tenant_id: str) -> bool:
         logger.error(f"Erreur lors de la vérification de l'abonnement: {e}")
         return False
 
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+REFRESH_TOKEN_EXPIRE_DAYS = 30
+
+
+def create_refresh_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    """
+    Crée un refresh token JWT.
+    """
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS))
+    to_encode.update({
+        "exp": expire,
+        "type": "refresh"
+    })
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
+def create_token_pair(user: User, subscription_active: bool, pharmacy_id: Optional[str] = None) -> dict:
+    """
+    Génère un couple access_token + refresh_token cohérent.
+    """
+    access_payload = {
+        "sub": str(user.id),
+        "tenant_id": str(user.tenant_id) if user.tenant_id else None,
+        "role": user.role,
+        "email": user.email,
+        "subscription_active": subscription_active,
+        "pharmacy_id": pharmacy_id,
+        "type": "access"
+    }
+
+    refresh_payload = {
+        "sub": str(user.id),
+        "tenant_id": str(user.tenant_id) if user.tenant_id else None,
+        "role": user.role,
+        "email": user.email,
+        "type": "refresh"
+    }
+
+    access_token = create_access_token(
+        access_payload,
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+
+    refresh_token = create_refresh_token(
+        refresh_payload,
+        expires_delta=timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    )
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "refresh_expires_in": REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60
+    }
+
+
+def decode_token_safely(token: str) -> dict:
+    try:
+        return jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    except Exception as e:
+        logger.error(f"Erreur décodage token: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token invalide ou expiré"
+        )
 
 # =========================
 # ENDPOINTS D'AUTHENTIFICATION
 # =========================
 @router.post("/tenants/register", status_code=201)
 def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
-    """Inscription d'un nouveau tenant (pharmacie)"""
+    """Inscription d'un nouveau tenant (pharmacie) avec création automatique de l'abonnement d'essai"""
     
-    # 1. VÉRIFICATIONS PRÉLIMINAIRES RENFORCÉES
-    # ------------------------------
+    # =========================
+    # 1. VÉRIFICATIONS PRÉLIMINAIRES
+    # =========================
+    
     # Vérifier l'email
     existing_user = db.query(User).filter(User.email == data.email.lower()).first()
     if existing_user:
@@ -316,13 +396,18 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
                 "suggestion": "Utilisez un autre numéro ou contactez le support"
             }
         )
-
+    
+    # Vérifier la longueur du mot de passe (limite bcrypt)
     if len(data.password.encode('utf-8')) > 72:
-        raise HTTPException(400, "Mot de passe trop long (max 72 bytes pour bcrypt).")
+        raise HTTPException(
+            status_code=400,
+            detail="Mot de passe trop long (maximum 72 caractères)"
+        )
 
+    # =========================
     # 2. GESTION DU PLAN D'ABONNEMENT
-    # --------------------------------
-    # Utiliser le plan fourni ou "professional" par défaut
+    # =========================
+    
     if not data.plan:
         raise HTTPException(400, "Plan d'abonnement requis")
 
@@ -337,18 +422,25 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
     }
 
     if plan not in plan_limits:
-        raise HTTPException(400, f"Plan invalide. Options: {', '.join(plan_limits.keys())}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Plan invalide. Options: {', '.join(plan_limits.keys())}"
+        )
 
     limits = plan_limits.get(plan)
-    
+
+    # =========================
     # 3. GÉNÉRATION DES IDENTIFIANTS UNIQUES
-    # --------------------------------------
+    # =========================
+    
     tenant_code = generate_unique_tenant_code(data.nom_pharmacie, db)
     slug = generate_unique_slug(data.nom_pharmacie, db)
     pharmacy_code = f"{tenant_code}001"
 
-    # 4. CRÉATION DU TENANT (PHARMACIE)
-    # ----------------------------------
+    # =========================
+    # 4. CRÉATION DU TENANT
+    # =========================
+    
     try:
         tenant = Tenant(
             # Identifiants
@@ -370,7 +462,7 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
             type_pharmacie=data.type_pharmacie,
             status="trial",
             
-            # Plan et limites
+            # Plan et limites (seront mises à jour après activation)
             max_users=limits["max_users"],
             max_products=limits["max_products"],
             current_plan=plan,
@@ -398,15 +490,17 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
             }
         )
 
+    # =========================
     # 5. GÉNÉRATION DU CODE DE VÉRIFICATION
-    # --------------------------------------
+    # =========================
+    
     otp = generate_otp()
 
+    # =========================
     # 6. CRÉATION DE L'UTILISATEUR ADMIN
-    # -----------------------------------
+    # =========================
+    
     try:
-        pw = data.password
-        logger.info("REGISTER pw chars=%s bytes=%s", len(pw), len(pw.encode("utf-8")))
         hashed_password = hash_password(data.password)
         admin = User(
             tenant_id=tenant.id,
@@ -414,7 +508,7 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
             email=data.email.lower(),
             password_hash=hashed_password,
             role="admin",
-            actif=False,
+            actif=False,  # Sera activé après vérification SMS
             telephone=data.telephone,
             sms_code=otp,
             sms_expires_at=datetime.utcnow() + timedelta(minutes=OTP_EXPIRATION_MIN),
@@ -423,6 +517,7 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         )
         db.add(admin)
         db.flush()  # Pour obtenir l'ID
+        
     except Exception as e:
         db.rollback()
         logger.error(f"Erreur création admin: {e}")
@@ -435,8 +530,10 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
             }
         )
 
+    # =========================
     # 7. CRÉATION DE LA PHARMACIE PRINCIPALE
-    # ---------------------------------------
+    # =========================
+    
     try:
         # Générer un numéro de licence par défaut
         license_number = f"LIC-{tenant_code}-{datetime.utcnow().strftime('%Y%m')}"
@@ -467,6 +564,7 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         )
         db.add(pharmacy)
         db.flush()  # Pour obtenir l'ID
+        
     except Exception as e:
         db.rollback()
         logger.error(f"Erreur création pharmacie: {e}")
@@ -479,8 +577,10 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
             }
         )
 
+    # =========================
     # 8. ASSOCIATION ADMIN-PHARMACIE
-    # -------------------------------
+    # =========================
+    
     try:
         association = UserPharmacy(
             user_id=admin.id,
@@ -490,32 +590,80 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         )
         db.add(association)
         
-        # 9. VALIDATION DE LA TRANSACTION
-        # --------------------------------
-        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Erreur association admin-pharmacie: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "association_failed",
+                "message": "Erreur lors de l'association admin-pharmacie",
+                "suggestion": "Contactez le support technique"
+            }
+        )
+
+    # =========================
+    # 9. CRÉATION DE L'ABONNEMENT D'ESSAI POUR L'ADMIN
+    # =========================
+    
+    from app.services.subscription_service import create_trial_subscription
+    
+    try:
+        trial_subscription = create_trial_subscription(
+            db=db,
+            user_id=admin.id,
+            tenant_id=tenant.id,
+            trial_days=14
+        )
         
     except Exception as e:
         db.rollback()
-        logger.error(f"Erreur association ou commit: {e}")
+        logger.error(f"Erreur création abonnement d'essai: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "subscription_creation_failed",
+                "message": "Erreur lors de la création de l'abonnement d'essai",
+                "suggestion": "Contactez le support technique"
+            }
+        )
+
+    # =========================
+    # 10. VALIDATION FINALE DE LA TRANSACTION
+    # =========================
+    
+    try:
+        db.commit()
+        logger.info(f"Tenant créé avec succès: {tenant_code} - Admin: {admin.email}")
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Erreur commit final: {e}")
         raise HTTPException(
             status_code=500,
             detail={
                 "error": "database_error",
-                "message": "Erreur lors de l'enregistrement",
+                "message": "Erreur lors de l'enregistrement final",
                 "suggestion": "Veuillez réessayer dans quelques instants"
             }
         )
 
-    # 10. ENVOI DU SMS DE CONFIRMATION
-    # ---------------------------------
+    # =========================
+    # 11. ENVOI DU SMS DE CONFIRMATION
+    # =========================
+    
     sms_sent = False
     whatsapp_sent = False
+    
     try:
         formatted_phone = format_phone_for_twilio(data.telephone)
         logger.info(f"Envoi SMS à {formatted_phone} - Plan: {plan}")
         
         # Utiliser send_sms_with_fallback pour meilleure fiabilité
-        result = send_sms_with_fallback(formatted_phone, f"Code de confirmation : {otp}")
+        result = send_sms_with_fallback(
+            formatted_phone, 
+            f"Bienvenue sur Medigest ! Votre code de confirmation est : {otp}"
+        )
         
         sms_sent = result.get('success', False)
         method = result.get('method', 'none')
@@ -527,27 +675,98 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
             
     except Exception as e:
         logger.error(f"Erreur envoi SMS: {e}")
-        # On continue même si le SMS échoue
+        # On continue même si le SMS échoue - l'utilisateur pourra demander un renvoi
 
-    # 11. RÉPONSE AU CLIENT
-    # ----------------------
-    return {
-        "message": "Compte créé avec succès. Confirmation SMS requise.",
-        "tenant_id": str(tenant.id),
-        "user_id": str(admin.id),
-        "tenant_code": tenant_code,
-        "pharmacy_id": str(pharmacy.id),
-        "verification_code": otp if not sms_sent else None,
-        "sms_sent": sms_sent,
-        "plan": plan,
-        "plan_name": plan_name,
-        "trial_end_date": tenant.trial_end_date.isoformat(),
-        "suggestions": {
-            "save_credentials": "Conservez vos identifiants en sécurité",
-            "complete_profile": "Complétez votre profil après activation",
-            "trial_period": f"Profitez de vos {14} jours d'essai gratuit"
-        }
+    # =========================
+    # 12. RÉPONSE AU CLIENT
+    # =========================
+    
+    response = {
+        "status": "success",
+        "message": "Pharmacie créée avec succès. Un code de confirmation a été envoyé par SMS.",
+        "data": {
+            # Identifiants principaux
+            "tenant_id": str(tenant.id),
+            "user_id": str(admin.id),
+            "tenant_code": tenant_code,
+            "pharmacy_id": str(pharmacy.id),
+            
+            # Informations SMS
+            "sms_sent": sms_sent,
+            "whatsapp_sent": whatsapp_sent,
+            "verification_code": otp if not sms_sent else None,  # Pour développement
+            
+            # Plan et abonnement
+            "plan": "trial",  # On force "trial" car c'est un essai
+            "plan_name": "Essai gratuit",
+            "trial_end_date": trial_subscription.end_date.isoformat(),
+            "trial_days": 14,
+            
+            # Détails de l'abonnement
+            "subscription": {
+                "id": str(trial_subscription.id),
+                "status": trial_subscription.status,
+                "days_remaining": trial_subscription.days_remaining(),
+                "is_trial": trial_subscription.is_trial(),
+                "mode": trial_subscription.get_mode()
+            },
+            
+            # Limites actuelles
+            "limits": {
+                "max_users": limits["max_users"],
+                "max_products": limits["max_products"],
+                "max_pharmacies": limits["max_pharmacies"]
+            },
+            
+            # Timestamps
+            "created_at": datetime.utcnow().isoformat(),
+            "trial_end_date": trial_subscription.end_date.isoformat()
+        },
+        
+        # Instructions pour l'utilisateur
+        "next_steps": {
+            "verify_phone": {
+                "message": "Vérifiez votre téléphone avec le code reçu",
+                "action": "POST /api/v1/auth/verify-sms",
+                "required_data": {
+                    "email": data.email,
+                    "code": "123456"
+                }
+            },
+            "activate_account": {
+                "message": "Après vérification, votre compte sera automatiquement activé",
+                "action": "Le code est valable 5 minutes"
+            },
+            "resend_code": {
+                "message": "Si vous n'avez pas reçu le code",
+                "action": "POST /api/v1/auth/resend-verification-code",
+                "required_data": {
+                    "email": data.email,
+                    "method": "sms"
+                }
+            },
+            "trial_info": f"Vous bénéficiez de 14 jours d'essai gratuit jusqu'au {trial_subscription.end_date.strftime('%d/%m/%Y')}",
+            "dashboard_access": "Une fois activé, accédez à votre tableau de bord via /dashboard"
+        },
+        
+        # Recommandations
+        "recommendations": [
+            "Sauvegardez vos identifiants dans un endroit sécurisé",
+            "Activez votre compte avec le code SMS reçu",
+            "Complétez le profil de votre pharmacie après activation",
+            "Explorez les fonctionnalités pendant votre période d'essai"
+        ]
     }
+    
+    # Si le SMS n'a pas été envoyé, proposer des alternatives
+    if not sms_sent:
+        response["data"]["sms_failed"] = True
+        response["next_steps"]["alternative_methods"] = {
+            "whatsapp": "POST /api/v1/auth/resend-verification-code (method=whatsapp)",
+            "email": "POST /api/v1/auth/resend-verification-code (method=email)"
+        }
+    
+    return response
 
 @router.post("/test-sms")
 def test_sms(phone: str, db: Session = Depends(get_db)):
@@ -766,13 +985,11 @@ def verify_sms(data: VerifySMSSchema, db: Session = Depends(get_db)):
         ).first()
         
         # Création du token d'accès final
-        token = create_access_token({
-            "sub": str(user.id),
-            "tenant_id": str(user.tenant_id),
-            "role": user.role,
-            "email": user.email,
-            "activated": True
-        })
+        token_pair = create_token_pair(
+            user=user,
+            subscription_active=is_subscription_active(db, str(user.tenant_id)),
+            pharmacy_id=str(pharmacy.id) if pharmacy else None
+        )
         
         db.commit()
         logger.info(f"Compte activé avec succès: {email}")
@@ -780,8 +997,7 @@ def verify_sms(data: VerifySMSSchema, db: Session = Depends(get_db)):
         # 9. Construction de la réponse
         response_data = {
             "message": "Compte activé avec succès",
-            "access_token": token,
-            "token_type": "bearer",
+            **token_pair,
             "user": {
                 "id": str(user.id),
                 "email": user.email,
@@ -1055,203 +1271,260 @@ def register_with_verified_phone(
     """
     Inscription avec numéro déjà vérifié
     """
-    # Vérifier le token
     try:
         payload = jwt.decode(
-            verification_token, 
-            settings.SECRET_KEY, 
+            verification_token,
+            settings.SECRET_KEY,
             algorithms=[settings.ALGORITHM]
         )
-        
+
         if payload.get("action") != "continue_registration":
             raise HTTPException(400, "Token invalide")
-        
+
         verified_phone = payload.get("verified_phone")
         if verified_phone != data.telephone:
             raise HTTPException(400, "Le numéro ne correspond pas")
-            
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(400, "Token expiré")
-    except jwt.InvalidTokenError:
-        raise HTTPException(400, "Token invalide")
-    
-    # Vérifier que le numéro n'est pas déjà utilisé (double sécurité)
+
+    except Exception:
+        raise HTTPException(400, "Token invalide ou expiré")
+
     phone_clean = re.sub(r'\D', '', data.telephone)
     existing = db.query(Tenant).filter(
         Tenant.telephone_principal == phone_clean
     ).first()
-    
-    if existing:
-        # Vérifier si c'est le même compte (email différent)
-        if existing.email_admin != data.email.lower():
-            raise HTTPException(
-                409,
-                detail={
-                    "error": "phone_verified_but_email_differs",
-                    "message": "Ce numéro appartient à un autre compte",
-                    "suggestion": "Utilisez un autre numéro ou connectez-vous avec l'email associé"
-                }
-            )
+
+    if existing and existing.email_admin != data.email.lower():
+        raise HTTPException(
+            409,
+            detail={
+                "error": "phone_verified_but_email_differs",
+                "message": "Ce numéro appartient à un autre compte",
+                "suggestion": "Utilisez un autre numéro ou connectez-vous avec l'email associé"
+            }
+        )
+
+    return register_tenant(data, db)
+
+@router.get("/me")
+def get_me(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    tenant = None
+    pharmacies = []
+    current_pharmacy = None
+    subscription_active = True
+
+    if current_user.tenant_id:
+        tenant = db.query(Tenant).filter(Tenant.id == current_user.tenant_id).first()
+
+        pharmacies = db.query(Pharmacy).filter(
+            Pharmacy.tenant_id == current_user.tenant_id,
+            Pharmacy.is_active == True
+        ).order_by(Pharmacy.is_main.desc(), Pharmacy.name).all()
+
+        current_pharmacy = next((p for p in pharmacies if p.is_main), pharmacies[0] if pharmacies else None)
+        subscription_active = is_subscription_active(db, str(current_user.tenant_id))
+
+    return {
+        "user": {
+            "id": str(current_user.id),
+            "email": current_user.email,
+            "nom_complet": current_user.nom_complet,
+            "role": current_user.role,
+            "tenant_id": str(current_user.tenant_id) if current_user.tenant_id else None,
+            "actif": current_user.actif,
+            "telephone": current_user.telephone
+        },
+        "tenant": {
+            "id": str(tenant.id),
+            "tenant_code": tenant.tenant_code,
+            "nom_pharmacie": tenant.nom_pharmacie,
+            "status": tenant.status
+        } if tenant else None,
+        "subscription_active": subscription_active,
+        "current_pharmacy": {
+            "id": str(current_pharmacy.id),
+            "name": current_pharmacy.name,
+            "pharmacy_code": current_pharmacy.pharmacy_code
+        } if current_pharmacy else None
+    }
 
 @router.post("/login")
 def login(data: LoginSchema, db: Session = Depends(get_db)):
-    """Connexion utilisateur"""
-    logger.info(f"Tentative de login pour: {data.email}")
-    
-    user = db.query(User).filter(User.email == data.email.lower()).first()
-    
+    """Connexion utilisateur avec génération access_token + refresh_token."""
+    email = data.email.lower().strip()
+    logger.info(f"Tentative de login pour: {email}")
+
+    user = db.query(User).filter(User.email == email).first()
+
     if not user:
-        logger.warning(f"Utilisateur non trouvé: {data.email}")
-        raise HTTPException(401, "Identifiants invalides")
-    
+        logger.warning(f"Utilisateur non trouvé: {email}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Identifiants invalides"
+        )
+
+    # Vérification verrouillage
     if user.locked_until and user.locked_until > datetime.utcnow():
         remaining = int((user.locked_until - datetime.utcnow()).total_seconds() / 60)
-        raise HTTPException(403, f"Compte temporairement bloqué. Réessayez dans {remaining} minutes.")
-    
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Compte temporairement bloqué. Réessayez dans {remaining} minutes."
+        )
+
+    # Vérification mot de passe
     if not verify_password(data.password, user.password_hash):
-        user.login_attempts += 1
+        user.login_attempts = (user.login_attempts or 0) + 1
+
         if user.login_attempts >= MAX_LOGIN_ATTEMPTS:
             user.locked_until = datetime.utcnow() + timedelta(minutes=LOCK_MIN)
             user.login_attempts = 0
+            logger.warning(f"Compte verrouillé après trop d'échecs: {email}")
+
         db.commit()
-        raise HTTPException(401, "Identifiants invalides")
-    
-    # MODIFICATION : Si compte non activé, proposer la vérification
+
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Identifiants invalides"
+        )
+
+    # Vérification activation compte
     if not user.actif:
-        # Vérifier s'il y a un code en attente
         has_pending_code = bool(user.sms_code and user.sms_expires_at)
-        
-        # Si pas de code ou code expiré, en envoyer un nouveau
-        if not has_pending_code or (user.sms_expires_at and user.sms_expires_at < datetime.utcnow()):
+        code_expired = bool(user.sms_expires_at and user.sms_expires_at < datetime.utcnow())
+
+        if not has_pending_code or code_expired:
             new_code = generate_otp()
             user.sms_code = new_code
             user.sms_expires_at = datetime.utcnow() + timedelta(minutes=OTP_EXPIRATION_MIN)
-            
+
+            sms_sent = False
             try:
                 formatted_phone = format_phone_for_twilio(user.telephone)
                 send_sms(formatted_phone, f"Code de vérification: {new_code}")
                 sms_sent = True
-                logger.info(f"Nouveau code envoyé à {data.email}")
+                logger.info(f"Nouveau code SMS envoyé à {email}")
             except Exception as e:
-                logger.error(f"Erreur envoi SMS: {e}")
-                sms_sent = False
-            
+                logger.error(f"Erreur envoi SMS à {email}: {e}")
+
             db.commit()
-            
+
             raise HTTPException(
-                403,
-                {
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
                     "error": "account_not_activated",
                     "message": "Compte non activé. Un code de vérification a été envoyé.",
                     "requires_verification": True,
-                    "email": data.email,
-                    "sms_sent": sms_sent,
-                    "verification_required": True
-                }
-            )
-        else:
-            # Il y a déjà un code valide
-            raise HTTPException(
-                403,
-                {
-                    "error": "account_not_activated",
-                    "message": "Compte non activé. Entrez le code de vérification reçu par SMS.",
-                    "requires_verification": True,
-                    "email": data.email,
                     "verification_required": True,
-                    "has_pending_code": True
+                    "email": email,
+                    "sms_sent": sms_sent
                 }
             )
-    tenant = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
-    if not tenant:
-        raise HTTPException(404, "Tenant non trouvé")
 
-    subscription_active = is_subscription_active(db, str(user.tenant_id))
-    
-    # Récupérer les pharmacies accessibles pour l'utilisateur
-    accessible_pharmacies = db.query(Pharmacy).join(
-        UserPharmacy, UserPharmacy.pharmacy_id == Pharmacy.id
-    ).filter(
-        UserPharmacy.user_id == user.id,
-        Pharmacy.is_active == True
-    ).all()
-    
-    # Récupérer la pharmacie principale
-    main_pharmacy = next((p for p in accessible_pharmacies if p.is_main), None)
-    if not main_pharmacy and accessible_pharmacies:
-        main_pharmacy = accessible_pharmacies[0]
-    
-    # Récupérer les pharmacies actives du tenant
-    pharmacies = db.query(Pharmacy).filter(
-        Pharmacy.tenant_id == tenant.id,
-        Pharmacy.is_active == True
-    ).order_by(Pharmacy.is_main.desc(), Pharmacy.name).all()
-    
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "account_not_activated",
+                "message": "Compte non activé. Entrez le code de vérification reçu par SMS.",
+                "requires_verification": True,
+                "verification_required": True,
+                "email": email,
+                "has_pending_code": True
+            }
+        )
+
+    # Variables de contexte
+    tenant = None
+    tenant_data = None
+    pharmacies = []
+    main_pharmacy = None
+    subscription_active = False
+
+    # Cas tenant normal
+    if user.tenant_id:
+        tenant = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
+
+        if tenant:
+            pharmacies = db.query(Pharmacy).filter(
+                Pharmacy.tenant_id == tenant.id,
+                Pharmacy.is_active == True
+            ).order_by(Pharmacy.is_main.desc(), Pharmacy.name).all()
+
+            main_pharmacy = next(
+                (pharmacy for pharmacy in pharmacies if pharmacy.is_main),
+                pharmacies[0] if pharmacies else None
+            )
+
+            subscription_active = is_subscription_active(db, str(user.tenant_id))
+
+            tenant_data = {
+                "id": str(tenant.id),
+                "tenant_code": tenant.tenant_code,
+                "nom_pharmacie": tenant.nom_pharmacie,
+                "nom_commercial": tenant.nom_commercial,
+                "ville": tenant.ville,
+                "pays": tenant.pays,
+                "email_admin": tenant.email_admin,
+                "status": tenant.status,
+                "current_plan": tenant.current_plan,
+                "plan_name": tenant.config.get("plan_name") if tenant.config else tenant.current_plan,
+                "max_users": tenant.max_users,
+                "max_products": tenant.max_products,
+                "max_pharmacies": tenant.max_pharmacies,
+                "trial_end_date": tenant.trial_end_date.isoformat() if tenant.trial_end_date else None
+            }
+        else:
+            logger.warning(f"Tenant introuvable pour l'utilisateur {email}: {user.tenant_id}")
+            subscription_active = False
+
+    # Cas super admin / système
+    else:
+        logger.info(f"Utilisateur sans tenant (rôle: {user.role})")
+        subscription_active = True
+
     # Réinitialiser les tentatives de login
     user.login_attempts = 0
     user.locked_until = None
     user.last_login = datetime.utcnow()
     db.commit()
 
-    # Créer le token
-    token = create_access_token({
-        "sub": str(user.id),
-        "tenant_id": str(user.tenant_id),
-        "role": user.role,
-        "email": user.email,
-        "subscription_active": subscription_active,
-        "pharmacy_id": str(main_pharmacy.id) if main_pharmacy else None
-    })
+    token_pair = create_token_pair(
+        user=user,
+        subscription_active=subscription_active,
+        pharmacy_id=str(main_pharmacy.id) if main_pharmacy else None
+    )
 
-    # Préparer la réponse avec le plan
     response_data = {
-        "access_token": token,
-        "token_type": "bearer",
+        **token_pair,
         "subscription_active": subscription_active,
         "user": {
             "id": str(user.id),
             "email": user.email,
             "nom_complet": user.nom_complet,
             "role": user.role,
-            "tenant_id": str(user.tenant_id),
+            "tenant_id": str(user.tenant_id) if user.tenant_id else None,
             "actif": user.actif,
             "telephone": user.telephone
         },
-        "tenant": {
-            "id": str(tenant.id),
-            "tenant_code": tenant.tenant_code,
-            "nom_pharmacie": tenant.nom_pharmacie,
-            "nom_commercial": tenant.nom_commercial,
-            "ville": tenant.ville,
-            "pays": tenant.pays,
-            "email_admin": tenant.email_admin,
-            "status": tenant.status,
-            "current_plan": tenant.current_plan,  # Le plan choisi
-            "plan_name": tenant.config.get("plan_name") if tenant.config else tenant.current_plan,
-            "max_users": tenant.max_users,
-            "max_products": tenant.max_products,
-            "max_pharmacies": tenant.max_pharmacies,
-            "trial_end_date": tenant.trial_end_date.isoformat() if tenant.trial_end_date else None
-        },
-        "pharmacies": []
+        "tenant": tenant_data,
+        "pharmacies": [
+            {
+                "id": str(pharmacy.id),
+                "name": pharmacy.name,
+                "address": pharmacy.address,
+                "city": pharmacy.city,
+                "phone": pharmacy.phone,
+                "email": pharmacy.email,
+                "is_active": pharmacy.is_active,
+                "is_main": pharmacy.is_main,
+                "pharmacy_code": pharmacy.pharmacy_code,
+                "created_at": pharmacy.created_at.isoformat() if pharmacy.created_at else None
+            }
+            for pharmacy in pharmacies
+        ]
     }
-    
-    # Ajouter les pharmacies
-    for pharmacy in pharmacies:
-        response_data["pharmacies"].append({
-            "id": str(pharmacy.id),
-            "name": pharmacy.name,
-            "address": pharmacy.address,
-            "city": pharmacy.city,
-            "phone": pharmacy.phone,
-            "email": pharmacy.email,
-            "is_active": pharmacy.is_active,
-            "is_main": pharmacy.is_main,
-            "pharmacy_code": pharmacy.pharmacy_code,
-            "created_at": pharmacy.created_at.isoformat() if pharmacy.created_at else None
-        })
-    
-    # Ajouter la pharmacie active
+
     if main_pharmacy:
         response_data["current_pharmacy"] = {
             "id": str(main_pharmacy.id),
@@ -1263,7 +1536,8 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
             "is_main": main_pharmacy.is_main,
             "pharmacy_code": main_pharmacy.pharmacy_code
         }
-    
+
+    logger.info(f"Login réussi pour: {email}")
     return response_data
 
 @router.post("/login-with-code")
@@ -1364,20 +1638,16 @@ def login_with_verification_code(data: LoginWithCodeSchema, db: Session = Depend
     # Créer le token
     subscription_active = is_subscription_active(db, str(user.tenant_id))
     
-    token = create_access_token({
-        "sub": str(user.id),
-        "tenant_id": str(user.tenant_id),
-        "role": user.role,
-        "email": user.email,
-        "subscription_active": subscription_active,
-        "pharmacy_id": str(pharmacy.id) if pharmacy else None
-    })
+    token_pair = create_token_pair(
+        user=user,
+        subscription_active=subscription_active,
+        pharmacy_id=str(pharmacy.id) if pharmacy else None
+    )
     
     logger.info(f"Compte activé et connecté: {data.email}")
     
     return {
-        "access_token": token,
-        "token_type": "bearer",
+        **token_pair,
         "subscription_active": subscription_active,
         "account_activated": True,
         "user": {
@@ -1953,28 +2223,64 @@ def health_check():
         "service": "auth-service"
     }
 
-@router.post("/refresh")
+@router.post("/refresh", response_model=TokenPairResponse)
 def refresh_token(
-    current_user: User = Depends(get_current_user),
+    data: TokenRefreshSchema,
     db: Session = Depends(get_db)
 ):
-    """Rafraîchit le token d'accès"""
-    subscription_active = is_subscription_active(db, str(current_user.tenant_id))
-    
-    token = create_access_token({
-        "sub": str(current_user.id),
-        "tenant_id": str(current_user.tenant_id),
-        "role": current_user.role,
-        "email": current_user.email,
-        "subscription_active": subscription_active,
-        "pharmacy_id": str(current_user.pharmacy_id) if current_user.pharmacy_id else None
-    })
-    
-    return {
-        "access_token": token,
-        "token_type": "bearer"
-    }
+    """
+    Rafraîchit le token d'accès à partir d'un refresh token valide.
+    """
+    payload = decode_token_safely(data.refresh_token)
 
+    token_type = payload.get("type")
+    if token_type != "refresh":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Type de token invalide"
+        )
+
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token invalide"
+        )
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Utilisateur introuvable"
+        )
+
+    if not user.actif:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Compte inactif"
+        )
+
+    main_pharmacy = None
+    subscription_active = True
+
+    if user.tenant_id:
+        main_pharmacy = db.query(Pharmacy).filter(
+            Pharmacy.tenant_id == user.tenant_id,
+            Pharmacy.is_main == True,
+            Pharmacy.is_active == True
+        ).first()
+
+        subscription_active = is_subscription_active(db, str(user.tenant_id))
+
+    token_pair = create_token_pair(
+        user=user,
+        subscription_active=subscription_active,
+        pharmacy_id=str(main_pharmacy.id) if main_pharmacy else None
+    )
+
+    logger.info(f"Refresh token réussi pour {user.email}")
+
+    return token_pair
 # =========================
 # ENDPOINTS TENANT UTILISATEUR
 # =========================
@@ -2262,7 +2568,7 @@ async def setup_super_admin(data: SuperAdminSetup, db: Session = Depends(get_db)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Le système est déjà initialisé.")
 
     new_admin = User(
-        tenant_id=uuid.uuid4(),  # ⚠️ ton modèle exige tenant_id NOT NULL -> il faut un tenant “system”
+        tenant_id=None,  
         email=data.email.lower(),
         password_hash=get_password_hash(data.password),
         nom_complet=data.nom_complet,

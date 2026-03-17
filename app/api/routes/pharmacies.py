@@ -419,5 +419,5 @@ def get_online_users(
         "pharmacy_name": pharmacy.nom,
         "online_count": len(online_users),
         "users": result,
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.datetime.utcnow().isoformat()
     }
