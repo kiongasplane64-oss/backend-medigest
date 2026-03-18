@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Optional, Dict, Any
 
@@ -87,7 +87,6 @@ class Tenant(Base):
     # =========================
     # CARACTÉRISTIQUES
     # =========================
-    # Stocke la valeur (string) de l'enum pour rester simple côté DB
     type_pharmacie = Column(String(30), nullable=False, default=PharmacyType.OFFICINE.value)
     nombre_employes = Column(Integer, nullable=False, default=1)
 
@@ -127,15 +126,16 @@ class Tenant(Base):
     activated_at = Column(DateTime, nullable=True)
     suspended_at = Column(DateTime, nullable=True)
 
-    # IMPORTANT:
-    # - nullable=True casse le cycle tenants<->users à la création.
-    # - On va créer la contrainte FK via migration APRES (ou la laisser nullable).
-    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", use_alter=True, name="fk_tenants_created_by_users"), nullable=True, index=True)
+    created_by = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", use_alter=True, name="fk_tenants_created_by_users"),
+        nullable=True,
+        index=True,
+    )
 
     # =========================
     # RELATIONS
     # =========================
-    # On utilise des chemins "courts" pour éviter des imports doubles et rester compatible Alembic
     users = relationship(
         "User",
         back_populates="tenant",
@@ -151,7 +151,6 @@ class Tenant(Base):
         uselist=False,
     )
 
-    # Relations principales (chemins string simples, plus robustes)
     payments = relationship("Payment", back_populates="tenant", cascade="all, delete-orphan")
     costs = relationship("Cost", back_populates="tenant", lazy="noload")
     budgets = relationship("Budget", back_populates="tenant", lazy="noload")
@@ -197,6 +196,53 @@ class Tenant(Base):
         return value.lower().strip()
 
     # =========================
+    # NORMALISATION JSON
+    # =========================
+    def ensure_json_fields(self) -> None:
+        if self.config is None or not isinstance(self.config, dict):
+            self.config = {}
+        if self.meta_data is None or not isinstance(self.meta_data, dict):
+            self.meta_data = {}
+        if self.tags is None or not isinstance(self.tags, list):
+            self.tags = []
+
+    # =========================
+    # CONFIGURATION
+    # =========================
+    def get_config_value(self, key: str, default: Any = None) -> Any:
+        """
+        Retourne une valeur depuis config.
+        Ex:
+            tenant.get_config_value("calcul_auto_prix", True)
+        """
+        self.ensure_json_fields()
+        return self.config.get(key, default)
+
+    def set_config_value(self, key: str, value: Any) -> None:
+        """
+        Définit une valeur dans config.
+        """
+        self.ensure_json_fields()
+        self.config[key] = value
+
+    def update_config(self, values: Dict[str, Any]) -> None:
+        """
+        Fusionne plusieurs valeurs dans config.
+        """
+        self.ensure_json_fields()
+        if not isinstance(values, dict):
+            raise ValueError("values doit être un dictionnaire")
+        self.config.update(values)
+
+    def get_meta_value(self, key: str, default: Any = None) -> Any:
+        self.ensure_json_fields()
+        return self.meta_data.get(key, default)
+
+    def set_meta_value(self, key: str, value: Any) -> None:
+        self.ensure_json_fields()
+        self.meta_data[key] = value
+
+    # =========================
     # PROPRIÉTÉS SAAS
     # =========================
     @property
@@ -226,6 +272,39 @@ class Tenant(Base):
             return 0
         return len([p for p in self.pharmacies if getattr(p, "is_active", False)])
 
+    @property
+    def display_name(self) -> str:
+        return self.nom_commercial or self.nom_pharmacie
+
+    # =========================
+    # CONFIGS MÉTIER PRATIQUES
+    # =========================
+    @property
+    def calcul_auto_prix(self) -> bool:
+        return bool(self.get_config_value("calcul_auto_prix", True))
+
+    @property
+    def marge_par_defaut(self) -> float:
+        try:
+            return float(self.get_config_value("marge_par_defaut", 30.0))
+        except (TypeError, ValueError):
+            return 30.0
+
+    @property
+    def taux_tva(self) -> float:
+        try:
+            return float(self.get_config_value("taux_tva", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @property
+    def lock_stock_modification(self) -> bool:
+        return bool(self.get_config_value("lock_stock_modification", False))
+
+    @property
+    def devise(self) -> str:
+        return str(self.get_config_value("devise", "USD"))
+
     # =========================
     # ACTIONS SAAS
     # =========================
@@ -248,12 +327,15 @@ class Tenant(Base):
     # SERIALISATION API
     # =========================
     def to_dict(self) -> Dict[str, Any]:
+        self.ensure_json_fields()
+
         return {
             "id": str(self.id),
             "tenant_code": self.tenant_code,
             "slug": self.slug,
             "nom_pharmacie": self.nom_pharmacie,
             "nom_commercial": self.nom_commercial,
+            "display_name": self.display_name,
             "email_admin": self.email_admin,
             "telephone_principal": self.telephone_principal,
             "adresse": self.adresse,
@@ -273,6 +355,9 @@ class Tenant(Base):
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "pharmacies_count": len(self.pharmacies) if self.pharmacies else 0,
             "active_pharmacies_count": self.active_pharmacies_count,
+            "config": self.config,
+            "meta_data": self.meta_data,
+            "tags": self.tags,
         }
 
     def __repr__(self) -> str:

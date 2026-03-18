@@ -1,5 +1,6 @@
 # app/models/sale.py
 import uuid
+import sqlalchemy as sa
 from datetime import datetime
 from decimal import Decimal
 from sqlalchemy.orm import relationship, validates
@@ -25,6 +26,8 @@ class Sale(Base):
     client_id = Column(UUID(as_uuid=True), ForeignKey("clients.id"), nullable=True)
     client_name = Column(String(100), nullable=False, default="Client Générique")
     client_phone = Column(String(20), nullable=True)
+    customer_id = Column(UUID, ForeignKey("customers.id"), nullable=True)
+    branch_id = Column(UUID, sa.ForeignKey("branches.id"), nullable=True)
 
     # CORRECTION: Changé seller_id à created_by pour correspondre au modèle User
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
@@ -81,10 +84,11 @@ class Sale(Base):
     client = relationship("Client", back_populates="sales", foreign_keys=[client_id])
     creator = relationship("User", foreign_keys=[created_by], backref="sales_created")
     validator = relationship("User", foreign_keys=[validated_by], backref="sales_validated")
-    
+    customer = relationship("Customer", back_populates="sales")
     items = relationship("SaleItem", back_populates="sale", cascade="all, delete-orphan")
     payments = relationship("Payment", back_populates="sale", cascade="all, delete-orphan")
     refunds = relationship("Refund", back_populates="sale", cascade="all, delete-orphan")
+    branch = relationship("Branch", back_populates="sales")
     
     # Relation avec DebtPayment
     debt_payments = relationship(

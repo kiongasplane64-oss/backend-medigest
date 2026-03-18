@@ -40,6 +40,8 @@ from .payment import Payment
 
 from .transfert import ProductTransfer, TransferItem, TransferStatus, TransferType
 from .stock_movement import StockMovement, InventoryCount, InventoryCountItem
+from app.models.customer import Customer  
+from app.models.branch import Branch 
 
 __all__ = [
     # Core
@@ -80,4 +82,6 @@ __all__ = [
     "TransferItem",
     "TransferStatus",
     "TransferType",
+    "Customer",
+    "Branch",
 ]

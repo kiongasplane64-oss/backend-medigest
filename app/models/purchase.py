@@ -21,6 +21,7 @@ class Purchase(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
+    pharmacy_id = Column(UUID(as_uuid=True), ForeignKey("pharmacies.id", ondelete="CASCADE"), nullable=False, index=True)
 
     reference = Column(String(50), unique=True, nullable=False, index=True)
     invoice_number = Column(String(100), nullable=True, index=True)
@@ -84,6 +85,7 @@ class Purchase(Base):
     supplier = relationship("Supplier", back_populates="purchases", overlaps="purchases")
     creator = relationship("User", foreign_keys=[created_by])
     receiver = relationship("User", foreign_keys=[received_by])
+    pharmacy = relationship("Pharmacy", back_populates="purchases")
     
     items = relationship("PurchaseItem", back_populates="purchase", cascade="all, delete-orphan")
     payments = relationship("PurchasePayment", back_populates="purchase", cascade="all, delete-orphan")
