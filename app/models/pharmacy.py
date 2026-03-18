@@ -1,12 +1,13 @@
 # app/models/pharmacy.py
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Text, JSON, Float
+from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, Text, JSON, Float
 from sqlalchemy.orm import relationship, Session, validates
-from datetime import datetime, time
+from datetime import datetime
 from app.db.base import Base
 from sqlalchemy.dialects.postgresql import UUID
 import uuid
 import json
 from typing import Optional, Dict, Any, List
+import pytz
 
 
 class Pharmacy(Base):
@@ -24,50 +25,29 @@ class Pharmacy(Base):
 
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
     name = Column(String(255), nullable=False)
-    pharmacy_code = Column(String(50), unique=True, nullable=True)
     
     # Informations de licence
-    license_number = Column(String(100), nullable=False, default="PENDING")
-    license_issuing_authority = Column(String(255), nullable=True)
-    license_expiry_date = Column(DateTime, nullable=True)
+    license_number = Column(String(100), nullable=False)
     
     # Localisation
     address = Column(Text, nullable=False)
     city = Column(String(100), nullable=False)
-    country = Column(String(100), nullable=False, default="RDC")
-    phone = Column(String(50))
-    email = Column(String(255))
-    website = Column(String(255), nullable=True)
-    
-    # Coordonnées GPS
-    latitude = Column(Float, nullable=True)
-    longitude = Column(Float, nullable=True)
+    country = Column(String(2), nullable=False, default="CD")  # Code ISO 2 lettres
+    phone = Column(String(50), nullable=True)
+    email = Column(String(255), nullable=True)
     
     # =========================
     # Statut & Spécialisation
     # =========================
     is_active = Column(Boolean, default=True)
     is_main = Column(Boolean, default=False, comment="Pharmacie principale du tenant")
-    pharmacy_type = Column(String(50), default="retail", comment="retail, hospital, clinic")
     
-    # Horaires d'ouverture (format simplifié)
-    opening_hours = Column(JSON, default=lambda: {
-        "monday": "08:00-20:00",
-        "tuesday": "08:00-20:00",
-        "wednesday": "08:00-20:00",
-        "thursday": "08:00-20:00",
-        "friday": "08:00-20:00",
-        "saturday": "09:00-18:00",
-        "sunday": "closed"
-    })
-    
-    # Pharmacien responsable
-    pharmacist_in_charge = Column(String(255))
-    pharmacist_license = Column(String(100))
-    pharmacist_contact = Column(String(50), nullable=True)
+    # Pharmacien responsable (pour compatibilité)
+    pharmacist_in_charge = Column(String(255), nullable=True)
+    pharmacist_license = Column(String(100), nullable=True)
     
     # =========================
-    # CONFIGURATION COMPLÈTE (version enrichie)
+    # CONFIGURATION COMPLÈTE (harmonisée avec les schémas)
     # =========================
     config = Column(JSON, default=lambda: {
         # Informations de base
@@ -86,27 +66,22 @@ class Pharmacy(Base):
             {"code": "USD", "symbol": "$", "isActive": True, "exchangeRate": 1.0}
         ],
         "primaryCurrency": "CDF",
-        "enableCurrencyConversion": True,
         
         # Fiscalité
         "taxRate": 16.0,
-        "taxIncluded": True,
-        "taxNumber": "",
         
         # Stock et alertes
         "lowStockThreshold": 10,
         "expiryWarningDays": 90,
         "allowNegativeStock": False,
-        "enableBatchTracking": True,
-        "enableExpiryAlerts": True,
-        "lowStockAlertEnabled": True,
         
-        # Heures de service
+        # Heures de service (avec fuseau horaire)
         "workingHours": {
             "enabled": True,
             "startTime": "08:00",
             "endTime": "20:00",
             "overtimeEndTime": "22:00",
+            "timezone": "Africa/Kinshasa",
             "daysOff": {
                 "monday": True,
                 "tuesday": True,
@@ -120,8 +95,6 @@ class Pharmacy(Base):
         
         # Retour produit
         "productReturnDays": 30,
-        "enableProductReturns": True,
-        "requireReturnReason": True,
         
         # Configuration des prix et marges
         "marginConfig": {
@@ -131,19 +104,15 @@ class Pharmacy(Base):
         },
         "automaticPricing": {
             "enabled": False,
-            "method": "percentage",  # percentage, coefficient, margin
+            "method": "percentage",
             "value": 25.0
         },
         
         # Thème et apparence
         "theme": "system",
-        "enableDarkMode": True,
         
         # Capital et finances
         "initialCapital": 0.0,
-        "currencySymbol": "FC",
-        "decimalPrecision": 2,
-        "dateFormat": "dd/MM/yyyy",
         
         # Configuration des branches/succursales
         "branchConfig": {
@@ -152,26 +121,24 @@ class Pharmacy(Base):
             "branches": []
         },
         
-        # Paramètres généraux
-        "language": "fr",
-        "enableBarcode": True,
-        "enablePrescriptionTracking": True,
-        "enableLoyaltyProgram": False,
-        
         # Métadonnées
         "createdAt": None,
-        "updatedAt": None,
-        "version": "1.0.0"
+        "updatedAt": None
     })
     
-    # Métadonnées additionnelles
-    meta_data = Column(JSON, default=lambda: {
-        "total_sales": 0,
-        "total_products": 0,
-        "total_customers": 0,
-        "last_inventory_date": None,
-        "subscription_status": "active"
-    })
+    # Métadonnées additionnelles (pour compatibilité)
+    meta_data = Column(JSON, default=lambda: {})
+    
+    # Pour compatibilité avec ancien code
+    opening_hours = Column(JSON, nullable=True)
+    pharmacy_code = Column(String(50), nullable=True)
+    website = Column(String(255), nullable=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    pharmacy_type = Column(String(50), default="retail")
+    license_issuing_authority = Column(String(255), nullable=True)
+    license_expiry_date = Column(DateTime, nullable=True)
+    pharmacist_contact = Column(String(50), nullable=True)
     
     # =========================
     # Métadonnées temporelles
@@ -218,9 +185,15 @@ class Pharmacy(Base):
     
     @validates('phone')
     def validate_phone(self, key, phone):
-        if phone and not phone.replace('+', '').replace(' ', '').isdigit():
+        if phone and not phone.replace('+', '').replace(' ', '').replace('-', '').isdigit():
             raise ValueError("Numéro de téléphone invalide")
         return phone
+    
+    @validates('country')
+    def validate_country(self, key, country):
+        if country and len(country) != 2:
+            raise ValueError("Le code pays doit être sur 2 caractères (ISO 3166-1 alpha-2)")
+        return country.upper() if country else country
     
     # =========================
     # Méthodes de configuration
@@ -263,6 +236,128 @@ class Pharmacy(Base):
         self.config["updatedAt"] = datetime.utcnow().isoformat()
     
     # =========================
+    # Gestion des heures de service (avec fuseau horaire)
+    # =========================
+    def get_timezone(self) -> pytz.timezone:
+        """Récupère l'objet timezone pour la pharmacie"""
+        timezone_str = self.get_config("workingHours.timezone") or "Africa/Kinshasa"
+        try:
+            return pytz.timezone(timezone_str)
+        except:
+            return pytz.timezone("Africa/Kinshasa")
+    
+    def get_current_time_in_pharmacy_tz(self) -> datetime:
+        """Retourne l'heure actuelle dans le fuseau de la pharmacie"""
+        return datetime.now(self.get_timezone())
+    
+    def convert_to_pharmacy_time(self, dt: datetime) -> datetime:
+        """Convertit une datetime UTC vers le fuseau de la pharmacie"""
+        if dt.tzinfo is None:
+            dt = pytz.UTC.localize(dt)
+        return dt.astimezone(self.get_timezone())
+    
+    def convert_from_pharmacy_time(self, dt: datetime) -> datetime:
+        """Convertit une datetime du fuseau pharmacie vers UTC"""
+        if dt.tzinfo is None:
+            # Si pas de timezone, on suppose que c'est en heure pharmacie
+            dt = self.get_timezone().localize(dt)
+        return dt.astimezone(pytz.UTC)
+    
+    def is_in_service(self, check_time: Optional[datetime] = None) -> Dict[str, Any]:
+        """
+        Vérifie si la pharmacie est en service à l'heure donnée
+        Utilise le fuseau horaire configuré pour la pharmacie
+        """
+        working_hours = self.get_config("workingHours") or {}
+        
+        if not working_hours.get("enabled", True):
+            return {
+                "in_service": True,
+                "restrictions_enabled": False,
+                "message": "Service toujours disponible (pas de restriction horaire)",
+                "timezone": working_hours.get("timezone", "Africa/Kinshasa")
+            }
+        
+        # Utiliser le fuseau horaire de la pharmacie
+        pharmacy_tz = self.get_timezone()
+        
+        if check_time is None:
+            check_time = datetime.now(pharmacy_tz)
+        else:
+            # Si check_time est fourni sans timezone, on suppose UTC
+            if check_time.tzinfo is None:
+                check_time = pytz.UTC.localize(check_time)
+            check_time = check_time.astimezone(pharmacy_tz)
+        
+        now_utc = datetime.now(pytz.UTC)
+        
+        current_time = check_time.hour * 60 + check_time.minute
+        current_day = check_time.strftime("%A").lower()
+        
+        # Mapping des jours
+        day_mapping = {
+            "monday": "monday",
+            "tuesday": "tuesday",
+            "wednesday": "wednesday",
+            "thursday": "thursday",
+            "friday": "friday",
+            "saturday": "saturday",
+            "sunday": "sunday"
+        }
+        
+        days_off = working_hours.get("daysOff", {})
+        is_working_day = days_off.get(day_mapping.get(current_day, ""), False)
+        
+        start_time = working_hours.get("startTime", "08:00").split(":")
+        end_time = working_hours.get("endTime", "20:00").split(":")
+        
+        start_minutes = int(start_time[0]) * 60 + int(start_time[1])
+        end_minutes = int(end_time[0]) * 60 + int(end_time[1])
+        
+        is_within_hours = current_time >= start_minutes and current_time <= end_minutes
+        in_service = is_working_day and is_within_hours
+        
+        # Calculer le prochain service
+        next_service_time = None
+        if not in_service and is_working_day:
+            # Prochain service aujourd'hui (si après fermeture)
+            if current_time > end_minutes:
+                # Demain
+                next_service_time = f"{working_hours.get('startTime')} (demain)"
+            # Prochain service aujourd'hui (si avant ouverture)
+            elif current_time < start_minutes:
+                next_service_time = f"{working_hours.get('startTime')} (aujourd'hui)"
+        elif not in_service and not is_working_day:
+            # Trouver le prochain jour ouvré
+            days_order = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+            current_index = days_order.index(current_day) if current_day in days_order else 0
+            
+            for i in range(1, 8):
+                next_index = (current_index + i) % 7
+                next_day = days_order[next_index]
+                if days_off.get(next_day, False):
+                    next_service_time = f"{working_hours.get('startTime')} {next_day}"
+                    break
+        
+        return {
+            "in_service": in_service,
+            "restrictions_enabled": True,
+            "current_time_utc": now_utc.isoformat(),
+            "current_time_local": check_time.isoformat(),
+            "timezone": str(pharmacy_tz),
+            "current_day": current_day,
+            "is_working_day": is_working_day,
+            "is_within_hours": is_within_hours,
+            "working_hours": {
+                "start": working_hours.get("startTime"),
+                "end": working_hours.get("endTime"),
+                "overtime": working_hours.get("overtimeEndTime")
+            },
+            "message": "En service" if in_service else "Hors service",
+            "next_service_time": next_service_time
+        }
+    
+    # =========================
     # Gestion des succursales
     # =========================
     def add_branch(self, branch_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -286,8 +381,7 @@ class Pharmacy(Base):
             "email": branch_data.get("email", ""),
             "manager": branch_data.get("manager", ""),
             "created_at": datetime.utcnow().isoformat(),
-            "is_active": True,
-            "config": branch_data.get("config", {})
+            "is_active": True
         }
         
         branch_config["branches"].append(new_branch)
@@ -339,7 +433,6 @@ class Pharmacy(Base):
         """
         currencies = self.get_config("currencies") or []
         
-        # Trouver les taux
         from_rate = None
         to_rate = None
         
@@ -352,71 +445,10 @@ class Pharmacy(Base):
         if not from_rate or not to_rate:
             raise ValueError(f"Devise non trouvée: {from_currency if not from_rate else to_currency}")
         
-        # Conversion via USD comme référence
         amount_in_usd = amount / from_rate if from_currency != "USD" else amount
         converted = amount_in_usd * to_rate if to_currency != "USD" else amount_in_usd
         
-        return round(converted, self.get_config("decimalPrecision") or 2)
-    
-    # =========================
-    # Vérification des heures de service
-    # =========================
-    def is_in_service(self, check_time: Optional[datetime] = None) -> Dict[str, Any]:
-        """
-        Vérifie si la pharmacie est en service à l'heure donnée
-        """
-        if check_time is None:
-            check_time = datetime.utcnow()
-        
-        working_hours = self.get_config("workingHours") or {}
-        
-        if not working_hours.get("enabled", True):
-            return {
-                "in_service": True,
-                "message": "Service toujours disponible",
-                "restrictions_enabled": False
-            }
-        
-        current_time = check_time.hour * 60 + check_time.minute
-        current_day = check_time.strftime("%A").lower()
-        
-        # Mapping des jours
-        day_mapping = {
-            "monday": "monday",
-            "tuesday": "tuesday",
-            "wednesday": "wednesday",
-            "thursday": "thursday",
-            "friday": "friday",
-            "saturday": "saturday",
-            "sunday": "sunday"
-        }
-        
-        days_off = working_hours.get("daysOff", {})
-        is_working_day = days_off.get(day_mapping.get(current_day, ""), False)
-        
-        start_time = working_hours.get("startTime", "08:00").split(":")
-        end_time = working_hours.get("endTime", "20:00").split(":")
-        
-        start_minutes = int(start_time[0]) * 60 + int(start_time[1])
-        end_minutes = int(end_time[0]) * 60 + int(end_time[1])
-        
-        is_within_hours = current_time >= start_minutes and current_time <= end_minutes
-        in_service = is_working_day and is_within_hours
-        
-        return {
-            "in_service": in_service,
-            "restrictions_enabled": True,
-            "current_time_utc": check_time.isoformat(),
-            "current_day": current_day,
-            "is_working_day": is_working_day,
-            "is_within_hours": is_within_hours,
-            "working_hours": {
-                "start": working_hours.get("startTime"),
-                "end": working_hours.get("endTime"),
-                "overtime": working_hours.get("overtimeEndTime")
-            },
-            "message": "En service" if in_service else "Hors service"
-        }
+        return round(converted, 2)
     
     # =========================
     # Méthodes de gestion des utilisateurs
@@ -435,7 +467,6 @@ class Pharmacy(Base):
         """
         from app.models.user_pharmacy import UserPharmacy
         
-        # Vérification si l'association existe déjà
         existing = db.query(UserPharmacy).filter_by(
             user_id=user_id, 
             pharmacy_id=self.id
@@ -472,7 +503,8 @@ class Pharmacy(Base):
             "active_users": len(self.get_users_with_access()),
             "branches": self.get_config("branchConfig.currentBranches") or 0,
             "is_active": self.is_active,
-            "is_main": self.is_main
+            "is_main": self.is_main,
+            "timezone": self.get_config("workingHours.timezone") or "Africa/Kinshasa"
         }
     
     def to_dict(self) -> Dict[str, Any]:
@@ -481,7 +513,6 @@ class Pharmacy(Base):
             "id": str(self.id),
             "tenant_id": str(self.tenant_id),
             "name": self.name,
-            "pharmacy_code": self.pharmacy_code,
             "license_number": self.license_number,
             "address": self.address,
             "city": self.city,
@@ -490,6 +521,8 @@ class Pharmacy(Base):
             "email": self.email,
             "is_active": self.is_active,
             "is_main": self.is_main,
+            "pharmacist_in_charge": self.pharmacist_in_charge,
+            "pharmacist_license": self.pharmacist_license,
             "config": self.config,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None

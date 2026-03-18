@@ -4,6 +4,8 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 import json
 from uuid import UUID
+import pytz
+from zoneinfo import ZoneInfo  # Python 3.9+
 
 from app.api.deps import get_current_user, get_db, get_current_tenant
 from app.models.user import User
@@ -25,6 +27,34 @@ from app.utils.pharmacy_utils import PharmacyValidator
 
 router = APIRouter(prefix="/api/v1/pharmacies", tags=["pharmacies"])
 
+# Fuseaux horaires supportés
+SUPPORTED_TIMEZONES = {
+    "kinshasa": "Africa/Kinshasa",  # UTC+1 (pas d'heure d'été)
+    "lubumbashi": "Africa/Lubumbashi",  # UTC+2
+    "paris": "Europe/Paris",  # UTC+1/UTC+2 (avec heure d'été)
+    "rdc": "Africa/Kinshasa",  # Par défaut RDC
+    "congo": "Africa/Kinshasa"
+}
+
+def get_pharmacy_timezone(pharmacy_config: dict) -> str:
+    """
+    Récupère le fuseau horaire configuré pour la pharmacie
+    Par défaut: Africa/Kinshasa (UTC+1)
+    """
+    # Vous pouvez ajouter un champ timezone dans la config si nécessaire
+    # Pour l'instant, on utilise Kinshasa par défaut
+    return "Africa/Kinshasa"
+
+def get_current_time_in_timezone(timezone_str: str = "Africa/Kinshasa") -> datetime:
+    """
+    Retourne l'heure actuelle dans le fuseau horaire spécifié
+    """
+    try:
+        tz = pytz.timezone(timezone_str)
+        return datetime.now(tz)
+    except:
+        # Fallback sur UTC si le fuseau n'est pas trouvé
+        return datetime.now(pytz.UTC)
 
 class PharmacyLimits:
     """Définit les limites de pharmacies selon le plan d'abonnement"""
@@ -142,7 +172,7 @@ def get_pharmacies(
         pharmacy_dict = {
             "id": str(pharmacy.id),
             "tenant_id": str(pharmacy.tenant_id),
-            "nom": pharmacy.name,  # Utilise name au lieu de nom
+            "nom": pharmacy.name,
             "name": pharmacy.name,
             "license_number": pharmacy.license_number,
             "address": pharmacy.address,
@@ -221,7 +251,7 @@ def create_pharmacy(
             detail="Ce numéro de licence est déjà utilisé"
         )
     
-    # Configuration par défaut
+    # Configuration par défaut avec heures en heure locale (Paris/RDC)
     default_config = {
         "pharmacyInfo": {
             "name": pharmacy_in.nom or pharmacy_in.name,
@@ -241,9 +271,9 @@ def create_pharmacy(
         "allowNegativeStock": False,
         "workingHours": {
             "enabled": True,
-            "startTime": "08:00",
-            "endTime": "20:00",
-            "overtimeEndTime": "22:00",
+            "startTime": "08:00",  # Heure locale (Paris/RDC)
+            "endTime": "20:00",     # Heure locale (Paris/RDC)
+            "overtimeEndTime": "22:00",  # Heure locale (Paris/RDC)
             "daysOff": {
                 "monday": True,
                 "tuesday": True,
@@ -252,7 +282,8 @@ def create_pharmacy(
                 "friday": True,
                 "saturday": True,
                 "sunday": False
-            }
+            },
+            "timezone": "Africa/Kinshasa"  # Fuseau horaire par défaut
         },
         "productReturnDays": 30,
         "marginConfig": {
@@ -275,9 +306,9 @@ def create_pharmacy(
         "updatedAt": datetime.utcnow().isoformat()
     }
     
-    # Créer la pharmacie - utilise uniquement les champs qui existent dans le modèle
+    # Créer la pharmacie
     pharmacy = Pharmacy(
-        name=pharmacy_in.nom or pharmacy_in.name,  # Utilise name comme champ principal
+        name=pharmacy_in.nom or pharmacy_in.name,
         license_number=pharmacy_in.license_number,
         address=pharmacy_in.address,
         city=pharmacy_in.city,
@@ -314,7 +345,7 @@ def create_pharmacy(
     pharmacy_dict = {
         "id": str(pharmacy.id),
         "tenant_id": str(pharmacy.tenant_id),
-        "nom": pharmacy.name,  # Utilise name au lieu de nom
+        "nom": pharmacy.name,
         "name": pharmacy.name,
         "license_number": pharmacy.license_number,
         "address": pharmacy.address,
@@ -379,7 +410,7 @@ def update_pharmacy_config(
     current_tenant: Tenant = Depends(get_current_tenant)
 ):
     """Met à jour la configuration d'une pharmacie"""
-    # Validation optionnelle de l'UUID
+    # Validation de l'UUID
     try:
         UUID(pharmacy_id)
     except ValueError:
@@ -399,32 +430,32 @@ def update_pharmacy_config(
             detail="Pharmacie non trouvée"
         )
     
-    # Vérifier les limites si on modifie les branches
-    if config_in.branchConfig:
-        limits_check = PharmacyLimits.can_create_branch(pharmacy, current_tenant)
-        new_branches = config_in.branchConfig.currentBranches
-        
-        if new_branches > limits_check["max_branches_allowed"]:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Limite de {limits_check['max_branches_allowed']} succursales atteinte"
-            )
+    # Récupérer la config actuelle ou initialiser
+    current_config = pharmacy.config or {}
     
-    # Mettre à jour la configuration
-    config = pharmacy.config or {}
+    # Mettre à jour uniquement les champs fournis
+    update_data = config_in.dict(exclude_unset=True, exclude_none=True)
     
-    # Mise à jour récursive des champs
-    update_data = config_in.dict(exclude_unset=True)
-    for key, value in update_data.items():
-        if isinstance(value, dict) and key in config and isinstance(config[key], dict):
-            config[key].update(value)
-        else:
-            config[key] = value
+    # Fusion profonde des données
+    def deep_merge(original, updates):
+        for key, value in updates.items():
+            if isinstance(value, dict) and key in original and isinstance(original[key], dict):
+                deep_merge(original[key], value)
+            else:
+                original[key] = value
+        return original
     
-    config["updatedAt"] = datetime.utcnow().isoformat()
-    pharmacy.config = config
+    # Appliquer les mises à jour
+    updated_config = deep_merge(current_config.copy(), update_data)
+    
+    # Ajouter la date de mise à jour
+    updated_config["updatedAt"] = datetime.utcnow().isoformat()
+    
+    # Mettre à jour la pharmacie
+    pharmacy.config = updated_config
     pharmacy.updated_at = datetime.utcnow()
     
+    # Commit explicite
     db.commit()
     db.refresh(pharmacy)
     
@@ -433,7 +464,6 @@ def update_pharmacy_config(
         "config": pharmacy.config,
         "updated_at": pharmacy.updated_at
     }
-
 
 @router.patch("/{pharmacy_id}/config/currencies")
 def update_currencies_config(
@@ -462,6 +492,29 @@ def update_currencies_config(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Pharmacie non trouvée"
+        )
+    
+    # VALIDATION DES TAUX DE CHANGE
+    for currency in currencies:
+        # Vérifier que le taux de change est valide
+        if currency.exchangeRate <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Le taux de change pour {currency.code} doit être supérieur à 0"
+            )
+        
+        # Pour USD, le taux doit être exactement 1 (devise de référence)
+        if currency.code == "USD" and currency.exchangeRate != 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Le taux de change pour USD doit être 1 (devise de référence)"
+            )
+    
+    # S'assurer qu'au moins une devise est active
+    if not any(c.isActive for c in currencies):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Au moins une devise doit être active"
         )
     
     config = pharmacy.config or {}
@@ -674,7 +727,6 @@ def create_branch(
         "max_allowed": limits_check["max_branches_allowed"]
     }
 
-
 @router.get("/{pharmacy_id}/service-status")
 def check_service_status(
     pharmacy_id: str,
@@ -682,8 +734,17 @@ def check_service_status(
     current_user: User = Depends(get_current_user),
     current_tenant: Tenant = Depends(get_current_tenant)
 ):
-    """Vérifie si la pharmacie est en service (basé sur les heures configurées)"""
-    # Validation optionnelle de l'UUID
+    """
+    Vérifie si la pharmacie est en service selon les heures configurées.
+    
+    Logique CORRIGÉE:
+    - workingHours.enabled = True -> Les restrictions sont actives
+    - daysOff = Jours OUVERTS (True = ouvert, False = fermé) - COHERENT AVEC LE FRONTEND
+    - La pharmacie est en service si:
+        * Aujourd'hui est un jour OUVERT (daysOff[aujourd'hui] = True)
+        * ET l'heure actuelle est entre startTime et endTime
+    """
+    # Validation de l'UUID
     try:
         UUID(pharmacy_id)
     except ValueError:
@@ -692,6 +753,7 @@ def check_service_status(
             detail="Format d'ID de pharmacie invalide"
         )
     
+    # Récupérer la pharmacie
     pharmacy = db.query(Pharmacy).filter(
         Pharmacy.id == pharmacy_id,
         Pharmacy.tenant_id == current_tenant.id
@@ -703,60 +765,240 @@ def check_service_status(
             detail="Pharmacie non trouvée"
         )
     
+    # Récupérer la configuration
     config = pharmacy.config or {}
     working_hours = config.get("workingHours", {})
     
+    # Logging pour débogage
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"=== VÉRIFICATION SERVICE PHARMACIE {pharmacy_id} ===")
+    logger.info(f"Configuration workingHours: {working_hours}")
+    
+    # Si les restrictions ne sont pas activées, toujours en service
     if not working_hours.get("enabled", True):
+        logger.info("Restrictions désactivées -> SERVICE DISPONIBLE")
         return {
             "in_service": True,
+            "restrictions_enabled": False,
             "message": "Service toujours disponible (pas de restriction horaire)",
-            "restrictions_enabled": False
+            "current_time_utc": datetime.now(pytz.UTC).isoformat(),
         }
     
-    # Heure UTC du serveur
-    now = datetime.utcnow()
-    current_time = now.hour * 60 + now.minute
-    current_day = now.strftime("%A").lower()
+    # Récupérer le fuseau horaire de la pharmacie
+    timezone_str = working_hours.get("timezone", "Africa/Kinshasa")
     
-    # Mapping des jours
-    day_mapping = {
-        "monday": "monday",
-        "tuesday": "tuesday",
-        "wednesday": "wednesday",
-        "thursday": "thursday",
-        "friday": "friday",
-        "saturday": "saturday",
-        "sunday": "sunday"
-    }
+    try:
+        tz = pytz.timezone(timezone_str)
+        now_local = datetime.now(tz)
+        now_utc = datetime.now(pytz.UTC)
+        logger.info(f"Heure locale ({timezone_str}): {now_local.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Heure UTC: {now_utc.strftime('%Y-%m-%d %H:%M:%S')}")
+    except Exception as e:
+        logger.error(f"Erreur fuseau horaire: {e}, utilisation UTC")
+        tz = pytz.UTC
+        now_local = datetime.now(pytz.UTC)
+        now_utc = now_local
+        timezone_str = "UTC"
     
+    # Heure actuelle en minutes depuis minuit
+    current_minutes = now_local.hour * 60 + now_local.minute
+    current_day = now_local.strftime("%A").lower()
+    
+    logger.info(f"Jour actuel: {current_day}")
+    logger.info(f"Heure actuelle: {now_local.hour:02d}:{now_local.minute:02d} ({current_minutes} minutes)")
+    
+    # Récupérer la configuration des jours de service
+    # CORRECTION: daysOff: True = jour OUVERT (comme dans le frontend)
     days_off = working_hours.get("daysOff", {})
-    is_working_day = days_off.get(day_mapping.get(current_day, ""), False)
+    logger.info(f"Configuration daysOff (True = OUVERT): {days_off}")
     
-    start_time = working_hours.get("startTime", "08:00").split(":")
-    end_time = working_hours.get("endTime", "20:00").split(":")
+    # Si days_off est vide, utiliser les valeurs par défaut (ouvert du lundi au samedi, fermé dimanche)
+    if not days_off:
+        days_off = {
+            "monday": True,    # Lundi OUVERT
+            "tuesday": True,   # Mardi OUVERT
+            "wednesday": True, # Mercredi OUVERT
+            "thursday": True,  # Jeudi OUVERT
+            "friday": True,    # Vendredi OUVERT
+            "saturday": True,  # Samedi OUVERT
+            "sunday": False    # Dimanche FERMÉ
+        }
+        logger.info(f"Utilisation des valeurs par défaut: {days_off}")
     
-    start_minutes = int(start_time[0]) * 60 + int(start_time[1])
-    end_minutes = int(end_time[0]) * 60 + int(end_time[1])
+    # CORRECTION: Vérifier si aujourd'hui est un jour OUVERT
+    is_open_today = days_off.get(current_day, False)  # True = ouvert
+    is_working_day = is_open_today  # C'est un jour travaillé si c'est ouvert
     
-    is_within_hours = current_time >= start_minutes and current_time <= end_minutes
+    logger.info(f"Aujourd'hui est ouvert? {is_open_today} -> Jour travaillé? {is_working_day}")
+    
+    # Récupérer les heures d'ouverture
+    start_time_str = working_hours.get("startTime", "08:00")
+    end_time_str = working_hours.get("endTime", "20:00")
+    
+    logger.info(f"Heures d'ouverture: {start_time_str} - {end_time_str}")
+    
+    try:
+        start_parts = start_time_str.split(":")
+        end_parts = end_time_str.split(":")
+        start_minutes = int(start_parts[0]) * 60 + int(start_parts[1])
+        end_minutes = int(end_parts[0]) * 60 + int(end_parts[1])
+    except (ValueError, IndexError) as e:
+        logger.error(f"Erreur format heure: {e}, utilisation valeurs par défaut")
+        start_minutes = 8 * 60  # 08:00
+        end_minutes = 20 * 60    # 20:00
+        start_time_str = "08:00"
+        end_time_str = "20:00"
+    
+    # Vérifier si l'heure actuelle est dans la plage d'ouverture
+    # Gestion du cas où l'heure de fin est après minuit (ex: 20:00 - 02:00)
+    if end_minutes < start_minutes:
+        # Service qui passe minuit
+        if current_minutes >= start_minutes or current_minutes <= end_minutes:
+            is_within_hours = True
+            logger.info(f"Heure {current_minutes} dans plage nuit ({start_minutes}-{end_minutes})")
+        else:
+            is_within_hours = False
+            logger.info(f"Heure {current_minutes} hors plage nuit ({start_minutes}-{end_minutes})")
+    else:
+        # Cas normal
+        is_within_hours = start_minutes <= current_minutes <= end_minutes
+        logger.info(f"Heure {current_minutes} dans plage {start_minutes}-{end_minutes}? {is_within_hours}")
+    
+    # CORRECTION: Déterminer si la pharmacie est en service
     in_service = is_working_day and is_within_hours
+    logger.info(f"Résultat final - Jour ouvert: {is_working_day}, Dans heures: {is_within_hours} -> EN SERVICE? {in_service}")
     
-    return {
+    # Calculer le prochain service pour aider l'utilisateur
+    next_service_info = calculate_next_service_time(
+        current_day=current_day,
+        current_minutes=current_minutes,
+        working_hours=working_hours,
+        is_working_day=is_working_day,
+        start_minutes=start_minutes,
+        end_minutes=end_minutes,
+        days_off=days_off
+    )
+    
+    logger.info(f"Prochain service: {next_service_info}")
+    logger.info("========================================")
+    
+    # Construire la réponse
+    response = {
         "in_service": in_service,
         "restrictions_enabled": True,
-        "current_time_utc": now.isoformat(),
+        "current_time_utc": now_utc.isoformat(),
+        "current_time_local": now_local.isoformat(),
+        "timezone": timezone_str,
         "current_day": current_day,
         "is_working_day": is_working_day,
+        "is_open_today": is_open_today,
         "is_within_hours": is_within_hours,
         "working_hours": {
-            "start": working_hours.get("startTime"),
-            "end": working_hours.get("endTime"),
+            "start": start_time_str,
+            "end": end_time_str,
             "overtime": working_hours.get("overtimeEndTime")
         },
-        "message": "En service" if in_service else "Hors service",
-        "next_service_time": f"{working_hours.get('startTime')} UTC" if not in_service else None
+        "message": "✅ En service" if in_service else "❌ Hors service",
     }
+    
+    # Ajouter les informations sur le prochain service si disponible
+    if next_service_info:
+        response["next_service_time"] = next_service_info
+    
+    return response
+# ==================== FONCTIONS UTILITAIRES ====================
 
+def calculate_next_service_time(
+    current_day: str,
+    current_minutes: int,
+    working_hours: dict,
+    is_working_day: bool,
+    start_minutes: int,
+    end_minutes: int,
+    days_off: dict
+) -> str | None:
+    """
+    Calcule le prochain moment où la pharmacie sera en service.
+    
+    CORRECTION: days_off[day] = True signifie jour OUVERT
+    """
+    # Récupérer l'heure d'ouverture formatée pour l'affichage
+    start_time_str = working_hours.get("startTime", "08:00")
+    
+    # CAS 1: Jour ouvert mais avant l'ouverture
+    if is_working_day and current_minutes < start_minutes:
+        return f"{start_time_str} (aujourd'hui)"
+    
+    # CAS 2: Jour ouvert mais après la fermeture
+    if is_working_day and current_minutes > end_minutes:
+        return find_next_open_day(current_day, start_time_str, days_off)
+    
+    # CAS 3: Jour fermé
+    if not is_working_day:
+        return find_next_open_day(current_day, start_time_str, days_off)
+    
+    # CAS 4: Déjà en service (aucun message à retourner)
+    return None
+
+
+def find_next_open_day(current_day: str, start_time: str, days_off: dict) -> str:
+    """
+    Trouve le prochain jour OUVERT dans la semaine.
+    
+    CORRECTION: days_off[day] = True signifie jour OUVERT
+    
+    Args:
+        current_day: Jour actuel en anglais
+        start_time: Heure d'ouverture formatée (HH:MM)
+        days_off: Dictionnaire des jours ouverts (True = ouvert)
+    
+    Returns:
+        str: Description du prochain jour ouvert avec l'heure
+    """
+    # Ordre des jours de la semaine
+    days_order = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    
+    # Traduction des jours en français pour l'affichage
+    day_names_fr = {
+        "monday": "lundi", 
+        "tuesday": "mardi", 
+        "wednesday": "mercredi",
+        "thursday": "jeudi", 
+        "friday": "vendredi", 
+        "saturday": "samedi",
+        "sunday": "dimanche"
+    }
+    
+    # Trouver l'index du jour actuel
+    try:
+        current_index = days_order.index(current_day)
+    except ValueError:
+        # Si le jour n'est pas reconnu, on part de lundi
+        current_index = 0
+    
+    # Parcourir les 7 prochains jours
+    for i in range(1, 8):  # i = 1 à 7
+        next_index = (current_index + i) % 7
+        next_day = days_order[next_index]
+        
+        # CORRECTION: Vérifier si ce jour est OUVERT
+        # Un jour est ouvert si days_off[next_day] = True
+        is_open = days_off.get(next_day, False)
+        
+        if is_open:
+            day_name_fr = day_names_fr.get(next_day, next_day)
+            
+            # Formatage du message selon le délai
+            if i == 1:
+                return f"{start_time} demain"
+            else:
+                return f"{start_time} {day_name_fr}"
+    
+    # Si aucun jour n'est trouvé (tous les jours sont fermés)
+    return "aucun jour d'ouverture configuré"
+
+# ==================== FIN DES FONCTIONS UTILITAIRES ====================
 
 # ROUTES CRUD STANDARD
 @router.delete("/{pharmacy_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -841,7 +1083,7 @@ def reactivate_pharmacy(
     pharmacy_dict = {
         "id": str(pharmacy.id),
         "tenant_id": str(pharmacy.tenant_id),
-        "nom": pharmacy.name,  # Utilise name au lieu de nom
+        "nom": pharmacy.name,
         "name": pharmacy.name,
         "license_number": pharmacy.license_number,
         "address": pharmacy.address,
@@ -894,7 +1136,7 @@ def get_pharmacy(
     pharmacy_dict = {
         "id": str(pharmacy.id),
         "tenant_id": str(pharmacy.tenant_id),
-        "nom": pharmacy.name,  # Utilise name au lieu de nom
+        "nom": pharmacy.name,
         "name": pharmacy.name,
         "license_number": pharmacy.license_number,
         "address": pharmacy.address,
@@ -968,7 +1210,7 @@ def update_pharmacy(
     pharmacy_dict = {
         "id": str(pharmacy.id),
         "tenant_id": str(pharmacy.tenant_id),
-        "nom": pharmacy.name,  # Utilise name au lieu de nom
+        "nom": pharmacy.name,
         "name": pharmacy.name,
         "license_number": pharmacy.license_number,
         "address": pharmacy.address,
@@ -1051,7 +1293,7 @@ def get_online_users(
     
     return {
         "pharmacy_id": pharmacy_id,
-        "pharmacy_name": pharmacy.name,  # Utilise name au lieu de nom
+        "pharmacy_name": pharmacy.name,
         "online_count": len(online_users),
         "users": result,
         "timestamp": datetime.utcnow().isoformat()

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field, validator, ConfigDict
+from pydantic import BaseModel, EmailStr, Field, field_validator, ConfigDict
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 import re
@@ -6,17 +6,11 @@ from uuid import UUID
 
 
 # ============================================
-# SCHÉMAS DE CONFIGURATION (du nouveau fichier)
+# SCHÉMAS DE CONFIGURATION - HEURES DE SERVICE
 # ============================================
 
-class CurrencyConfig(BaseModel):
-    code: str = Field(..., min_length=3, max_length=3)
-    symbol: str
-    isActive: bool = True
-    exchangeRate: float = Field(..., gt=0)
-
-
 class DaysOffConfig(BaseModel):
+    """Configuration des jours de service"""
     monday: bool = True
     tuesday: bool = True
     wednesday: bool = True
@@ -24,118 +18,270 @@ class DaysOffConfig(BaseModel):
     friday: bool = True
     saturday: bool = True
     sunday: bool = False
+    
+    model_config = ConfigDict(from_attributes=True)
 
 
 class WorkingHoursConfig(BaseModel):
+    """
+    Configuration des heures de service
+    Les heures sont stockées en heure locale de la pharmacie (timezone spécifiée)
+    """
     enabled: bool = True
-    startTime: str = Field(..., pattern="^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$")
-    endTime: str = Field(..., pattern="^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$")
-    overtimeEndTime: Optional[str] = Field(None, pattern="^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$")
-    daysOff: DaysOffConfig = DaysOffConfig()
+    startTime: str = Field(
+        default="08:00", 
+        pattern=r"^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$",
+        description="Heure de début en format HH:MM (heure locale pharmacie)"
+    )
+    endTime: str = Field(
+        default="20:00", 
+        pattern=r"^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$",
+        description="Heure de fin en format HH:MM (heure locale pharmacie)"
+    )
+    overtimeEndTime: Optional[str] = Field(
+        None, 
+        pattern=r"^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$",
+        description="Heure limite supplémentaire en format HH:MM (heure locale pharmacie)"
+    )
+    timezone: str = Field(
+        default="Africa/Kinshasa",
+        description="Fuseau horaire de la pharmacie (ex: Africa/Kinshasa, Africa/Lubumbashi, Europe/Paris)"
+    )
+    daysOff: DaysOffConfig = Field(
+        default_factory=DaysOffConfig,
+        description="Configuration des jours de service"
+    )
+    
+    model_config = ConfigDict(from_attributes=True)
+    
+    @field_validator('endTime')
+    @classmethod
+    def validate_end_time(cls, v, info):
+        """Vérifie que l'heure de fin est après l'heure de début"""
+        if 'startTime' in info.data and v < info.data['startTime']:
+            raise ValueError("L'heure de fin doit être après l'heure de début")
+        return v
+    
+    @field_validator('overtimeEndTime')
+    @classmethod
+    def validate_overtime(cls, v, info):
+        """Vérifie que l'heure supplémentaire est après l'heure de fin"""
+        if v and 'endTime' in info.data and v < info.data['endTime']:
+            raise ValueError("L'heure supplémentaire doit être après l'heure de fin")
+        return v
+    
+    @field_validator('timezone')
+    @classmethod
+    def validate_timezone(cls, v):
+        """Valide que le fuseau horaire est supporté"""
+        supported_zones = [
+            "Africa/Kinshasa",      # UTC+1
+            "Africa/Lubumbashi",    # UTC+2
+            "Africa/Johannesburg",  # UTC+2
+            "Africa/Lagos",         # UTC+1
+            "Europe/Paris",          # UTC+1/UTC+2 (DST)
+            "UTC"
+        ]
+        if v not in supported_zones:
+            raise ValueError(f"Fuseau horaire non supporté. Utilisez l'un de: {', '.join(supported_zones)}")
+        return v
 
+
+# ============================================
+# SCHÉMAS DE CONFIGURATION - DEVISES
+# ============================================
+
+class CurrencyConfig(BaseModel):
+    """Configuration d'une devise"""
+    code: str = Field(..., min_length=3, max_length=3, pattern=r"^[A-Z]{3}$")
+    symbol: str = Field(..., min_length=1, max_length=5)
+    isActive: bool = True
+    exchangeRate: float = Field(..., gt=0, description="Taux de change par rapport à la devise primaire")
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ============================================
+# SCHÉMAS DE CONFIGURATION - MARGES ET PRIX
+# ============================================
 
 class MarginConfig(BaseModel):
-    defaultMargin: float = Field(..., ge=0, le=100)
-    minMargin: float = Field(..., ge=0, le=100)
-    maxMargin: float = Field(..., ge=0, le=100)
+    """Configuration des marges bénéficiaires"""
+    defaultMargin: float = Field(..., ge=0, le=100, description="Marge par défaut en pourcentage")
+    minMargin: float = Field(..., ge=0, le=100, description="Marge minimale autorisée")
+    maxMargin: float = Field(..., ge=0, le=100, description="Marge maximale autorisée")
     
-    @validator('maxMargin')
-    def validate_margins(cls, v, values):
-        if 'minMargin' in values and v < values['minMargin']:
-            raise ValueError('maxMargin must be greater than minMargin')
+    model_config = ConfigDict(from_attributes=True)
+    
+    @field_validator('maxMargin')
+    @classmethod
+    def validate_margins(cls, v, info):
+        """Vérifie la cohérence des marges"""
+        if 'minMargin' in info.data and v < info.data['minMargin']:
+            raise ValueError("La marge maximale doit être supérieure à la marge minimale")
         return v
 
 
 class AutomaticPricingConfig(BaseModel):
+    """Configuration du calcul automatique des prix"""
     enabled: bool = False
-    method: str = Field(..., pattern="^(percentage|coefficient|margin)$")
-    value: float = Field(..., gt=0)
+    method: str = Field(
+        ...,
+        pattern=r"^(percentage|coefficient|margin)$",
+        description="Méthode de calcul: percentage, coefficient, margin"
+    )
+    value: float = Field(..., gt=0, description="Valeur à appliquer selon la méthode choisie")
+    
+    model_config = ConfigDict(from_attributes=True)
 
 
-class BranchConfig(BaseModel):
-    maxBranches: int = Field(..., ge=0)
-    currentBranches: int = Field(..., ge=0)
-    branches: List[Dict[str, Any]] = []
+# ============================================
+# SCHÉMAS DE CONFIGURATION - SUCCURSALES
+# ============================================
 
-
-class ThemeConfig(BaseModel):
-    theme: str = Field(..., pattern="^(light|dark|system)$")
-
-
-class PharmacyInfoConfig(BaseModel):
+class BranchItem(BaseModel):
+    """Informations d'une succursale"""
+    id: str
     name: str
     address: str
     phone: str
     email: str
-    licenseNumber: str
-    logo: Optional[str] = None
+    manager: Optional[str] = None
+    created_at: datetime
+    is_active: bool = True
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class BranchConfig(BaseModel):
+    """Configuration des succursales"""
+    maxBranches: int = Field(..., ge=0, description="Nombre maximum de succursales autorisé")
+    currentBranches: int = Field(..., ge=0, description="Nombre actuel de succursales")
+    branches: List[BranchItem] = Field(default_factory=list, description="Liste des succursales")
+    
+    model_config = ConfigDict(from_attributes=True)
 
 
 # ============================================
-# SCHÉMAS PHARMACIE DE BASE (fusion des deux)
+# SCHÉMAS DE CONFIGURATION - INFORMATIONS PHARMACIE
+# ============================================
+
+class PharmacyInfoConfig(BaseModel):
+    """Informations de base de la pharmacie"""
+    name: str = Field(..., description="Nom de la pharmacie")
+    address: str = Field(..., description="Adresse complète")
+    phone: str = Field(..., description="Numéro de téléphone")
+    email: EmailStr = Field(..., description="Email de contact")
+    licenseNumber: str = Field(..., description="Numéro de licence")
+    logo: Optional[str] = Field(None, description="URL du logo")
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ============================================
+# SCHÉMAS DE CONFIGURATION - THÈME
+# ============================================
+
+class ThemeConfig(BaseModel):
+    """Configuration du thème de l'application"""
+    theme: str = Field(..., pattern=r"^(light|dark|system)$", description="Thème: light, dark ou system")
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ============================================
+# SCHÉMA PRINCIPAL DE CONFIGURATION PHARMACIE
+# ============================================
+
+class PharmacyConfig(BaseModel):
+    """Configuration complète d'une pharmacie"""
+    pharmacyInfo: PharmacyInfoConfig
+    currencies: List[CurrencyConfig] = Field(..., min_length=1)
+    primaryCurrency: str = Field(..., description="Code de la devise primaire")
+    taxRate: float = Field(..., ge=0, le=100, description="Taux de TVA en pourcentage")
+    lowStockThreshold: int = Field(..., ge=0, description="Seuil d'alerte stock bas")
+    expiryWarningDays: int = Field(..., ge=0, description="Nombre de jours avant expiration pour alerte")
+    allowNegativeStock: bool = Field(False, description="Autoriser la vente en stock négatif")
+    workingHours: WorkingHoursConfig
+    productReturnDays: int = Field(..., ge=0, description="Délai de retour produit en jours")
+    marginConfig: MarginConfig
+    automaticPricing: AutomaticPricingConfig
+    theme: str = Field(..., pattern=r"^(light|dark|system)$", description="Thème de l'application")
+    initialCapital: float = Field(..., ge=0, description="Capital initial en USD")
+    branchConfig: BranchConfig
+    createdAt: datetime
+    updatedAt: datetime
+    
+    model_config = ConfigDict(from_attributes=True)
+    
+    @field_validator('primaryCurrency')
+    @classmethod
+    def validate_primary_currency(cls, v, info):
+        """Vérifie que la devise primaire existe dans la liste"""
+        if 'currencies' in info.data:
+            currencies = info.data['currencies']
+            if not any(c.code == v for c in currencies):
+                raise ValueError(f"La devise primaire '{v}' n'existe pas dans la liste des devises")
+        return v
+
+
+# ============================================
+# SCHÉMAS DE CRÉATION/MISE À JOUR PHARMACIE
 # ============================================
 
 class PharmacyBase(BaseModel):
-    # Champs du nouveau fichier
-    nom: Optional[str] = None
-    # Champs de l'ancien fichier (avec noms anglais)
-    name: Optional[str] = None
-    license_number: str = Field(..., min_length=5)
-    address: str
-    city: str = "Kinshasa"
-    country: str = "CD"
-    phone: Optional[str] = None
-    email: Optional[EmailStr] = None
-    is_active: bool = True
+    """Champs de base pour une pharmacie"""
+    name: str = Field(..., description="Nom de la pharmacie")
+    license_number: str = Field(..., min_length=5, description="Numéro de licence")
+    address: str = Field(..., description="Adresse")
+    city: str = Field("Kinshasa", description="Ville")
+    country: str = Field("CD", min_length=2, max_length=2, description="Code pays ISO 3166-1 alpha-2")
+    phone: Optional[str] = Field(None, description="Téléphone")
+    email: Optional[EmailStr] = Field(None, description="Email")
+    is_active: bool = Field(True, description="Statut actif/inactif")
+    opening_hours: Optional[Dict[str, str]] = Field(None, description="Horaires d'ouverture (format libre)")
+    pharmacist_in_charge: Optional[str] = Field(None, description="Pharmacien responsable")
+    pharmacist_license: Optional[str] = Field(None, description="Licence du pharmacien")
     
-    # Anciens champs supplémentaires
-    opening_hours: Optional[Dict[str, str]] = None
-    pharmacist_in_charge: Optional[str] = None
-    pharmacist_license: Optional[str] = None
+    model_config = ConfigDict(from_attributes=True)
     
-    # Configuration
-    config: Optional[Dict[str, Any]] = None
-    
-    @validator('license_number')
+    @field_validator('license_number')
+    @classmethod
     def validate_license_number(cls, v):
+        """Valide le format du numéro de licence"""
         if not v or len(v) < 5:
             raise ValueError("Le numéro de licence doit contenir au moins 5 caractères")
-        # Validation supplémentaire pour le format selon le pays
         if not re.match(r'^[A-Z0-9-]+$', v):
             raise ValueError("Le numéro de licence ne peut contenir que des lettres majuscules, chiffres et tirets")
         return v
     
-    @validator('phone')
+    @field_validator('phone')
+    @classmethod
     def validate_phone(cls, v):
+        """Valide le format du téléphone"""
         if v and not re.match(r'^\+?[0-9\s-]{8,}$', v):
-            raise ValueError("Format de téléphone invalide")
+            raise ValueError("Format de téléphone invalide. Utilisez +243XXXXXXXXX")
         return v
     
-    @validator('name', 'nom', pre=True, always=True)
-    def set_name(cls, v, values):
-        """Gère à la fois name et nom"""
-        if v:
-            return v
-        if 'name' in values and values['name']:
-            return values['name']
-        return None
+    @field_validator('country')
+    @classmethod
+    def validate_country(cls, v):
+        """Valide le code pays"""
+        if v and len(v) != 2:
+            raise ValueError("Le code pays doit être sur 2 caractères (ISO 3166-1 alpha-2)")
+        return v.upper()
 
 
 class PharmacyCreate(PharmacyBase):
-    tenant_id: str  # Changé de int à str pour UUID
+    """Schéma pour la création d'une pharmacie"""
+    tenant_id: str = Field(..., description="ID du tenant (UUID)")
     
-    # S'assurer qu'au moins un des deux noms est fourni
-    @validator('name', 'nom', pre=True, always=True)
-    def validate_name_exists(cls, v, values):
-        if not v and not values.get('name') and not values.get('nom'):
-            raise ValueError("Le nom de la pharmacie est requis")
-        return v
+    # Configuration optionnelle à la création
+    config: Optional[PharmacyConfig] = None
 
 
 class PharmacyUpdate(BaseModel):
-    # Champs du nouveau fichier
-    nom: Optional[str] = None
-    # Champs de l'ancien fichier
+    """Schéma pour la mise à jour d'une pharmacie"""
     name: Optional[str] = None
     license_number: Optional[str] = None
     address: Optional[str] = None
@@ -144,24 +290,19 @@ class PharmacyUpdate(BaseModel):
     phone: Optional[str] = None
     email: Optional[EmailStr] = None
     is_active: Optional[bool] = None
-    
-    # Anciens champs supplémentaires
     opening_hours: Optional[Dict[str, str]] = None
     pharmacist_in_charge: Optional[str] = None
     pharmacist_license: Optional[str] = None
-    
-    # Configuration
-    config: Optional[Dict[str, Any]] = None
     
     model_config = ConfigDict(from_attributes=True)
 
 
 # ============================================
-# SCHÉMAS DE CONFIGURATION PHARMACIE
+# SCHÉMAS DE MISE À JOUR DE CONFIGURATION
 # ============================================
 
 class PharmacyConfigUpdate(BaseModel):
-    # Du nouveau fichier
+    """Schéma pour la mise à jour partielle de la configuration"""
     pharmacyInfo: Optional[PharmacyInfoConfig] = None
     currencies: Optional[List[CurrencyConfig]] = None
     primaryCurrency: Optional[str] = None
@@ -173,11 +314,11 @@ class PharmacyConfigUpdate(BaseModel):
     productReturnDays: Optional[int] = Field(None, ge=0)
     marginConfig: Optional[MarginConfig] = None
     automaticPricing: Optional[AutomaticPricingConfig] = None
-    theme: Optional[str] = Field(None, pattern="^(light|dark|system)$")
+    theme: Optional[str] = Field(None, pattern=r"^(light|dark|system)$")
     initialCapital: Optional[float] = Field(None, ge=0)
     branchConfig: Optional[BranchConfig] = None
     
-    # De l'ancien fichier (pour rétrocompatibilité)
+    # Champs pour rétrocompatibilité
     require_prescription: Optional[bool] = None
     enable_expiry_alerts: Optional[bool] = None
     low_stock_threshold: Optional[int] = None
@@ -189,73 +330,90 @@ class PharmacyConfigUpdate(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-class PharmacyConfigResponse(BaseModel):
-    pharmacy_id: str  # Changé de int à str pour UUID
-    config: Dict[str, Any]
-    updated_at: datetime
-    
-    model_config = ConfigDict(from_attributes=True)
-
-
 # ============================================
-# SCHÉMAS DE RÉPONSE (fusion des deux)
+# SCHÉMAS DE RÉPONSE
 # ============================================
 
 class PharmacyInDB(PharmacyBase):
-    id: str  # Changé de int à str pour UUID
-    tenant_id: str  # Changé de int à str pour UUID
+    """Pharmacie telle que stockée en base"""
+    id: str = Field(..., description="ID unique de la pharmacie (UUID)")
+    tenant_id: str = Field(..., description="ID du tenant (UUID)")
+    config: Dict[str, Any] = Field(default_factory=dict, description="Configuration JSON")
     created_at: datetime
     updated_at: datetime
     
     model_config = ConfigDict(
         from_attributes=True,
         json_encoders={
-            UUID: lambda v: str(v),  # Conversion explicite en string
+            UUID: str,
             datetime: lambda v: v.isoformat()
         }
     )
 
 
 class PharmacyResponse(PharmacyInDB):
-    # Champ calculé pour le nom unifié
+    """Réponse API pour une pharmacie"""
+    
     @property
     def display_name(self) -> str:
-        return self.nom or self.name or "Pharmacie sans nom"
-    
-    model_config = ConfigDict(
-        from_attributes=True,
-        json_encoders={
-            UUID: lambda v: str(v),  # Conversion explicite en string
-            datetime: lambda v: v.isoformat()
-        }
-    )
-    
-    def dict(self, *args, **kwargs):
-        """Surcharge pour garantir que les UUIDs sont des strings"""
-        d = super().dict(*args, **kwargs)
-        # Conversion explicite des UUIDs en strings
-        if 'id' in d and d['id'] and not isinstance(d['id'], str):
-            d['id'] = str(d['id'])
-        if 'tenant_id' in d and d['tenant_id'] and not isinstance(d['tenant_id'], str):
-            d['tenant_id'] = str(d['tenant_id'])
-        return d
+        """Nom d'affichage unifié"""
+        return self.name or "Pharmacie sans nom"
     
     def model_dump(self, *args, **kwargs):
-        """Pour Pydantic v2"""
-        d = super().model_dump(*args, **kwargs)
-        # Conversion explicite des UUIDs en strings
-        if 'id' in d and d['id'] and not isinstance(d['id'], str):
-            d['id'] = str(d['id'])
-        if 'tenant_id' in d and d['tenant_id'] and not isinstance(d['tenant_id'], str):
-            d['tenant_id'] = str(d['tenant_id'])
-        return d
+        """Surcharge pour garantir que les UUIDs sont des strings"""
+        data = super().model_dump(*args, **kwargs)
+        
+        # Conversion explicite des UUIDs
+        for field in ['id', 'tenant_id']:
+            if field in data and data[field] and not isinstance(data[field], str):
+                data[field] = str(data[field])
+        
+        # Conversion des datetime
+        for field in ['created_at', 'updated_at']:
+            if field in data and data[field] and isinstance(data[field], datetime):
+                data[field] = data[field].isoformat()
+        
+        return data
+
+
+class PharmacyConfigResponse(BaseModel):
+    """Réponse API pour la configuration"""
+    pharmacy_id: str
+    config: Dict[str, Any]
+    updated_at: datetime
+    
+    model_config = ConfigDict(from_attributes=True)
+    
+    def model_dump(self, *args, **kwargs):
+        data = super().model_dump(*args, **kwargs)
+        if 'updated_at' in data and isinstance(data['updated_at'], datetime):
+            data['updated_at'] = data['updated_at'].isoformat()
+        return data
 
 
 # ============================================
-# SCHÉMAS SPÉCIFIQUES POUR LES LIMITES
+# SCHÉMAS DE SERVICE ET STATUT
 # ============================================
+
+class ServiceStatusResponse(BaseModel):
+    """Statut du service basé sur les heures configurées"""
+    in_service: bool
+    restrictions_enabled: bool
+    current_time_utc: str
+    current_time_local: str
+    timezone: str
+    current_day: str
+    is_working_day: bool
+    is_within_hours: bool
+    working_hours: Dict[str, Optional[str]]
+    message: str
+    next_service_time: Optional[str] = None
+    
+    model_config = ConfigDict(from_attributes=True)
+
 
 class PharmacyLimitsResponse(BaseModel):
+    """Limites de la pharmacie selon l'abonnement"""
     tenant_id: str
     tenant_name: str
     current_plan: str
@@ -269,21 +427,23 @@ class PharmacyLimitsResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-class ServiceStatusResponse(BaseModel):
-    in_service: bool
-    restrictions_enabled: bool
-    current_time_utc: str
-    current_day: str
-    is_working_day: bool
-    is_within_hours: bool
-    working_hours: Dict[str, Optional[str]]
-    message: str
-    next_service_time: Optional[str] = None
+# ============================================
+# SCHÉMAS POUR LES SUCCURSALES
+# ============================================
+
+class BranchCreate(BaseModel):
+    """Création d'une succursale"""
+    name: str
+    address: str
+    phone: str
+    email: EmailStr
+    manager: Optional[str] = None
     
     model_config = ConfigDict(from_attributes=True)
 
 
 class BranchCreateResponse(BaseModel):
+    """Réponse après création d'une succursale"""
     message: str
     branch: Dict[str, Any]
     remaining: int
@@ -298,6 +458,7 @@ class BranchCreateResponse(BaseModel):
 # ============================================
 
 class OnlineUserResponse(BaseModel):
+    """Utilisateur en ligne"""
     id: str
     nom_complet: Optional[str] = None
     email: str
@@ -306,16 +467,12 @@ class OnlineUserResponse(BaseModel):
     login_duration: str
     status: str = "online"
     
-    model_config = ConfigDict(
-        from_attributes=True,
-        json_encoders={
-            UUID: lambda v: str(v)
-        }
-    )
+    model_config = ConfigDict(from_attributes=True)
 
 
 class OnlineUsersResponse(BaseModel):
-    pharmacy_id: str  # Changé de int à str pour UUID
+    """Liste des utilisateurs en ligne"""
+    pharmacy_id: str
     pharmacy_name: str
     online_count: int
     users: List[OnlineUserResponse]
@@ -324,6 +481,8 @@ class OnlineUsersResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-class PricingConfig(AutomaticPricingConfig):
-    """Alias pour compatibilité avec l'ancien code"""
-    pass
+# ============================================
+# ALIAS POUR COMPATIBILITÉ
+# ============================================
+
+PricingConfig = AutomaticPricingConfig  # Alias pour compatibilité
