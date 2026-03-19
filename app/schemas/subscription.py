@@ -730,6 +730,42 @@ class SubscriptionInDB(SubscriptionResponse):
     """Schéma pour les données stockées en base de données"""
     pass
 
+class SubscriptionCodeCreate(BaseModel):
+    plan_type: str
+    billing_cycle: Optional[str] = "monthly"
+    duration_days: Optional[int] = None
+    price: Optional[float] = None
+    currency: Optional[str] = "USD"
+    valid_from: Optional[datetime] = None
+    valid_until: Optional[datetime] = None
+    expiry_days: Optional[int] = 90  # Durée de validité du code
+    code_length: Optional[int] = 8
+    notes: Optional[str] = None
+
+class ActivateSubscriptionCode(BaseModel):
+    code: str
+    force: bool = False  # Pour forcer l'activation même si abonnement actif
+
+class SubscriptionCodeResponse(BaseModel):
+    success: bool
+    code: str
+    plan_type: str
+    plan_name: str
+    price: float
+    currency: str
+    duration_days: int
+    valid_until: Optional[datetime]
+    created_at: datetime
+    status: str
+
+class ManualActivationSchema(BaseModel):
+    user_id: UUID
+    plan: str
+    billing_cycle: str = "monthly"
+    payment_id: Optional[str] = None
+    payment_method: str = "manual"
+    reference: Optional[str] = None
+    notes: Optional[str] = None
 
 # =======================
 # EXPORTS

@@ -96,6 +96,52 @@ class TenantRegisterSchema(BaseModel):
         if model.confirm_password and model.password != model.confirm_password:
             raise ValueError("Les mots de passe ne correspondent pas")
         return model
+    
+    @field_validator("pays")
+    def validate_country(cls, v: str) -> str:
+        """Convertit les noms de pays en codes ISO si nécessaire"""
+        if not v:
+            return "CD"  # Valeur par défaut
+        
+        # Mapping des noms de pays vers codes ISO
+        country_mapping = {
+            "rdc": "CD",
+            "congo": "CD",
+            "république démocratique du congo": "CD",
+            "republique democratique du congo": "CD",
+            "congo kinshasa": "CD",
+            "congo-kinshasa": "CD",
+            "rd congo": "CD",
+            "côte d'ivoire": "CI",
+            "cote d'ivoire": "CI",
+            "cameroon": "CM",
+            "cameroun": "CM",
+            "senegal": "SN",
+            "sénégal": "SN",
+            "france": "FR",
+            "belgique": "BE",
+            "belgium": "BE",
+        }
+        
+        # Si c'est déjà un code ISO valide (2 caractères)
+        if len(v) == 2 and v.isalpha():
+            return v.upper()
+        
+        # Sinon, chercher dans le mapping
+        normalized = v.lower().strip()
+        if normalized in country_mapping:
+            return country_mapping[normalized]
+        
+        # Par défaut, utiliser le code du pays le plus probable
+        # Pour la RDC, c'est "CD"
+        if "congo" in normalized or "kinshasa" in normalized:
+            return "CD"
+        
+        # Lever une erreur avec suggestion
+        raise ValueError(
+            f"Pays '{v}' non reconnu. Utilisez le code ISO à 2 lettres "
+            f"(ex: CD pour RDC, CI pour Côte d'Ivoire, FR pour France)"
+        )
 
 class LoginWithCodeSchema(BaseModel):
     email: EmailStr
@@ -601,20 +647,59 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
                 "suggestion": "Contactez le support technique"
             }
         )
-
     # =========================
     # 9. CRÉATION DE L'ABONNEMENT D'ESSAI POUR L'ADMIN
     # =========================
-    
+
     from app.services.subscription_service import create_trial_subscription
-    
+    import inspect
+
     try:
-        trial_subscription = create_trial_subscription(
-            db=db,
-            user_id=admin.id,
-            tenant_id=tenant.id,
-            trial_days=14
-        )
+        # Inspecter la fonction pour connaître ses paramètres
+        sig = inspect.signature(create_trial_subscription)
+        params = sig.parameters
+        
+        # Construire les arguments en fonction de la signature
+        kwargs = {
+            'db': db,
+            'user_id': admin.id,
+            'tenant_id': tenant.id
+        }
+        
+        # Ajouter le paramètre de durée selon le nom attendu
+        if 'trial_days' in params:
+            kwargs['trial_days'] = 14
+        elif 'days' in params:
+            kwargs['days'] = 14
+        elif 'duration' in params:
+            kwargs['duration'] = 14
+        elif 'duration_days' in params:
+            kwargs['duration_days'] = 14
+        
+        # Appeler la fonction avec les bons paramètres
+        trial_subscription = create_trial_subscription(**kwargs)
+        
+        logger.info(f"Abonnement d'essai créé pour l'utilisateur {admin.id}")
+        
+    except TypeError as e:
+        # Si l'inspection échoue, essayer différentes signatures
+        db.rollback()
+        logger.error(f"Erreur de signature dans create_trial_subscription: {e}")
+        
+        try:
+            # Essayer sans paramètre de durée
+            trial_subscription = create_trial_subscription(db, admin.id, tenant.id)
+        except Exception as e2:
+            db.rollback()
+            logger.error(f"Erreur création abonnement d'essai (second essai): {e2}")
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": "subscription_creation_failed",
+                    "message": "Erreur lors de la création de l'abonnement d'essai",
+                    "suggestion": "Contactez le support technique"
+                }
+            )
         
     except Exception as e:
         db.rollback()
@@ -627,7 +712,6 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
                 "suggestion": "Contactez le support technique"
             }
         )
-
     # =========================
     # 10. VALIDATION FINALE DE LA TRANSACTION
     # =========================

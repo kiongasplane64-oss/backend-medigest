@@ -34,6 +34,31 @@ router = APIRouter(prefix="/subscriptions", tags=["Subscriptions"])
 
 
 # =============================================================================
+# ENDPOINTS DE COMPATIBILITÉ
+# =============================================================================
+
+@router.put("/", response_model=Dict[str, Any])
+@router.put("", response_model=Dict[str, Any])  # Pour gérer les deux cas (avec et sans slash)
+async def update_subscription(
+    data: UpgradeSubscriptionSchema,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Met à jour l'abonnement de l'utilisateur connecté.
+    Alias pour POST /upgrade pour compatibilité.
+    """
+    logger.info("Appel PUT /subscriptions/ - redirection vers upgrade")
+    
+    # Appeler directement la fonction (pas besoin de await)
+    return await upgrade_my_subscription(
+        data=data,
+        current_user=current_user,
+        db=db
+    )
+
+
+# =============================================================================
 # HELPERS
 # =============================================================================
 

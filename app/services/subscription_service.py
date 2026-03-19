@@ -1,370 +1,1001 @@
 # app/services/subscription_service.py
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
+"""
+Service de gestion des abonnements et des codes d'activation.
+"""
 import logging
-from sqlalchemy.orm import Session
-from sqlalchemy import func
+import random
+import string
+import uuid
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Union
+from uuid import UUID
 
+from sqlalchemy.orm import Session
+from sqlalchemy import and_, or_
+
+# Importer les DEUX modèles
+from app.models.subscription import Subscription as TenantSubscription
+from app.models.user_subscription import UserSubscription
+from app.models.subscription_code import SubscriptionCode, SubscriptionCodeStatus
 from app.models.user import User
 from app.models.tenant import Tenant
-from app.models.user_subscription import UserSubscription
-from app.models.pharmacy import Pharmacy
-from app.models.payment import Payment
 
 logger = logging.getLogger(__name__)
 
-# Configuration des plans
+# ============================================================================
+# CONFIGURATION DES PLANS
+# ============================================================================
+
 PLAN_CONFIG = {
-    "trial": {
-        "name": "Essai gratuit",
+    "free": {
+        "name": "Gratuit",
         "price_monthly": 0,
         "price_yearly": 0,
-        "max_users_per_tenant": 1,  # L'admin peut créer 1 utilisateur (lui-même)
+        "max_users_per_tenant": 1,
         "max_products": 100,
-        "max_pharmacies": 1,  # L'admin peut créer 1 pharmacie
+        "max_pharmacies": 1,
         "features": [
-            "1 utilisateur",
-            "100 produits",
-            "1 pharmacie",
-            "Support email",
-            "Période d'essai de 14 jours"
+            "Gestion de stock de base",
+            "Ventes POS",
+            "Rapports quotidiens"
         ]
     },
     "starter": {
         "name": "Starter",
-        "price_monthly": 29.99,
-        "price_yearly": 299.99,
-        "max_users_per_tenant": 2,  # Admin + 1 employé
+        "price_monthly": 5,
+        "price_yearly": 48,  # 20% de réduction
+        "max_users_per_tenant": 1,
         "max_products": 500,
         "max_pharmacies": 1,
         "features": [
-            "Jusqu'à 2 utilisateurs",
-            "500 produits",
-            "1 pharmacie",
-            "Support email prioritaire",
-            "Rapports basiques"
+            "1 Utilisateur",
+            "Gestion de stock de base",
+            "Ventes POS",
+            "Rapports quotidiens"
         ]
     },
-    "professional": {
-        "name": "Professional",
-        "price_monthly": 79.99,
-        "price_yearly": 799.99,
-        "max_users_per_tenant": 5,  # Admin + 4 employés
-        "max_products": 0,  # Illimité
+    "pro": {
+        "name": "Pro",
+        "price_monthly": 8,
+        "price_yearly": 76.8,  # 20% de réduction
+        "max_users_per_tenant": 5,
+        "max_products": 2000,
         "max_pharmacies": 3,
         "features": [
-            "Jusqu'à 5 utilisateurs",
-            "Produits illimités",
-            "Jusqu'à 3 pharmacies",
-            "Support 24/7",
-            "Rapports avancés",
-            "API d'intégration"
+            "5 Utilisateurs",
+            "Transferts inter-stocks",
+            "Gestion des dettes",
+            "PWA (Mode Offline)",
+            "Support Prioritaire"
         ]
     },
     "enterprise": {
-        "name": "Enterprise",
-        "price_monthly": 199.99,
-        "price_yearly": 1999.99,
-        "max_users_per_tenant": 0,  # Illimité
-        "max_products": 0,  # Illimité
-        "max_pharmacies": 0,  # Illimité
+        "name": "Entreprise",
+        "price_monthly": 15,
+        "price_yearly": 144,  # 20% de réduction
+        "max_users_per_tenant": 0,  # 0 = Illimité
+        "max_products": 0,  # 0 = Illimité
+        "max_pharmacies": 0,  # 0 = Illimité
         "features": [
             "Utilisateurs illimités",
-            "Produits illimités",
-            "Pharmacies illimitées",
-            "Support dédié",
-            "Formation sur site",
-            "Personnalisation",
-            "SLA garanti"
+            "Analytique avancée",
+            "API d'inventaire",
+            "Audit Logs complets",
+            "Gestion multi-dépôts"
         ]
+    },
+    "trial": {
+        "name": "Essai",
+        "price_monthly": 0,
+        "price_yearly": 0,
+        "max_users_per_tenant": 5,
+        "max_products": 500,
+        "max_pharmacies": 1,
+        "features": [
+            "5 Utilisateurs",
+            "Gestion de stock avancée",
+            "Ventes POS",
+            "Rapports quotidiens",
+            "Période d'essai de 14 jours"
+        ],
+        "trial_days": 14
     }
 }
 
 
-def create_trial_subscription(
-    db: Session,
-    user_id: str,
-    tenant_id: str,
-    trial_days: int = 14
-) -> UserSubscription:
+# ============================================================================
+# FONCTIONS UTILITAIRES
+# ============================================================================
+
+def generate_subscription_code(length: int = 8) -> str:
     """
-    Crée un abonnement d'essai pour un nouvel utilisateur
+    Génère un code d'abonnement unique formaté XXXX-XXXX.
     """
-    plan = PLAN_CONFIG["trial"]
+    chars = string.ascii_uppercase + string.digits
+    # Exclure les caractères ambigus
+    chars = chars.replace('O', '').replace('0', '').replace('I', '').replace('1', '')
     
-    start_date = datetime.utcnow()
-    end_date = start_date + timedelta(days=trial_days)
+    # Générer la première partie
+    part1 = ''.join(random.choices(chars, k=4))
+    part2 = ''.join(random.choices(chars, k=4))
     
-    subscription = UserSubscription(
-        user_id=user_id,
-        tenant_id=tenant_id,
-        plan_type="trial",
-        plan_name=plan["name"],
-        start_date=start_date,
-        end_date=end_date,
-        trial_end_date=end_date,
-        status="active",
-        price=0,
-        billing_cycle="one_time",
-        max_users=plan["max_users_per_tenant"],
-        max_products=plan["max_products"],
-        max_pharmacies=plan["max_pharmacies"],
-        auto_renew=False,
-        config={
-            "trial_days": trial_days,
-            "created_at": start_date.isoformat()
-        }
-    )
-    
-    db.add(subscription)
-    db.commit()
-    db.refresh(subscription)
-    
-    logger.info(f"Abonnement d'essai créé pour l'utilisateur {user_id} (expire le {end_date})")
-    
-    return subscription
+    return f"{part1}-{part2}"
 
 
-def check_user_subscription(
-    db: Session,
-    user_id: str
-) -> Dict[str, Any]:
+def get_plan_config(plan_type: str) -> Dict[str, Any]:
     """
-    Vérifie le statut de l'abonnement d'un utilisateur
-    Met à jour le statut si expiré
+    Récupère la configuration d'un plan.
     """
-    user = db.query(User).filter(User.id == user_id).first()
+    return PLAN_CONFIG.get(plan_type, PLAN_CONFIG["free"])
+
+
+def calculate_end_date(start_date: datetime, duration_days: int) -> datetime:
+    """
+    Calcule la date de fin à partir de la date de début et de la durée.
+    """
+    return start_date + timedelta(days=duration_days)
+
+
+def is_unlimited(value: Union[int, str]) -> bool:
+    """
+    Vérifie si une valeur représente "Illimité".
+    """
+    if isinstance(value, str):
+        return value.lower() == "illimité"
+    return value == 0
+
+
+def format_unlimited(value: Union[int, str]) -> Union[int, str]:
+    """
+    Formate une valeur pour l'affichage (transforme 0 en "Illimité").
+    """
+    if isinstance(value, int) and value == 0:
+        return "Illimité"
+    if isinstance(value, str) and value.lower() == "illimité":
+        return "Illimité"
+    return value
+
+
+# ============================================================================
+# FONCTIONS POUR LES ABONNEMENTS UTILISATEUR
+# ============================================================================
+
+def check_user_subscription(db: Session, user_id: str) -> Dict[str, Any]:
+    """
+    Vérifie le statut de l'abonnement d'un utilisateur.
+    Utilise le modèle UserSubscription.
+    """
+    user = db.query(User).filter(User.id == UUID(user_id)).first()
     if not user:
         return {
             "has_subscription": False,
-            "error": "Utilisateur non trouvé"
+            "is_active": False,
+            "plan": "free",
+            "status": "no_user",
+            "message": "Utilisateur non trouvé"
         }
-    
-    if not user.subscription:
+
+    # Utiliser UserSubscription (pas Subscription)
+    subscription = db.query(UserSubscription).filter(
+        UserSubscription.user_id == user.id
+    ).first()
+
+    if not subscription:
         return {
             "has_subscription": False,
-            "user_id": str(user_id),
-            "mode": "READ_ONLY",
-            "message": "Aucun abonnement trouvé"
+            "is_active": False,
+            "plan": "free",
+            "status": "no_subscription",
+            "user_id": str(user.id),
+            "tenant_id": str(user.tenant_id) if user.tenant_id else None
         }
-    
-    subscription = user.subscription
-    
-    # Vérifier si l'abonnement a expiré
-    if subscription.has_expired() and subscription.status == "active":
-        subscription.status = "expired"
-        db.commit()
-        logger.info(f"Abonnement expiré pour l'utilisateur {user_id}")
-        
-        return {
-            "has_subscription": True,
-            "user_id": str(user_id),
-            "plan": subscription.plan_type,
-            "plan_name": subscription.plan_name,
-            "status": "expired",
-            "mode": "READ_ONLY",
-            "message": f"Abonnement expiré depuis le {subscription.end_date.strftime('%d/%m/%Y')}",
-            "expired_date": subscription.end_date.isoformat() if subscription.end_date else None
-        }
-    
-    # Vérifier si c'est un essai qui expire bientôt (alerte)
-    warning = None
-    if subscription.is_trial():
-        days_left = subscription.days_remaining()
-        if days_left <= 3:
-            warning = {
-                "message": f"Votre période d'essai expire dans {days_left} jours",
-                "days_remaining": days_left,
-                "requires_action": True
-            }
-    
+
+    now = datetime.utcnow()
+    is_active = subscription.status == "active" and (
+        subscription.end_date is None or subscription.end_date > now
+    )
+
+    days_remaining = 0
+    if subscription.end_date and is_active:
+        days_remaining = (subscription.end_date - now).days
+
     return {
         "has_subscription": True,
-        "user_id": str(user_id),
+        "is_active": is_active,
         "plan": subscription.plan_type,
         "plan_name": subscription.plan_name,
         "status": subscription.status,
-        "mode": subscription.get_mode(),
-        "is_active": subscription.is_active(),
-        "is_trial": subscription.is_trial(),
-        "days_remaining": subscription.days_remaining(),
         "start_date": subscription.start_date.isoformat() if subscription.start_date else None,
         "end_date": subscription.end_date.isoformat() if subscription.end_date else None,
+        "days_remaining": max(0, days_remaining),
         "trial_end_date": subscription.trial_end_date.isoformat() if subscription.trial_end_date else None,
-        "warning": warning
+        "auto_renew": subscription.auto_renew,
+        "billing_cycle": subscription.billing_cycle,
+        "price": float(subscription.price or 0),
+        "currency": subscription.currency or "EUR",
+        "user_id": str(user.id),
+        "tenant_id": str(user.tenant_id) if user.tenant_id else None
     }
 
 
-def check_tenant_limits(
+def create_user_subscription(
     db: Session,
-    tenant_id: str,
-    user_role: str = "admin"
-) -> Dict[str, Any]:
+    user_id: UUID,
+    tenant_id: Optional[UUID] = None,
+    plan_type: str = "trial"
+) -> UserSubscription:
     """
-    Vérifie les limites du tenant basées sur l'abonnement de l'admin
+    Crée un abonnement pour un utilisateur.
     """
-    # Récupérer l'admin du tenant
-    admin = db.query(User).filter(
-        User.tenant_id == tenant_id,
-        User.role == "admin"
-    ).first()
+    plan_config = get_plan_config(plan_type)
+    trial_days = plan_config.get("trial_days", 14)
     
-    if not admin or not admin.subscription:
-        return {
-            "can_create_user": False,
-            "can_create_pharmacy": False,
-            "reason": "No active subscription",
-            "mode": "READ_ONLY"
+    now = datetime.utcnow()
+    
+    if plan_type == "trial":
+        end_date = now + timedelta(days=trial_days)
+        trial_end_date = end_date
+    else:
+        end_date = now + timedelta(days=30)  # 30 jours par défaut
+        trial_end_date = None
+
+    subscription = UserSubscription(
+        user_id=user_id,
+        tenant_id=tenant_id,
+        plan_type=plan_type,
+        plan_name=plan_config["name"],
+        status="active",
+        start_date=now,
+        end_date=end_date,
+        trial_end_date=trial_end_date,
+        price=plan_config.get("price_monthly", 0),
+        currency="EUR",
+        billing_cycle="monthly",
+        auto_renew=True,
+        max_users=plan_config.get("max_users_per_tenant", 1),
+        max_products=plan_config.get("max_products", 100),
+        max_pharmacies=plan_config.get("max_pharmacies", 1),
+        config={
+            "created_at": now.isoformat(),
+            "plan_config": plan_config
         }
-    
-    subscription = admin.subscription
-    
-    if not subscription.is_active():
-        return {
-            "can_create_user": False,
-            "can_create_pharmacy": False,
-            "reason": "Subscription expired",
-            "mode": "READ_ONLY"
-        }
-    
-    # Compter les utilisateurs actuels (hors admin)
-    user_count = db.query(User).filter(
-        User.tenant_id == tenant_id,
-        User.role != "admin",
-        User.actif == True
-    ).count()
-    
-    # Compter les pharmacies actuelles
-    pharmacy_count = db.query(Pharmacy).filter(
-        Pharmacy.tenant_id == tenant_id,
-        Pharmacy.is_active == True
-    ).count()
-    
-    # Déterminer les limites
-    max_users = subscription.max_users
-    max_pharmacies = subscription.max_pharmacies
-    
-    can_create_user = max_users == 0 or user_count < max_users
-    can_create_pharmacy = max_pharmacies == 0 or pharmacy_count < max_pharmacies
-    
-    return {
-        "tenant_id": str(tenant_id),
-        "plan": subscription.plan_type,
-        "plan_name": subscription.plan_name,
-        "mode": subscription.get_mode(),
-        "limits": {
-            "max_users": max_users if max_users > 0 else "Illimité",
-            "max_products": subscription.max_products if subscription.max_products > 0 else "Illimité",
-            "max_pharmacies": max_pharmacies if max_pharmacies > 0 else "Illimité"
-        },
-        "current_usage": {
-            "users": user_count,
-            "pharmacies": pharmacy_count
-        },
-        "can_create_user": can_create_user,
-        "can_create_pharmacy": can_create_pharmacy,
-        "users_remaining": max_users - user_count if max_users > 0 else "Illimité",
-        "pharmacies_remaining": max_pharmacies - pharmacy_count if max_pharmacies > 0 else "Illimité"
-    }
+    )
+
+    db.add(subscription)
+    db.commit()
+    db.refresh(subscription)
+
+    logger.info(f"Abonnement utilisateur créé pour l'utilisateur {user_id} avec le plan {plan_type}")
+    return subscription
 
 
-def upgrade_subscription(
+def upgrade_user_subscription(
     db: Session,
-    user_id: str,
+    user_id: Union[str, UUID],
     new_plan: str,
     billing_cycle: str = "monthly",
     payment_id: Optional[str] = None,
-    payment_method: Optional[str] = None,
-    manual_activation: bool = False,
-    activated_by: Optional[str] = None
+    payment_method: Optional[str] = None
 ) -> UserSubscription:
     """
-    Met à niveau l'abonnement d'un utilisateur
-    Peut être utilisé par le super admin pour activation manuelle
+    Met à niveau l'abonnement d'un utilisateur.
     """
+    if isinstance(user_id, str):
+        user_id = UUID(user_id)
+
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
-        raise ValueError("Utilisateur non trouvé")
+        raise ValueError(f"Utilisateur {user_id} non trouvé")
+
+    plan_config = get_plan_config(new_plan)
     
-    if new_plan not in PLAN_CONFIG:
-        raise ValueError(f"Plan invalide: {new_plan}")
+    # Calculer le prix selon le cycle
+    price_key = f"price_{billing_cycle}"
+    price = plan_config.get(price_key, 0)
+
+    now = datetime.utcnow()
     
-    plan_info = PLAN_CONFIG[new_plan]
-    
-    # Calculer la nouvelle date de fin
-    start_date = datetime.utcnow()
+    # Calculer la date de fin
     if billing_cycle == "yearly":
-        end_date = start_date + timedelta(days=365)
+        end_date = now + timedelta(days=365)
     else:
-        end_date = start_date + timedelta(days=30)
-    
-    # Déterminer le prix
-    price = plan_info["price_yearly"] if billing_cycle == "yearly" else plan_info["price_monthly"]
-    
-    # Créer ou mettre à jour l'abonnement
-    if user.subscription:
-        subscription = user.subscription
-        old_plan = subscription.plan_type
+        end_date = now + timedelta(days=30)
+
+    # Vérifier si l'utilisateur a déjà un abonnement
+    existing = db.query(UserSubscription).filter(
+        UserSubscription.user_id == user_id
+    ).first()
+
+    if existing:
+        # Mettre à jour l'abonnement existant
+        existing.plan_type = new_plan
+        existing.plan_name = plan_config["name"]
+        existing.status = "active"
+        existing.start_date = now
+        existing.end_date = end_date
+        existing.price = price
+        existing.billing_cycle = billing_cycle
+        existing.trial_end_date = None
+        existing.max_users = plan_config.get("max_users_per_tenant", 1)
+        existing.max_products = plan_config.get("max_products", 100)
+        existing.max_pharmacies = plan_config.get("max_pharmacies", 1)
         
-        subscription.plan_type = new_plan
-        subscription.plan_name = plan_info["name"]
-        subscription.start_date = start_date
-        subscription.end_date = end_date
-        subscription.price = price
-        subscription.billing_cycle = billing_cycle
-        subscription.payment_id = payment_id
-        subscription.status = "active"
-        subscription.auto_renew = True
-        subscription.max_users = plan_info["max_users_per_tenant"]
-        subscription.max_products = plan_info["max_products"]
-        subscription.max_pharmacies = plan_info["max_pharmacies"]
-        
-        # Si c'était un essai, supprimer la date de fin d'essai
-        if subscription.plan_type == "trial":
-            subscription.trial_end_date = None
-        
-        # Ajouter des métadonnées
-        if not subscription.config:
-            subscription.config = {}
-        
-        subscription.config.update({
-            "upgraded_from": old_plan,
-            "upgraded_at": start_date.isoformat(),
-            "manual_activation": manual_activation,
-            "activated_by": activated_by
+        # Mettre à jour la config
+        config = existing.config or {}
+        config.update({
+            "upgraded_at": now.isoformat(),
+            "previous_plan": existing.plan_type,
+            "payment_id": payment_id,
+            "payment_method": payment_method
         })
+        existing.config = config
         
+        subscription = existing
     else:
+        # Créer un nouvel abonnement
         subscription = UserSubscription(
             user_id=user_id,
             tenant_id=user.tenant_id,
             plan_type=new_plan,
-            plan_name=plan_info["name"],
-            start_date=start_date,
-            end_date=end_date,
+            plan_name=plan_config["name"],
             status="active",
+            start_date=now,
+            end_date=end_date,
             price=price,
+            currency="EUR",
             billing_cycle=billing_cycle,
-            max_users=plan_info["max_users_per_tenant"],
-            max_products=plan_info["max_products"],
-            max_pharmacies=plan_info["max_pharmacies"],
-            payment_id=payment_id,
             auto_renew=True,
+            max_users=plan_config.get("max_users_per_tenant", 1),
+            max_products=plan_config.get("max_products", 100),
+            max_pharmacies=plan_config.get("max_pharmacies", 1),
             config={
-                "manual_activation": manual_activation,
-                "activated_by": activated_by,
-                "activated_at": start_date.isoformat()
+                "created_at": now.isoformat(),
+                "payment_id": payment_id,
+                "payment_method": payment_method
             }
         )
         db.add(subscription)
-    
+
     db.commit()
     db.refresh(subscription)
+
+    logger.info(f"Abonnement utilisateur mis à niveau pour l'utilisateur {user_id} vers {new_plan}")
+    return subscription
+
+
+# ============================================================================
+# FONCTIONS DE RENOUVELLEMENT ET CHANGEMENT DE PLAN (ALIAS)
+# ============================================================================
+
+def upgrade_subscription(
+    db: Session,
+    user_id: Union[str, UUID],
+    new_plan: str,
+    billing_cycle: str = "monthly",
+    payment_id: Optional[str] = None,
+    payment_method: Optional[str] = None
+) -> UserSubscription:
+    """
+    Alias pour upgrade_user_subscription - Met à niveau l'abonnement d'un utilisateur.
+    Utilisé par subscriptions.py pour être compatible avec l'ancien code.
+    """
+    logger.info(f"Appel de upgrade_subscription (alias) pour l'utilisateur {user_id} vers {new_plan}")
+    return upgrade_user_subscription(
+        db=db,
+        user_id=user_id,
+        new_plan=new_plan,
+        billing_cycle=billing_cycle,
+        payment_id=payment_id,
+        payment_method=payment_method
+    )
+
+
+def renew_subscription(
+    db: Session,
+    user_id: Union[str, UUID],
+    billing_cycle: Optional[str] = None
+) -> UserSubscription:
+    """
+    Renouvelle l'abonnement d'un utilisateur pour une nouvelle période.
+    """
+    if isinstance(user_id, str):
+        user_id = UUID(user_id)
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise ValueError(f"Utilisateur {user_id} non trouvé")
+
+    if not user.subscription:
+        raise ValueError("L'utilisateur n'a pas d'abonnement à renouveler")
+
+    subscription = user.subscription
+    now = datetime.utcnow()
     
-    action = "manually activated" if manual_activation else "upgraded"
-    logger.info(f"Abonnement {action} pour {user_id}: {new_plan}")
+    # Déterminer la période de renouvellement
+    cycle = billing_cycle or subscription.billing_cycle
+    
+    # Calculer la nouvelle date de fin
+    if cycle == "yearly":
+        end_date = now + timedelta(days=365)
+    elif cycle == "monthly":
+        end_date = now + timedelta(days=30)
+    else:
+        end_date = now + timedelta(days=30)  # Par défaut
+
+    # Mettre à jour l'abonnement
+    subscription.start_date = now
+    subscription.end_date = end_date
+    subscription.status = "active"
+    subscription.auto_renew = True
+    
+    # Mettre à jour la config
+    config = subscription.config or {}
+    config["renewed_at"] = now.isoformat()
+    config["previous_end_date"] = subscription.end_date.isoformat() if subscription.end_date else None
+    subscription.config = config
+
+    db.commit()
+    db.refresh(subscription)
+
+    logger.info(f"Abonnement renouvelé pour l'utilisateur {user_id} jusqu'au {end_date}")
+    return subscription
+
+
+def change_subscription_plan(
+    db: Session,
+    user_id: Union[str, UUID],
+    new_plan: str,
+    billing_cycle: Optional[str] = None,
+    immediate: bool = True
+) -> UserSubscription:
+    """
+    Change le plan d'abonnement d'un utilisateur (sans paiement, pour les tests/administration).
+    """
+    if isinstance(user_id, str):
+        user_id = UUID(user_id)
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise ValueError(f"Utilisateur {user_id} non trouvé")
+
+    plan_config = get_plan_config(new_plan)
+    
+    if not user.subscription:
+        # Créer un nouvel abonnement
+        return create_user_subscription(
+            db=db,
+            user_id=user_id,
+            tenant_id=user.tenant_id,
+            plan_type=new_plan
+        )
+
+    subscription = user.subscription
+    now = datetime.utcnow()
+    
+    # Mettre à jour le plan
+    subscription.plan_type = new_plan
+    subscription.plan_name = plan_config["name"]
+    subscription.price = plan_config.get("price_monthly", 0)
+    
+    # Mettre à jour les limites
+    subscription.max_users = plan_config.get("max_users_per_tenant", 1)
+    subscription.max_products = plan_config.get("max_products", 100)
+    subscription.max_pharmacies = plan_config.get("max_pharmacies", 1)
+    
+    # Changer la date de fin si immédiat
+    if immediate and billing_cycle:
+        if billing_cycle == "yearly":
+            subscription.end_date = now + timedelta(days=365)
+        elif billing_cycle == "monthly":
+            subscription.end_date = now + timedelta(days=30)
+        subscription.billing_cycle = billing_cycle
+    
+    # Mettre à jour la config
+    config = subscription.config or {}
+    config["plan_changed_at"] = now.isoformat()
+    config["previous_plan"] = subscription.plan_type
+    config["new_plan"] = new_plan
+    subscription.config = config
+
+    db.commit()
+    db.refresh(subscription)
+
+    logger.info(f"Plan changé pour l'utilisateur {user_id} vers {new_plan}")
+    return subscription
+
+
+# ============================================================================
+# FONCTION DE CRÉATION D'ESSAI
+# ============================================================================
+
+def create_trial_subscription(
+    db: Session,
+    user_id: UUID,
+    tenant_id: Optional[UUID] = None
+) -> UserSubscription:
+    """
+    Crée un abonnement d'essai pour un nouvel utilisateur.
+    Alias pour create_user_subscription avec plan_type="trial".
+    """
+    logger.info(f"Création d'un abonnement d'essai pour l'utilisateur {user_id}")
+    return create_user_subscription(
+        db=db,
+        user_id=user_id,
+        tenant_id=tenant_id,
+        plan_type="trial"
+    )
+
+
+# ============================================================================
+# FONCTIONS POUR LES ABONNEMENTS TENANT
+# ============================================================================
+
+def get_tenant_subscription(db: Session, tenant_id: str) -> Optional[TenantSubscription]:
+    """
+    Récupère l'abonnement d'un tenant.
+    """
+    tenant = db.query(Tenant).filter(Tenant.id == UUID(tenant_id)).first()
+    if not tenant:
+        return None
+    
+    # Chercher l'admin du tenant pour avoir l'abonnement
+    admin = db.query(User).filter(
+        User.tenant_id == tenant.id,
+        User.role == "admin"
+    ).first()
+    
+    if admin and admin.subscription:
+        # Si l'admin a un UserSubscription, l'utiliser
+        return None  # Ceci est un UserSubscription, pas un TenantSubscription
+    
+    # Sinon, chercher un TenantSubscription
+    subscription = db.query(TenantSubscription).filter(
+        TenantSubscription.tenant_id == tenant.id
+    ).first()
     
     return subscription
+
+
+def create_tenant_subscription(
+    db: Session,
+    tenant_id: UUID,
+    plan_type: str = "starter",
+    created_by: Optional[UUID] = None
+) -> TenantSubscription:
+    """
+    Crée un abonnement pour un tenant.
+    """
+    plan_config = get_plan_config(plan_type)
+    
+    now = datetime.utcnow()
+    end_date = now + timedelta(days=30)  # 30 jours par défaut
+
+    # Générer un code d'abonnement unique
+    subscription_code = f"TEN-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
+
+    subscription = TenantSubscription(
+        tenant_id=tenant_id,
+        subscription_code=subscription_code,
+        plan=plan_type,  # Note: TenantSubscription utilise 'plan' pas 'plan_type'
+        plan_name=plan_config["name"],
+        billing_period="mensuel",
+        status="active",
+        monthly_price=plan_config.get("price_monthly", 0),
+        annual_price=plan_config.get("price_yearly", 0),
+        current_price=plan_config.get("price_monthly", 0),
+        start_date=now,
+        end_date=end_date,
+        max_users=plan_config.get("max_users_per_tenant", 1),
+        max_products=plan_config.get("max_products", 100),
+        auto_renew=True,
+        created_by=created_by,
+        features=str(plan_config.get("features", []))  # Convertir en string pour le stockage
+    )
+
+    db.add(subscription)
+    db.commit()
+    db.refresh(subscription)
+
+    logger.info(f"Abonnement tenant créé pour le tenant {tenant_id} avec le plan {plan_type}")
+    return subscription
+
+
+# ============================================================================
+# FONCTIONS DE VÉRIFICATION DES LIMITES
+# ============================================================================
+
+def check_tenant_limits(db: Session, tenant_id: str) -> Dict[str, Any]:
+    """
+    Vérifie les limites d'un tenant par rapport à son abonnement.
+    """
+    from app.models.product import Product
+    from app.models.pharmacy import Pharmacy
+
+    tenant = db.query(Tenant).filter(Tenant.id == UUID(tenant_id)).first()
+    if not tenant:
+        return {"error": "Tenant non trouvé"}
+
+    # Chercher d'abord un UserSubscription pour l'admin
+    admin = db.query(User).filter(
+        User.tenant_id == tenant.id,
+        User.role == "admin"
+    ).first()
+
+    subscription = None
+    plan_type = "free"
+    plan_config = PLAN_CONFIG["free"]
+
+    if admin and admin.subscription:
+        # Utiliser l'abonnement de l'admin (UserSubscription)
+        subscription = admin.subscription
+        plan_type = subscription.plan_type
+        plan_config = get_plan_config(plan_type)
+    else:
+        # Sinon, chercher un TenantSubscription
+        tenant_sub = db.query(TenantSubscription).filter(
+            TenantSubscription.tenant_id == tenant.id
+        ).first()
+        if tenant_sub:
+            plan_type = tenant_sub.plan.value if hasattr(tenant_sub.plan, 'value') else str(tenant_sub.plan)
+            plan_config = get_plan_config(plan_type)
+
+    # Compter les utilisateurs actifs
+    users_count = db.query(User).filter(
+        User.tenant_id == tenant.id,
+        User.actif.is_(True)
+    ).count()
+
+    # Compter les produits
+    products_count = db.query(Product).filter(
+        Product.tenant_id == tenant.id
+    ).count()
+
+    # Compter les pharmacies
+    pharmacies_count = db.query(Pharmacy).filter(
+        Pharmacy.tenant_id == tenant.id
+    ).count()
+
+    max_users = plan_config.get("max_users_per_tenant", 1)
+    max_products = plan_config.get("max_products", 100)
+    max_pharmacies = plan_config.get("max_pharmacies", 1)
+
+    return {
+        "has_subscription": subscription is not None,
+        "plan": plan_type,
+        "plan_name": plan_config["name"],
+        "current": {
+            "users": users_count,
+            "products": products_count,
+            "pharmacies": pharmacies_count
+        },
+        "limits": {
+            "users": format_unlimited(max_users),
+            "products": format_unlimited(max_products),
+            "pharmacies": format_unlimited(max_pharmacies)
+        },
+        "percentages": {
+            "users": (users_count / max_users * 100) if max_users > 0 else 0,
+            "products": (products_count / max_products * 100) if max_products > 0 else 0,
+            "pharmacies": (pharmacies_count / max_pharmacies * 100) if max_pharmacies > 0 else 0
+        },
+        "exceeded": {
+            "users": users_count > max_users if max_users > 0 else False,
+            "products": products_count > max_products if max_products > 0 else False,
+            "pharmacies": pharmacies_count > max_pharmacies if max_pharmacies > 0 else False
+        }
+    }
+
+
+def can_user_access_feature(user: User, feature: str) -> bool:
+    """
+    Vérifie si un utilisateur peut accéder à une fonctionnalité.
+    """
+    if not user.subscription:
+        return False
+
+    plan_config = get_plan_config(user.subscription.plan_type)
+    features = plan_config.get("features", [])
+    
+    # Vérifier si la fonctionnalité est dans la liste
+    return any(feature.lower() in f.lower() for f in features)
+
+
+# ============================================================================
+# GESTION DES CODES D'ABONNEMENT
+# ============================================================================
+
+def create_subscription_code(
+    db: Session,
+    created_by_user_id: UUID,
+    plan_type: str,
+    billing_cycle: str = "monthly",
+    duration_days: Optional[int] = None,
+    price: Optional[float] = None,
+    currency: str = "EUR",
+    valid_until: Optional[datetime] = None,
+    notes: Optional[str] = None
+) -> SubscriptionCode:
+    """
+    Crée un code d'abonnement (pour paiement cash).
+    """
+    plan_config = get_plan_config(plan_type)
+    
+    # Déterminer la durée
+    if not duration_days:
+        duration_days = 365 if billing_cycle == "yearly" else 30
+    
+    # Déterminer le prix
+    if price is None:
+        price_key = f"price_{billing_cycle}"
+        price = plan_config.get(price_key, 0)
+    
+    # Déterminer la date de validité du code
+    if not valid_until:
+        valid_until = datetime.utcnow() + timedelta(days=90)  # 90 jours par défaut
+
+    # Générer un code unique
+    attempts = 0
+    max_attempts = 10
+    while attempts < max_attempts:
+        code = generate_subscription_code()
+        
+        # Vérifier si le code existe déjà
+        existing = db.query(SubscriptionCode).filter(
+            SubscriptionCode.code == code
+        ).first()
+        
+        if not existing:
+            break
+        attempts += 1
+    else:
+        raise Exception("Impossible de générer un code unique après plusieurs tentatives")
+
+    subscription_code = SubscriptionCode(
+        code=code,
+        plan_type=plan_type,
+        plan_name=plan_config["name"],
+        duration_days=duration_days,
+        price=price,
+        currency=currency,
+        valid_from=datetime.utcnow(),
+        valid_until=valid_until,
+        status=SubscriptionCodeStatus.PENDING,
+        created_by_user_id=created_by_user_id,
+        notes=notes
+    )
+
+    db.add(subscription_code)
+    db.commit()
+    db.refresh(subscription_code)
+
+    logger.info(f"Code d'abonnement généré: {code} pour le plan {plan_type}")
+    return subscription_code
+
+
+def validate_subscription_code(db: Session, code: str) -> Optional[SubscriptionCode]:
+    """
+    Valide un code d'abonnement.
+    """
+    # Nettoyer le code
+    clean_code = code.strip().upper()
+    
+    subscription_code = db.query(SubscriptionCode).filter(
+        SubscriptionCode.code == clean_code
+    ).first()
+
+    if not subscription_code:
+        return None
+
+    now = datetime.utcnow()
+    
+    # Vérifier la validité
+    if subscription_code.status != SubscriptionCodeStatus.PENDING:
+        return None
+    
+    if subscription_code.valid_from and now < subscription_code.valid_from:
+        return None
+    
+    if subscription_code.valid_until and now > subscription_code.valid_until:
+        subscription_code.status = SubscriptionCodeStatus.EXPIRED
+        db.commit()
+        return None
+
+    return subscription_code
+
+
+def activate_subscription_with_code(
+    db: Session,
+    user: User,
+    code: SubscriptionCode
+) -> UserSubscription:
+    """
+    Active un abonnement utilisateur avec un code.
+    """
+    now = datetime.utcnow()
+    end_date = now + timedelta(days=code.duration_days)
+
+    # Vérifier si l'utilisateur a déjà un abonnement
+    existing = db.query(UserSubscription).filter(
+        UserSubscription.user_id == user.id
+    ).first()
+
+    if existing:
+        # Mettre à jour l'abonnement existant
+        existing.plan_type = code.plan_type
+        existing.plan_name = code.plan_name
+        existing.status = "active"
+        existing.start_date = now
+        existing.end_date = end_date
+        existing.price = code.price
+        existing.currency = code.currency
+        existing.billing_cycle = "code_activation"
+        
+        config = existing.config or {}
+        config.update({
+            "activated_with_code": code.code,
+            "code_id": str(code.id),
+            "activated_at": now.isoformat()
+        })
+        existing.config = config
+        
+        subscription = existing
+    else:
+        # Créer un nouvel abonnement
+        plan_config = get_plan_config(code.plan_type)
+        subscription = UserSubscription(
+            user_id=user.id,
+            tenant_id=user.tenant_id,
+            plan_type=code.plan_type,
+            plan_name=code.plan_name,
+            status="active",
+            start_date=now,
+            end_date=end_date,
+            price=code.price,
+            currency=code.currency,
+            billing_cycle="code_activation",
+            auto_renew=False,
+            max_users=plan_config.get("max_users_per_tenant", 1),
+            max_products=plan_config.get("max_products", 100),
+            max_pharmacies=plan_config.get("max_pharmacies", 1),
+            config={
+                "activated_with_code": code.code,
+                "code_id": str(code.id),
+                "activated_at": now.isoformat()
+            }
+        )
+        db.add(subscription)
+
+    # Marquer le code comme utilisé
+    code.status = SubscriptionCodeStatus.ACTIVATED
+    code.activated_by_user_id = user.id
+    code.activated_at = now
+
+    db.commit()
+    db.refresh(subscription)
+
+    logger.info(f"Abonnement activé avec code {code.code} pour l'utilisateur {user.id}")
+    return subscription
+
+
+# ============================================================================
+# STATISTIQUES ET RAPPORTS
+# ============================================================================
+
+def get_user_subscription_usage(db: Session, user_id: str) -> Dict[str, Any]:
+    """
+    Récupère les statistiques d'utilisation de l'abonnement d'un utilisateur.
+    """
+    from app.models.product import Product
+    from app.models.pharmacy import Pharmacy
+
+    user = db.query(User).filter(User.id == UUID(user_id)).first()
+    if not user:
+        return {"error": "Utilisateur non trouvé"}
+
+    if not user.tenant_id:
+        return {
+            "current_products": 0,
+            "max_products": 100,
+            "usage_percentage": 0,
+            "remaining_products": 100,
+            "current_users": 1,
+            "max_users": 1,
+            "users_usage_percentage": 0,
+            "remaining_users": 0,
+            "current_pharmacies": 0,
+            "max_pharmacies": 1,
+            "pharmacies_usage_percentage": 0,
+            "remaining_pharmacies": 1
+        }
+
+    # Compter les produits
+    products_count = db.query(Product).filter(
+        Product.tenant_id == user.tenant_id
+    ).count()
+
+    # Compter les utilisateurs actifs
+    users_count = db.query(User).filter(
+        User.tenant_id == user.tenant_id,
+        User.actif.is_(True)
+    ).count()
+
+    # Compter les pharmacies
+    pharmacies_count = db.query(Pharmacy).filter(
+        Pharmacy.tenant_id == user.tenant_id
+    ).count()
+
+    # Récupérer les limites du plan de l'utilisateur
+    if user.subscription:
+        plan_config = get_plan_config(user.subscription.plan_type)
+        max_products = plan_config.get("max_products", 100)
+        max_users = plan_config.get("max_users_per_tenant", 1)
+        max_pharmacies = plan_config.get("max_pharmacies", 1)
+    else:
+        max_products = 100
+        max_users = 1
+        max_pharmacies = 1
+
+    # Calculer les pourcentages
+    products_percentage = (products_count / max_products * 100) if max_products > 0 else 0
+    users_percentage = (users_count / max_users * 100) if max_users > 0 else 0
+    pharmacies_percentage = (pharmacies_count / max_pharmacies * 100) if max_pharmacies > 0 else 0
+
+    return {
+        "current_products": products_count,
+        "max_products": format_unlimited(max_products),
+        "usage_percentage": round(min(100, products_percentage), 2),
+        "remaining_products": format_unlimited(max(0, max_products - products_count) if max_products > 0 else "Illimité"),
+        
+        "current_users": users_count,
+        "max_users": format_unlimited(max_users),
+        "users_usage_percentage": round(min(100, users_percentage), 2),
+        "remaining_users": format_unlimited(max(0, max_users - users_count) if max_users > 0 else "Illimité"),
+        
+        "current_pharmacies": pharmacies_count,
+        "max_pharmacies": format_unlimited(max_pharmacies),
+        "pharmacies_usage_percentage": round(min(100, pharmacies_percentage), 2),
+        "remaining_pharmacies": format_unlimited(max(0, max_pharmacies - pharmacies_count) if max_pharmacies > 0 else "Illimité"),
+        
+        "subscription": {
+            "plan_name": user.subscription.plan_name if user.subscription else "Gratuit",
+            "plan_type": user.subscription.plan_type if user.subscription else "free",
+            "status": user.subscription.status if user.subscription else "inactive",
+            "price": float(user.subscription.price or 0) if user.subscription else 0,
+            "currency": user.subscription.currency or "EUR" if user.subscription else "EUR",
+            "billing_cycle": user.subscription.billing_cycle if user.subscription else None,
+            "current_period_start": user.subscription.start_date.isoformat() if user.subscription and user.subscription.start_date else None,
+            "current_period_end": user.subscription.end_date.isoformat() if user.subscription and user.subscription.end_date else None,
+        } if user.subscription else None
+    }
+
+
+def get_available_plans(include_trial: bool = False) -> List[Dict[str, Any]]:
+    """
+    Récupère la liste des plans disponibles.
+    """
+    plans = []
+    
+    for key, config in PLAN_CONFIG.items():
+        if key == "trial" and not include_trial:
+            continue
+            
+        plans.append({
+            "id": key,
+            "name": config["name"],
+            "type": key,
+            "price": config["price_monthly"],
+            "price_monthly": config["price_monthly"],
+            "price_yearly": config["price_yearly"],
+            "max_users": format_unlimited(config.get("max_users_per_tenant", 0)),
+            "max_products": format_unlimited(config.get("max_products", 0)),
+            "max_pharmacies": format_unlimited(config.get("max_pharmacies", 0)),
+            "features": config.get("features", []),
+            "is_popular": key == "pro",
+            "description": f"Plan {config['name']}",
+            "billing_cycle": "monthly"
+        })
+    
+    return plans
 
 
 def get_subscription_summary_for_superadmin(
@@ -372,148 +1003,109 @@ def get_subscription_summary_for_superadmin(
     tenant_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Résumé des abonnements pour le super admin
+    Récupère un résumé des abonnements pour le super admin.
+    Inclut à la fois les abonnements tenant et utilisateur.
     """
-    query = db.query(User).join(UserSubscription).filter(User.role == "admin")
-    
+    # Abonnements tenant
+    tenant_query = db.query(TenantSubscription)
     if tenant_id:
-        query = query.filter(User.tenant_id == tenant_id)
+        tenant_query = tenant_query.filter(TenantSubscription.tenant_id == UUID(tenant_id))
+    tenant_subs = tenant_query.all()
     
-    admins = query.all()
+    # Abonnements utilisateur
+    user_query = db.query(UserSubscription)
+    if tenant_id:
+        # Filtrer par tenant_id si spécifié
+        user_query = user_query.filter(UserSubscription.tenant_id == UUID(tenant_id))
+    user_subs = user_query.all()
     
-    summary = {
-        "total_tenants": len(admins),
-        "plans_distribution": {},
-        "active_subscriptions": 0,
-        "expired_subscriptions": 0,
-        "trial_subscriptions": 0,
-        "tenants": []
+    total_revenue = 0
+    for sub in tenant_subs:
+        if sub.status == "active" or (hasattr(sub.status, 'value') and sub.status.value == "active"):
+            total_revenue += float(sub.current_price or 0)
+    
+    for sub in user_subs:
+        if sub.status == "active":
+            total_revenue += float(sub.price or 0)
+    
+    return {
+        "tenant_subscriptions": len(tenant_subs),
+        "user_subscriptions": len(user_subs),
+        "total_subscriptions": len(tenant_subs) + len(user_subs),
+        "total_monthly_revenue": float(total_revenue),
+        "projected_yearly_revenue": float(total_revenue * 12),
+        "tenant_subscriptions_list": [
+            {
+                "id": str(sub.id),
+                "tenant_id": str(sub.tenant_id),
+                "plan": sub.plan.value if hasattr(sub.plan, 'value') else str(sub.plan),
+                "plan_name": sub.plan_name,
+                "status": sub.status.value if hasattr(sub.status, 'value') else str(sub.status),
+                "start_date": sub.start_date.isoformat() if sub.start_date else None,
+                "end_date": sub.end_date.isoformat() if sub.end_date else None,
+                "price": float(sub.current_price or 0),
+                "type": "tenant"
+            }
+            for sub in tenant_subs
+        ],
+        "user_subscriptions_list": [
+            {
+                "id": str(sub.id),
+                "user_id": str(sub.user_id),
+                "tenant_id": str(sub.tenant_id) if sub.tenant_id else None,
+                "plan": sub.plan_type,
+                "plan_name": sub.plan_name,
+                "status": sub.status,
+                "start_date": sub.start_date.isoformat() if sub.start_date else None,
+                "end_date": sub.end_date.isoformat() if sub.end_date else None,
+                "price": float(sub.price or 0),
+                "type": "user"
+            }
+            for sub in user_subs
+        ]
     }
-    
-    for admin in admins:
-        sub = admin.subscription
-        if not sub:
-            continue
-        
-        # Compter par plan
-        plan = sub.plan_type
-        summary["plans_distribution"][plan] = summary["plans_distribution"].get(plan, 0) + 1
-        
-        if sub.is_active():
-            summary["active_subscriptions"] += 1
-        else:
-            summary["expired_subscriptions"] += 1
-        
-        if sub.plan_type == "trial":
-            summary["trial_subscriptions"] += 1
-        
-        # Compter les utilisateurs du tenant
-        user_count = db.query(User).filter(
-            User.tenant_id == admin.tenant_id,
-            User.actif == True
-        ).count()
-        
-        pharmacy_count = db.query(Pharmacy).filter(
-            Pharmacy.tenant_id == admin.tenant_id,
-            Pharmacy.is_active == True
-        ).count()
-        
-        summary["tenants"].append({
-            "tenant_id": str(admin.tenant_id),
-            "tenant_name": admin.tenant.nom_pharmacie if admin.tenant else "N/A",
-            "admin_email": admin.email,
-            "plan": sub.plan_type,
-            "plan_name": sub.plan_name,
-            "status": sub.status,
-            "is_active": sub.is_active(),
-            "days_remaining": sub.days_remaining(),
-            "end_date": sub.end_date.isoformat() if sub.end_date else None,
-            "users_count": user_count,
-            "pharmacies_count": pharmacy_count,
-            "max_users": sub.max_users if sub.max_users > 0 else "Illimité",
-            "max_pharmacies": sub.max_pharmacies if sub.max_pharmacies > 0 else "Illimité"
-        })
-    
-    return summary
 
 
-def process_expired_subscriptions(db: Session) -> int:
+def create_subscription_payment(
+    db: Session,
+    user_id: str,
+    payment_data: Dict[str, Any]
+) -> Dict[str, Any]:
     """
-    Tâche CRON : Marque les abonnements expirés
+    Enregistre un paiement d'abonnement pour un utilisateur.
     """
-    expired_count = 0
-    now = datetime.utcnow()
-    
-    expired_subs = db.query(UserSubscription).filter(
-        UserSubscription.status == "active",
-        UserSubscription.end_date < now
-    ).all()
-    
-    for sub in expired_subs:
-        sub.status = "expired"
-        expired_count += 1
-        logger.info(f"Abonnement expiré: {sub.id} (utilisateur {sub.user_id})")
-    
-    if expired_count > 0:
-        db.commit()
-    
-    return expired_count
+    user = db.query(User).filter(User.id == UUID(user_id)).first()
+    if not user:
+        raise ValueError("Utilisateur non trouvé")
+
+    plan = payment_data.get("plan")
+    billing_period = payment_data.get("billing_period", "monthly")
+    payment_method = payment_data.get("payment_method")
+    amount = payment_data.get("amount")
+    reference = payment_data.get("reference")
+
+    # Mettre à jour l'abonnement utilisateur
+    subscription = upgrade_subscription(
+        db=db,
+        user_id=user.id,
+        new_plan=plan,
+        billing_cycle=billing_period,
+        payment_id=reference,
+        payment_method=payment_method
+    )
+
+    return {
+        "success": True,
+        "subscription_id": str(subscription.id),
+        "reference": reference,
+        "amount": float(amount),
+        "currency": "EUR",
+        "payment_method": payment_method,
+        "paid_at": datetime.utcnow().isoformat(),
+        "type": "user_subscription"
+    }
 
 
-def can_user_access_feature(user: User, feature: str) -> bool:
-    """
-    Vérifie si un utilisateur peut accéder à une fonctionnalité spécifique
-    """
-    if not user.subscription or not user.subscription.is_active():
-        return False
-    
-    # Logique spécifique par fonctionnalité
-    if feature == "create_pharmacy":
-        return user.role == "admin"
-    
-    if feature == "add_user":
-        return user.role == "admin"
-    
-    if feature == "export_data":
-        return True
-    
-    return True
-
-def check_subscription_status(db: Session, tenant_id: str) -> bool:
-    """
-    Vérifie si l'abonnement d'un tenant est actif.
-    Compatibilité avec l'ancien code qui utilisait cette fonction.
-    
-    Args:
-        db: Session de base de données
-        tenant_id: ID du tenant
-        
-    Returns:
-        True si l'abonnement est actif, False sinon
-    """
-    from app.models.tenant import Tenant
-    from app.models.user import User
-    
-    try:
-        # Récupérer le tenant
-        tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
-        if not tenant:
-            logger.warning(f"Tenant {tenant_id} non trouvé")
-            return False
-        
-        # Récupérer l'admin du tenant
-        admin = db.query(User).filter(
-            User.tenant_id == tenant_id,
-            User.role == "admin"
-        ).first()
-        
-        if not admin or not admin.subscription:
-            logger.warning(f"Aucun abonnement trouvé pour le tenant {tenant_id}")
-            return False
-        
-        # Vérifier si l'abonnement de l'admin est actif
-        return admin.subscription.is_active()
-        
-    except Exception as e:
-        logger.error(f"Erreur lors de la vérification de l'abonnement: {e}")
-        return False
+# Aliases pour compatibilité avec l'ancien code
+check_subscription_status = check_user_subscription
+get_subscription_usage = get_user_subscription_usage

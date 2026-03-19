@@ -8,6 +8,7 @@ Objectif: importer les modèles pour enregistrer les tables dans Base.metadata
 # =========================
 # Modèles SaaS / Core
 # =========================
+from app.models.user_subscription import UserSubscription 
 from .tenant import Tenant
 from .user import User
 from .subscription import Subscription
@@ -84,4 +85,5 @@ __all__ = [
     "TransferType",
     "Customer",
     "Branch",
+    "UserSubscription"
 ]
