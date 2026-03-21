@@ -39,25 +39,36 @@ router = APIRouter(prefix="/super-admin", tags=["Super Admin"])
 # DEPENDANCES SUPER ADMIN
 # =========================
 
+# app/api/v1/superadmin.py
 def verify_super_admin(
-    current_user: User = Depends(get_current_active_user)  # Utilisez get_current_active_user au lieu de get_current_user
+    current_user: User = Depends(get_current_active_user)
 ):
     """Vérifie que l'utilisateur est un super administrateur"""
-    logger.info(f"Vérification super admin - Rôle utilisateur: '{current_user.role}'")
     
-    # Ajoutez plus de logs
-    logger.info(f"User ID: {current_user.id}")
-    logger.info(f"User email: {current_user.email}")
-    logger.info(f"User actif: {current_user.actif}")
+    logger.info(f"🔍 Vérification super admin - Rôle utilisateur: '{current_user.role}'")
+    logger.info(f"   User ID: {current_user.id}")
+    logger.info(f"   User email: {current_user.email}")
+    logger.info(f"   User actif: {current_user.actif}")
     
-    # Acceptez les deux variantes
-    if current_user.role not in ["superadmin", "super_admin"]:
+    # Normaliser le rôle pour la comparaison
+    user_role = current_user.role.lower().strip() if current_user.role else ""
+    
+    # Liste des rôles acceptés pour super admin
+    allowed_roles = ["super_admin", "superadmin", "super-admin", "admin_super"]
+    
+    # Log détaillé pour debug
+    logger.info(f"🔍 Rôle normalisé: '{user_role}'")
+    logger.info(f"🔍 Rôles acceptés: {allowed_roles}")
+    
+    if user_role not in allowed_roles:
+        logger.error(f"❌ Accès refusé - Rôle '{user_role}' non autorisé")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Accès refusé. Rôle super admin requis. Rôle actuel: {current_user.role}"
         )
+    
+    logger.info(f"✅ Super admin vérifié: {current_user.email}")
     return current_user
-
 # =========================
 # SCHEMAS
 # =========================
@@ -2417,3 +2428,55 @@ async def debug_test_auth(
 ):
     """Teste la vérification super admin"""
     return {"message": "Succès", "user": current_user.email}
+
+
+@router.get("/debug/token-payload", status_code=status.HTTP_200_OK)
+async def debug_token_payload(
+    current_user: User = Depends(get_current_active_user)
+):
+    """Debug: Affiche le payload du token et les infos utilisateur"""
+    
+    # Récupérer le token depuis la requête (via FastAPI)
+    from fastapi import Request
+    
+    # Note: Cette fonction doit avoir accès au token
+    return {
+        "user": {
+            "id": str(current_user.id),
+            "email": current_user.email,
+            "role": current_user.role,
+            "role_lower": current_user.role.lower() if current_user.role else None,
+            "actif": current_user.actif,
+            "tenant_id": str(current_user.tenant_id) if current_user.tenant_id else None,
+        },
+        "jwt_payload": getattr(current_user, 'jwt_payload', None),
+        "is_impersonated": getattr(current_user, 'is_impersonated', False),
+        "is_super_admin": current_user.role in ["super_admin", "superadmin", "super-admin"],
+        "debug": {
+            "raw_role": current_user.role,
+            "normalized_role": current_user.role.lower().strip() if current_user.role else None,
+            "allowed_roles": ["super_admin", "superadmin", "super-admin"]
+        }
+    }
+
+@router.get("/debug/whoami", status_code=status.HTTP_200_OK)
+async def debug_whoami(
+    current_user: User = Depends(get_current_active_user)
+):
+    """Debug: Voir l'utilisateur actuel et son rôle"""
+    return {
+        "user": {
+            "id": str(current_user.id),
+            "email": current_user.email,
+            "role": current_user.role,
+            "role_lower": current_user.role.lower() if current_user.role else None,
+            "actif": current_user.actif,
+            "tenant_id": str(current_user.tenant_id) if current_user.tenant_id else None,
+        },
+        "is_super_admin": current_user.role.lower() in ["super_admin", "superadmin", "super-admin"],
+        "debug": {
+            "raw_role": current_user.role,
+            "normalized_role": current_user.role.lower().strip() if current_user.role else None,
+            "allowed_roles": ["super_admin", "superadmin", "super-admin", "admin_super"]
+        }
+    }

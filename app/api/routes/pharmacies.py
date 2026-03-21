@@ -7,6 +7,10 @@ from uuid import UUID
 import pytz
 from zoneinfo import ZoneInfo  # Python 3.9+
 
+import os
+import shutil
+from fastapi import UploadFile, File
+
 from app.api.deps import get_current_user, get_db, get_current_tenant
 from app.models.user import User
 from app.models.tenant import Tenant
@@ -34,6 +38,7 @@ SUPPORTED_TIMEZONES = {
     "paris": "Europe/Paris",  # UTC+1/UTC+2 (avec heure d'été)
     "rdc": "Africa/Kinshasa",  # Par défaut RDC
     "congo": "Africa/Kinshasa"
+    
 }
 
 def get_pharmacy_timezone(pharmacy_config: dict) -> str:
@@ -1298,3 +1303,48 @@ def get_online_users(
         "users": result,
         "timestamp": datetime.utcnow().isoformat()
     }
+
+@router.post("/{pharmacy_id}/logo")
+async def upload_logo(
+    pharmacy_id: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """Télécharge le logo de la pharmacie"""
+    try:
+        UUID(pharmacy_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ID invalide")
+    
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(status_code=404, detail="Pharmacie non trouvée")
+    
+    # Créer le dossier si nécessaire
+    upload_dir = f"uploads/pharmacies/{pharmacy_id}"
+    os.makedirs(upload_dir, exist_ok=True)
+    
+    # Sauvegarder le fichier
+    file_extension = file.filename.split(".")[-1]
+    filename = f"logo.{file_extension}"
+    file_path = f"{upload_dir}/{filename}"
+    
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    # Mettre à jour la config
+    config = pharmacy.config or {}
+    config["pharmacyInfo"] = config.get("pharmacyInfo", {})
+    config["pharmacyInfo"]["logoUrl"] = f"/uploads/pharmacies/{pharmacy_id}/{filename}"
+    pharmacy.config = config
+    pharmacy.updated_at = datetime.utcnow()
+    
+    db.commit()
+    
+    return {"logo_url": config["pharmacyInfo"]["logoUrl"]}

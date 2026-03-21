@@ -43,6 +43,8 @@ from .transfert import ProductTransfer, TransferItem, TransferStatus, TransferTy
 from .stock_movement import StockMovement, InventoryCount, InventoryCountItem
 from app.models.customer import Customer  
 from app.models.branch import Branch 
+from app.models.subscription_code import SubscriptionCode, SubscriptionCodeStatus
+from app.models.category import Category
 
 __all__ = [
     # Core
@@ -85,5 +87,8 @@ __all__ = [
     "TransferType",
     "Customer",
     "Branch",
-    "UserSubscription"
+    "UserSubscription",
+    "SubscriptionCode",
+    "SubscriptionCodeStatus",
+    "Category"
 ]

@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db, get_current_active_user, get_super_admin_user
 from app.models.subscription_code import SubscriptionCode, SubscriptionCodeStatus
 from app.models.user import User
+from app.models.tenant import Tenant  # Ajout pour le modèle Tenant
 from app.schemas.subscription import (
     SubscriptionCodeCreate, 
     SubscriptionCodeResponse,
@@ -90,7 +91,9 @@ def validate_code_logic(db: Session, code: str) -> Dict[str, Any]:
         "price": float(code_obj.price) if code_obj.price else 0,
         "currency": code_obj.currency or "EUR",
         "valid_until": code_obj.valid_until.isoformat() if code_obj.valid_until else None,
-        "code": code_obj.code  # Retourner le code formaté
+        "code": code_obj.code,  # Retourner le code formaté
+        "tenant_id": str(code_obj.tenant_id) if code_obj.tenant_id else None,  # Ajout
+        "user_id": str(code_obj.user_id) if code_obj.user_id else None  # Ajout
     }
 
 # =============================================================================
@@ -106,6 +109,11 @@ async def generate_subscription_code(
     """
     Génère un code d'abonnement pour paiement cash.
     Accessible uniquement aux super admins.
+    
+    Peut être associé à :
+    - Un tenant spécifique (pharmacie)
+    - Un utilisateur spécifique
+    - Aucun (code générique)
     """
     logger.info(f"Génération de code abonnement par {current_user.email} pour plan {data.plan_type}")
     
@@ -118,6 +126,39 @@ async def generate_subscription_code(
                 "message": f"Le plan {data.plan_type} n'existe pas."
             }
         )
+    
+    # Validation des IDs si fournis
+    if data.tenant_id:
+        tenant = db.query(Tenant).filter(Tenant.id == data.tenant_id).first()
+        if not tenant:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": "tenant_not_found",
+                    "message": "La pharmacie spécifiée n'existe pas."
+                }
+            )
+    
+    if data.user_id:
+        user = db.query(User).filter(User.id == data.user_id).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": "user_not_found",
+                    "message": "L'utilisateur spécifié n'existe pas."
+                }
+            )
+        
+        # Vérifier que l'utilisateur est bien associé au tenant si les deux sont fournis
+        if data.tenant_id and user.tenant_id != data.tenant_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": "user_tenant_mismatch",
+                    "message": "L'utilisateur n'appartient pas à la pharmacie spécifiée."
+                }
+            )
     
     plan_config = PLAN_CONFIG[data.plan_type]
     
@@ -160,7 +201,7 @@ async def generate_subscription_code(
         price_key = f"price_{data.billing_cycle or 'monthly'}"
         price = plan_config.get(price_key, 0)
     
-    # Créer le code
+    # Créer le code avec les associations tenant/user
     code = SubscriptionCode(
         code=generated_code,
         plan_type=data.plan_type,
@@ -172,14 +213,16 @@ async def generate_subscription_code(
         valid_until=data.valid_until or (datetime.utcnow() + timedelta(days=data.expiry_days or 90)),
         notes=data.notes,
         created_by_user_id=current_user.id,
-        status=SubscriptionCodeStatus.PENDING
+        status=SubscriptionCodeStatus.PENDING,
+        tenant_id=data.tenant_id,  # Ajout
+        user_id=data.user_id  # Ajout
     )
     
     db.add(code)
     db.commit()
     db.refresh(code)
     
-    logger.info(f"Code généré avec succès: {generated_code}")
+    logger.info(f"Code généré avec succès: {generated_code} pour tenant: {data.tenant_id}, user: {data.user_id}")
     
     return {
         "success": True,
@@ -191,13 +234,17 @@ async def generate_subscription_code(
         "duration_days": code.duration_days,
         "valid_until": code.valid_until.isoformat() if code.valid_until else None,
         "created_at": code.created_at.isoformat() if code.created_at else None,
-        "status": code.status.value if hasattr(code.status, 'value') else code.status
+        "status": code.status.value if hasattr(code.status, 'value') else code.status,
+        "tenant_id": str(code.tenant_id) if code.tenant_id else None,  # Ajout
+        "user_id": str(code.user_id) if code.user_id else None  # Ajout
     }
 
 
 @router.get("/admin/list", response_model=Dict[str, Any])
 async def list_subscription_codes(
     status: Optional[str] = Query(None),
+    tenant_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
+    user_id: Optional[UUID] = Query(None, description="Filtrer par utilisateur"),
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
@@ -205,6 +252,7 @@ async def list_subscription_codes(
 ) -> Any:
     """
     Liste tous les codes d'abonnement générés.
+    Possibilité de filtrer par tenant ou utilisateur.
     """
     query = db.query(SubscriptionCode)
     
@@ -214,6 +262,12 @@ async def list_subscription_codes(
             query = query.filter(SubscriptionCode.status == status_enum)
         except ValueError:
             pass
+    
+    if tenant_id:
+        query = query.filter(SubscriptionCode.tenant_id == tenant_id)
+    
+    if user_id:
+        query = query.filter(SubscriptionCode.user_id == user_id)
     
     total = query.count()
     
@@ -240,7 +294,11 @@ async def list_subscription_codes(
                 "created_at": code.created_at.isoformat() if code.created_at else None,
                 "activated_by": code.activated_by_user.email if code.activated_by_user else None,
                 "activated_at": code.activated_at.isoformat() if code.activated_at else None,
-                "created_by": code.created_by_user.email if code.created_by_user else None
+                "created_by": code.created_by_user.email if code.created_by_user else None,
+                "tenant_id": str(code.tenant_id) if code.tenant_id else None,  # Ajout
+                "user_id": str(code.user_id) if code.user_id else None,  # Ajout
+                "tenant_name": code.tenant.name if code.tenant else None,  # Ajout
+                "user_email": code.assigned_user.email if code.assigned_user else None  # Ajout
             }
             for code in codes
         ]
@@ -283,7 +341,11 @@ async def get_subscription_code_details(
         "activated_at": code.activated_at.isoformat() if code.activated_at else None,
         "notes": code.notes,
         "is_valid": code.is_valid(),
-        "days_remaining": code.days_remaining()
+        "days_remaining": code.days_remaining(),
+        "tenant_id": str(code.tenant_id) if code.tenant_id else None,  # Ajout
+        "user_id": str(code.user_id) if code.user_id else None,  # Ajout
+        "tenant_name": code.tenant.name if code.tenant else None,  # Ajout
+        "user_email": code.assigned_user.email if code.assigned_user else None  # Ajout
     }
 
 
@@ -382,6 +444,8 @@ async def activate_with_code(
 ) -> Any:
     """
     Active un abonnement avec un code (paiement cash).
+    Vérifie que le code est valide et non utilisé.
+    Si le code est associé à un tenant, vérifie que l'utilisateur appartient à ce tenant.
     """
     logger.info(f"Tentative d'activation avec code par {current_user.email}")
     
@@ -424,6 +488,26 @@ async def activate_with_code(
             detail={
                 "error": "invalid_code",
                 "message": "Code d'abonnement invalide ou déjà utilisé."
+            }
+        )
+    
+    # Vérifier que l'utilisateur correspond au tenant associé au code (si spécifié)
+    if code.tenant_id and current_user.tenant_id != code.tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "invalid_tenant",
+                "message": "Ce code est réservé à une autre pharmacie."
+            }
+        )
+    
+    # Vérifier que l'utilisateur correspond à l'utilisateur associé au code (si spécifié)
+    if code.user_id and current_user.id != code.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "invalid_user",
+                "message": "Ce code est réservé à un autre utilisateur."
             }
         )
     
@@ -515,6 +599,8 @@ async def validate_code(
 @router.post("/debug/generate-test", include_in_schema=False)
 async def debug_generate_test_code(
     plan_type: str = "pro",
+    tenant_id: Optional[UUID] = None,
+    user_id: Optional[UUID] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ) -> Any:
@@ -542,7 +628,9 @@ async def debug_generate_test_code(
         valid_until=datetime.utcnow() + timedelta(days=90),
         created_by_user_id=current_user.id,
         status=SubscriptionCodeStatus.PENDING,
-        notes="Code de test généré automatiquement"
+        notes="Code de test généré automatiquement",
+        tenant_id=tenant_id,  # Ajout
+        user_id=user_id  # Ajout
     )
     
     db.add(code)
@@ -555,5 +643,7 @@ async def debug_generate_test_code(
         "code": code.code,
         "plan_type": code.plan_type,
         "plan_name": code.plan_name,
-        "valid_until": code.valid_until.isoformat() if code.valid_until else None
+        "valid_until": code.valid_until.isoformat() if code.valid_until else None,
+        "tenant_id": str(code.tenant_id) if code.tenant_id else None,  # Ajout
+        "user_id": str(code.user_id) if code.user_id else None  # Ajout
     }

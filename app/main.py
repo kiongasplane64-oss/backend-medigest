@@ -15,6 +15,7 @@ from app.db.session import engine
 from app.api.v1.tenants import router as tenant_router
 from app.api.v1.auth import router as auth_router
 from app.api.v1.subscriptions import router as subscriptions_router
+from app.api.v1.subscription_codes import router as subscription_codes_router
 from app.api.v1.payments import router as payment_router
 from app.api.v1.superadmin import router as superadmin_router
 from app.api.v1.sync import router as sync_router
@@ -25,6 +26,10 @@ from app.api.v1.payments_saas import router as saas_payments_router
 from app.api.v1.endpoints.stock import router as stock_router
 from app.api.v1.endpoints.products import router as products_router
 from app.api.v1 import users
+from app.api.v1.categories import router as categories_router
+from app.api.v1 import session
+
+
 
 # Routers admin / legacy
 from app.api.routes.pharmacies import router as pharmacies_router
@@ -215,6 +220,9 @@ include_router_auto(app, stock_router, tags=["Stock"])
 include_router_auto(app, products_router, tags=["Products"])
 include_router_auto(app, inventory_router, tags=["Inventory"])
 include_router_auto(app, users.router, tags=["Users"])
+include_router_auto(app, subscription_codes_router)
+include_router_auto(app, categories_router)
+app.include_router(session.router, prefix="/api/v1")
 
 
 # ============================================================================

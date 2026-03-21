@@ -10,6 +10,8 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, EmailStr, field_validator, model_validator
 from sqlalchemy.orm import Session
 from jose import jwt  
+import string
+import secrets
 
 from app.api.deps import get_current_user
 from app.core.security import (
@@ -2665,3 +2667,160 @@ async def setup_super_admin(data: SuperAdminSetup, db: Session = Depends(get_db)
     db.refresh(new_admin)
 
     return {"message": "Super Admin créé avec succès."}
+
+# =========================
+# ENDPOINTS SUPER ADMIN
+# =========================
+
+# D'abord les endpoints plus spécifiques (avec des chemins fixes)
+@router.post("/super-admin/verify-key")
+def verify_super_admin_key(
+    data: dict,
+    db: Session = Depends(get_db)
+):
+    """
+    Vérifie la clé d'accès super administrateur
+    """
+    key = data.get("key", "")
+    
+    logger.info(f"Vérification clé super admin - Longueur: {len(key)}")
+    
+    # Vérifier la clé maître
+    master_key = os.getenv("SUPER_ADMIN_ACCESS_KEY")
+    create_key = os.getenv("SUPER_ADMIN_CREATE_KEY")
+    
+    logger.info(f"Clés configurées - MASTER: {'oui' if master_key else 'non'}, CREATE: {'oui' if create_key else 'non'}")
+    
+    # Pour l'accès à la page d'accueil, on accepte la clé maître
+    if master_key and key == master_key:
+        logger.info("✅ Clé maître valide")
+        return {"valid": True, "access_type": "full"}
+    
+    # Sinon, vérifier si c'est une clé d'accès temporaire valide
+    if create_key and key == create_key:
+        logger.info("✅ Clé de création valide")
+        return {"valid": True, "access_type": "setup"}
+    
+    logger.warning(f"❌ Clé invalide: {key[:5]}...")
+    return {"valid": False, "message": "Clé d'accès invalide"}
+
+@router.post("/super-admin/setup", status_code=status.HTTP_201_CREATED)
+async def setup_super_admin(data: SuperAdminSetup, db: Session = Depends(get_db)):
+    """
+    Crée le premier super administrateur (nécessite une clé d'installation)
+    """
+    master_key = os.getenv("INITIAL_SETUP_KEY")
+    logger.info(f"Tentative création super admin - Setup key fournie: {data.setup_key[:5]}...")
+    
+    if not master_key:
+        logger.error("INITIAL_SETUP_KEY non configurée")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, 
+            detail="Clé d'installation non configurée sur le serveur."
+        )
+    
+    if data.setup_key != master_key:
+        logger.warning(f"Clé d'installation invalide: {data.setup_key[:5]}... vs {master_key[:5]}...")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, 
+            detail="Clé d'installation invalide."
+        )
+
+    # Vérifier si un super admin existe déjà
+    existing_admin = db.query(User).filter(User.role == "super_admin").first()
+    if existing_admin:
+        logger.warning("Tentative de création d'un super admin alors qu'il existe déjà")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail="Un super administrateur existe déjà. Utilisez l'interface de connexion normale."
+        )
+
+    # Créer le super admin
+    new_admin = User(
+        tenant_id=None,  
+        email=data.email.lower(),
+        password_hash=get_password_hash(data.password),
+        nom_complet=data.nom_complet,
+        actif=True,
+        role="super_admin",
+        created_at=datetime.utcnow(),
+    )
+
+    try:
+        db.add(new_admin)
+        db.commit()
+        db.refresh(new_admin)
+        
+        logger.info(f"✅ Super Admin créé avec succès: {new_admin.email}")
+        
+        return {
+            "message": "Super Admin créé avec succès.",
+            "credentials": {
+                "email": new_admin.email,
+                "password": data.password  # ⚠️ Ne pas renvoyer en production, uniquement pour le premier setup
+            } if os.getenv("ENV") != "production" else None
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Erreur création super admin: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur lors de la création: {str(e)}"
+        )
+
+@router.get("/current-session", status_code=status.HTTP_200_OK)
+def get_current_session(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Récupère la session courante de l'utilisateur.
+    Utilisé par le frontend POS pour obtenir les informations de session.
+    """
+    import secrets
+    import string
+    
+    # Générer un ID de session si non existant
+    session_id = None
+    session_number = None
+    pos_id = None
+    pos_name = None
+    
+    # Récupérer la pharmacie de l'utilisateur
+    pharmacy_id = None
+    
+    # Chercher la pharmacie associée au tenant
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.tenant_id == current_user.tenant_id,
+        Pharmacy.is_active == True,
+        Pharmacy.is_main == True
+    ).first()
+    
+    if pharmacy:
+        pharmacy_id = pharmacy.id
+        pos_id = str(pharmacy.id)
+        pos_name = pharmacy.name
+    else:
+        # Créer un ID par défaut
+        pos_id = f"POS-{str(current_user.id)[:6]}"
+        pos_name = "Caisse principale"
+    
+    # Générer un numéro de session aléatoire
+    alphabet = string.digits
+    session_number = ''.join(secrets.choice(alphabet) for _ in range(4))
+    session_id = f"{str(current_user.id)[:6]}_{datetime.utcnow().strftime('%Y%m%d')}_{session_number}"
+    
+    return {
+        "sessionId": session_id,
+        "sessionNumber": session_number,
+        "posId": pos_id,
+        "posName": pos_name,
+        "pharmacyId": str(pharmacy_id) if pharmacy_id else None,
+        "userId": str(current_user.id),
+        "userName": current_user.nom_complet,
+        "userEmail": current_user.email,
+        "userRole": current_user.role,
+        "startedAt": datetime.utcnow().isoformat(),
+        "status": "active"
+    }

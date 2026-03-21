@@ -19,8 +19,6 @@ from app.core.config import settings
 # GESTION DES MOTS DE PASSE
 # ===========================================
 import logging
-from fastapi import HTTPException, status
-from passlib.context import CryptContext
 
 logger = logging.getLogger("uvicorn.error")
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -47,6 +45,7 @@ def verify_password(plain_password: object, hashed_password: str) -> bool:
     pw = "" if plain_password is None else (plain_password if isinstance(plain_password, str) else str(plain_password))
     pw = pw.strip()
     return pwd_context.verify(pw, hashed_password)
+
 # ===========================================
 # JWT TOKENS - FONCTIONS MANQUANTES
 # ===========================================
@@ -87,7 +86,7 @@ def create_refresh_token(data: dict, expires_delta: Optional[timedelta] = None) 
 
 def decode_token(token: str) -> Dict[str, Any]:
     """Décode un token JWT"""
-    return verify_token(token)  # Utilise la même fonction
+    return verify_token(token)
 
 def decode_access_token(token: str) -> Dict[str, Any]:
     """Décode un token d'accès JWT (alias pour decode_token avec vérification du type)"""
@@ -112,6 +111,54 @@ def decode_access_token(token: str) -> Dict[str, Any]:
         )
 
 # ===========================================
+# CRÉATION DE LA PAIRE DE TOKENS (FONCTION AJOUTÉE)
+# ===========================================
+def create_token_pair(
+    user: User, 
+    subscription_active: bool = True, 
+    pharmacy_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Crée une paire de tokens (access + refresh) avec le rôle inclus"""
+    
+    # 🔥 DONNÉES DU TOKEN D'ACCÈS - INCLURE LE RÔLE ICI
+    access_token_data = {
+        "sub": str(user.id),
+        "email": user.email,
+        "role": user.role,  # ← CRUCIAL: inclure le rôle
+        "tenant_id": str(user.tenant_id) if user.tenant_id else None,
+        "subscription_active": subscription_active,
+        "is_impersonation": False
+    }
+    
+    if pharmacy_id:
+        access_token_data["pharmacy_id"] = pharmacy_id
+    
+    # Créer le token d'accès
+    access_token = create_access_token(
+        data=access_token_data,
+        expires_delta=timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    
+    # 🔥 DONNÉES DU TOKEN DE RAFRAÎCHISSEMENT
+    refresh_token_data = {
+        "sub": str(user.id),
+        "role": user.role,  # Inclure le rôle aussi dans le refresh token
+        "type": "refresh"
+    }
+    
+    # Créer le token de rafraîchissement
+    refresh_token = create_refresh_token(
+        data=refresh_token_data,
+        expires_delta=timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    )
+    
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
+    }
+
+# ===========================================
 # OAUTH2 & AUTHENTIFICATION
 # ===========================================
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.API_V1_STR}/auth/login")
@@ -130,10 +177,9 @@ async def get_current_user(
     try:
         payload = verify_token(token)
         user_id: str = payload.get("sub")
-        tenant_id: str = payload.get("tenant_id")
         token_type: str = payload.get("type")
         
-        if user_id is None or tenant_id is None:
+        if user_id is None:
             raise credentials_exception
             
         if token_type != "access":
@@ -147,7 +193,6 @@ async def get_current_user(
     # Récupérer l'utilisateur depuis la base de données
     user = db.query(User).filter(
         User.id == user_id,
-        User.tenant_id == tenant_id,
         User.actif == True
     ).first()
 
@@ -167,10 +212,10 @@ async def get_current_active_user(current_user: User = Depends(get_current_user)
 
 async def get_current_superuser(current_user: User = Depends(get_current_user)) -> User:
     """Vérifie que l'utilisateur est super admin"""
-    if current_user.role not in ["super_admin", "admin"]:
+    if current_user.role not in ["super_admin", "superadmin", "admin"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Privilèges insuffisants"
+            detail="Privilèges insuffisants. Rôle requis: super_admin"
         )
     return current_user
 
@@ -179,6 +224,7 @@ async def get_current_superuser(current_user: User = Depends(get_current_user)) 
 # ===========================================
 ROLE_PERMISSIONS = {
     "super_admin": ["*"],  # Toutes les permissions
+    "superadmin": ["*"],   # Alias
     "admin": ["*"],
     "pharmacien": ["ventes:create", "ventes:read", "ventes:update", "inventory:read", 
                    "inventory:update", "clients:read", "clients:create", "reports:read"],
@@ -333,7 +379,7 @@ def authenticate_user(db: Session, email: str, password: str, tenant_id: str = N
     if not user:
         return None
     
-    if not verify_password(password, user.hashed_password):
+    if not verify_password(password, user.password_hash):
         return None
     
     return user
@@ -353,40 +399,18 @@ async def login_for_access_token(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    # Créer les tokens
-    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    refresh_token_expires = timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
-    
-    access_token = create_access_token(
-        data={
-            "sub": str(user.id),
-            "tenant_id": str(user.tenant_id),
-            "role": user.role,
-            "email": user.email
-        },
-        expires_delta=access_token_expires
-    )
-    
-    refresh_token = create_refresh_token(
-        data={
-            "sub": str(user.id),
-            "tenant_id": str(user.tenant_id),
-            "role": user.role
-        },
-        expires_delta=refresh_token_expires
-    )
+    # Utiliser create_token_pair pour générer les tokens
+    token_pair = create_token_pair(user=user, subscription_active=True)
     
     return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer",
+        **token_pair,
         "expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         "user": {
             "id": str(user.id),
             "email": user.email,
             "nom_complet": user.nom_complet,
             "role": user.role,
-            "tenant_id": str(user.tenant_id)
+            "tenant_id": str(user.tenant_id) if user.tenant_id else None
         }
     }
 

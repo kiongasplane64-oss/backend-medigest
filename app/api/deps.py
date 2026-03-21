@@ -129,82 +129,78 @@ def _get_token_from_request(request: Request) -> Optional[str]:
 
 def get_current_user(
     db: Session = Depends(get_db),
-    token: Optional[str] = Depends(oauth2_scheme),
+    token: str = Depends(oauth2_scheme), # FastAPI lève déjà une 401 si absent avec oauth2_scheme
 ) -> User:
     """
     Récupère l'utilisateur courant à partir du token JWT.
     """
-    logger.info("🔐 get_current_user - Token présent: %s", bool(token))
-
+    # Note : Si oauth2_scheme est utilisé, FastAPI gère l'absence de token 
+    # automatiquement. Le code ci-dessous devient une sécurité supplémentaire.
     if not token:
-        logger.warning("❌ Token d'authentification manquant")
+        logger.warning("❌ Aucun token trouvé dans les headers")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token d'authentification manquant",
+            detail="Not authenticated",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
     try:
-        token_preview = f"{token[:15]}...{token[-10:]}" if len(token) > 25 else token
-        logger.debug("🔑 Validation du token: %s", token_preview)
-
+        # 1. Décodage et vérification de la signature
         payload = security_verify_token(token)
-        logger.info("📦 Payload décodé: %s", payload)
-
-        user_id = payload.get("sub")
+        
+        # 2. Extraction du sujet (ID utilisateur)
+        user_id: str = payload.get("sub")
         if not user_id:
-            logger.warning("❌ Token invalide : aucun identifiant utilisateur")
+            logger.error("❌ Payload invalide : champ 'sub' manquant")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token invalide : aucun identifiant utilisateur",
-                headers={"WWW-Authenticate": "Bearer"},
+                detail="Token invalide : identifiant manquant",
             )
 
+        # 3. Recherche de l'utilisateur
         user = db.query(User).filter(User.id == user_id).first()
+        
         if not user:
-            logger.warning("❌ Utilisateur non trouvé pour l'ID: %s", user_id)
+            logger.warning("❌ Utilisateur inexistant dans la DB : %s", user_id)
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Utilisateur non trouvé",
             )
 
-        logger.info(
-            "✅ Utilisateur trouvé: %s, rôle: %s, actif: %s",
-            getattr(user, "email", None),
-            getattr(user, "role", None),
-            getattr(user, "actif", None),
-        )
-
-        if not getattr(user, "actif", False):
-            logger.warning("⚠️ Compte désactivé: %s", getattr(user, "email", None))
+        # 4. Vérification du statut du compte
+        if not getattr(user, "is_active", True): # Utilise le nom de champ correct (is_active ou actif)
+            logger.warning("⚠️ Tentative de connexion sur compte désactivé : %s", user.email)
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Compte désactivé",
+                detail="Compte inactif",
             )
 
+        # 5. Injection des données contextuelles (Impersonation, etc.)
+        # On utilise .setattr ou l'accès direct si ces champs existent sur ton modèle
         user.is_impersonated = bool(payload.get("is_impersonation", False))
         user.impersonated_by = payload.get("impersonated_by")
         user.jwt_payload = payload
 
+        logger.info("✅ Authentification réussie : %s (ID: %s)", user.email, user.id)
         return user
 
+    except JWTError as e:
+        logger.warning("❌ Signature JWT invalide ou expirée : %s", str(e))
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expirée ou invalide",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     except HTTPException:
+        # On laisse remonter les exceptions FastAPI (403, 404)
         raise
-    except JWTError as exc:
-        logger.warning("❌ Erreur JWT: %s", exc)
+    except Exception as e:
+        # Capture les erreurs imprévues (ex: DB down, erreur attribut)
+        logger.critical("🔥 Erreur système lors de l'authentification : %s", str(e), exc_info=True)
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token invalide",
-            headers={"WWW-Authenticate": "Bearer"},
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Erreur interne d'authentification",
         )
-    except Exception as exc:
-        logger.error("❌ Erreur inattendue: %s", exc, exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Erreur d'authentification",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
 
 def get_current_active_user(
     current_user: User = Depends(get_current_user),

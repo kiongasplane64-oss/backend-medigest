@@ -345,18 +345,37 @@ def get_inventory_stats(
 
     return stats
 
-
 @router.get("/alerts", response_model=Dict[str, Any])
 def get_inventory_alerts(
     limit: int = Query(10, ge=1, le=100),
     db: Session = Depends(get_db),
-    current_tenant: Tenant = Depends(get_current_tenant),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),  # Modifier: rendre optional
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """
     Récupère les alertes d'inventaire.
     Accessible en lecture même si l'abonnement est inactif.
     """
+    # Si l'utilisateur est super admin et n'a pas de tenant, retourner des données vides
+    if current_tenant is None or current_user.role == "super_admin":
+        logger.info(f"Super admin {current_user.email} sans tenant - retour des alertes vides")
+        return {
+            "success": True,
+            "subscription_active": True,
+            "has_subscription": True,
+            "access_mode": "full",
+            "is_read_only": False,
+            "low_stock_count": 0,
+            "expiring_soon_count": 0,
+            "expired_count": 0,
+            "alerts": {
+                "low_stock": [],
+                "expiring_soon": [],
+                "expired": [],
+            },
+            "restrictions": None,
+        }
+    
     columns = _product_columns()
     access = _read_only_payload(db, current_user)
     today = date.today()
@@ -364,7 +383,7 @@ def get_inventory_alerts(
 
     try:
         base_query = db.query(Product).filter(
-            Product.tenant_id == current_tenant.id,
+            Product.tenant_id == current_tenant.id,  # Maintenant current_tenant n'est pas None
         )
 
         if "is_active" in columns:
@@ -456,7 +475,6 @@ def get_inventory_alerts(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Erreur lors de la récupération des alertes d'inventaire",
         )
-
 
 @router.get("/{inventory_id}", response_model=InventoryReport)
 @require_permission("inventory_view")

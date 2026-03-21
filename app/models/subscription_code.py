@@ -25,6 +25,7 @@ class SubscriptionCode(Base):
     price = Column(Integer, nullable=False)
     currency = Column(String(3), default="USD")
     
+    
     # Période de validité du code
     valid_from = Column(DateTime, default=datetime.utcnow)
     valid_until = Column(DateTime, nullable=True)

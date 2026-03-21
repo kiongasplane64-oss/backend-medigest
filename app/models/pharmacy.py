@@ -57,7 +57,8 @@ class Pharmacy(Base):
             "phone": "",
             "email": "",
             "licenseNumber": "",
-            "logo": None
+            "logo": None,
+            "logoUrl": None
         },
         
         # Devises et taux de change
@@ -120,6 +121,45 @@ class Pharmacy(Base):
             "currentBranches": 0,
             "branches": []
         },
+        
+        # ==================== NOUVEAUX CHAMPS ====================
+        # Type de vente (gros, détail, les deux)
+        "salesType": {
+            "type": "both"
+        },
+        
+        # Produits périmés
+        "expiredProducts": {
+            "allowSale": False
+        },
+        
+        # Heures supplémentaires (indépendantes des heures normales)
+        "overtime": {
+            "enabled": False,
+            "endTime": "22:00"
+        },
+        
+        # Vente selon taux de change
+        "sellByExchangeRate": True,
+        
+        # Rentabilité / Calcul automatique du prix de vente
+        "profitability": {
+            "enabled": False,
+            "rate": 30.0
+        },
+        
+        # Configuration de la facturation
+        "invoice": {
+            "autoPrint": False,
+            "autoSave": True,
+            "fontSize": 12
+        },
+        
+        # Configuration des rapports
+        "report": {
+            "defaultFontSize": 12
+        },
+        # ==================== FIN NOUVEAUX CHAMPS ====================
         
         # Métadonnées
         "createdAt": None,
@@ -232,7 +272,12 @@ class Pharmacy(Base):
     
     def reset_config_to_defaults(self) -> None:
         """Réinitialise la configuration aux valeurs par défaut"""
-        self.config = self.__table__.c.config.default.arg()
+        default_config = self.__table__.c.config.default.arg()
+        # S'assurer que c'est une fonction appelable ou un dict
+        if callable(default_config):
+            self.config = default_config()
+        else:
+            self.config = default_config.copy() if default_config else {}
         self.config["updatedAt"] = datetime.utcnow().isoformat()
     
     # =========================
@@ -306,6 +351,7 @@ class Pharmacy(Base):
         }
         
         days_off = working_hours.get("daysOff", {})
+        # days_off: True = jour OUVERT, False = jour FERMÉ
         is_working_day = days_off.get(day_mapping.get(current_day, ""), False)
         
         start_time = working_hours.get("startTime", "08:00").split(":")
@@ -314,7 +360,12 @@ class Pharmacy(Base):
         start_minutes = int(start_time[0]) * 60 + int(start_time[1])
         end_minutes = int(end_time[0]) * 60 + int(end_time[1])
         
-        is_within_hours = current_time >= start_minutes and current_time <= end_minutes
+        # Gestion du cas où l'heure de fin est après minuit
+        if end_minutes < start_minutes:
+            is_within_hours = current_time >= start_minutes or current_time <= end_minutes
+        else:
+            is_within_hours = start_minutes <= current_time <= end_minutes
+        
         in_service = is_working_day and is_within_hours
         
         # Calculer le prochain service
@@ -451,6 +502,94 @@ class Pharmacy(Base):
         return round(converted, 2)
     
     # =========================
+    # Gestion des types de vente
+    # =========================
+    def get_sales_type(self) -> str:
+        """Récupère le type de vente configuré"""
+        sales_type = self.get_config("salesType") or {}
+        return sales_type.get("type", "both")
+    
+    def can_sell_wholesale(self) -> bool:
+        """Vérifie si la vente en gros est autorisée"""
+        sales_type = self.get_sales_type()
+        return sales_type in ["wholesale", "both"]
+    
+    def can_sell_retail(self) -> bool:
+        """Vérifie si la vente au détail est autorisée"""
+        sales_type = self.get_sales_type()
+        return sales_type in ["retail", "both"]
+    
+    # =========================
+    # Gestion des produits périmés
+    # =========================
+    def can_sell_expired_products(self) -> bool:
+        """Vérifie si la vente de produits périmés est autorisée"""
+        expired_config = self.get_config("expiredProducts") or {}
+        return expired_config.get("allowSale", False)
+    
+    # =========================
+    # Gestion de la rentabilité
+    # =========================
+    def get_profitability_rate(self) -> float:
+        """Récupère le taux de rentabilité configuré"""
+        profitability = self.get_config("profitability") or {}
+        return profitability.get("rate", 30.0)
+    
+    def is_profitability_enabled(self) -> bool:
+        """Vérifie si le calcul automatique de rentabilité est activé"""
+        profitability = self.get_config("profitability") or {}
+        return profitability.get("enabled", False)
+    
+    def calculate_selling_price(self, purchase_price: float) -> float:
+        """
+        Calcule le prix de vente en fonction du taux de rentabilité
+        """
+        if not self.is_profitability_enabled():
+            return purchase_price
+        
+        rate = self.get_profitability_rate()
+        return round(purchase_price * (1 + rate / 100), 2)
+    
+    # =========================
+    # Gestion des heures supplémentaires
+    # =========================
+    def is_overtime_enabled(self) -> bool:
+        """Vérifie si les heures supplémentaires sont activées"""
+        overtime = self.get_config("overtime") or {}
+        return overtime.get("enabled", False)
+    
+    def get_overtime_end_time(self) -> str:
+        """Récupère l'heure de fin des heures supplémentaires"""
+        overtime = self.get_config("overtime") or {}
+        return overtime.get("endTime", "22:00")
+    
+    # =========================
+    # Gestion de la facturation
+    # =========================
+    def should_auto_print_invoice(self) -> bool:
+        """Vérifie si l'impression automatique est activée"""
+        invoice = self.get_config("invoice") or {}
+        return invoice.get("autoPrint", False)
+    
+    def should_auto_save_invoice(self) -> bool:
+        """Vérifie si la sauvegarde automatique est activée"""
+        invoice = self.get_config("invoice") or {}
+        return invoice.get("autoSave", True)
+    
+    def get_invoice_font_size(self) -> int:
+        """Récupère la taille de police pour les factures"""
+        invoice = self.get_config("invoice") or {}
+        return invoice.get("fontSize", 12)
+    
+    # =========================
+    # Gestion des rapports
+    # =========================
+    def get_report_font_size(self) -> int:
+        """Récupère la taille de police par défaut pour les rapports"""
+        report = self.get_config("report") or {}
+        return report.get("defaultFontSize", 12)
+    
+    # =========================
     # Méthodes de gestion des utilisateurs
     # =========================
     def get_users_with_access(self, role_filter: Optional[str] = None) -> List:
@@ -504,7 +643,11 @@ class Pharmacy(Base):
             "branches": self.get_config("branchConfig.currentBranches") or 0,
             "is_active": self.is_active,
             "is_main": self.is_main,
-            "timezone": self.get_config("workingHours.timezone") or "Africa/Kinshasa"
+            "timezone": self.get_config("workingHours.timezone") or "Africa/Kinshasa",
+            "sales_type": self.get_sales_type(),
+            "profitability_enabled": self.is_profitability_enabled(),
+            "profitability_rate": self.get_profitability_rate(),
+            "auto_print_invoice": self.should_auto_print_invoice()
         }
     
     def to_dict(self) -> Dict[str, Any]:

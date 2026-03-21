@@ -140,18 +140,16 @@ class ManualActivationSchema(BaseModel):
         Vérifie que le montant correspond au plan.
         Cette validation est optionnelle et peut être désactivée.
         """
-        # Import conditionnel pour éviter les dépendances circulaires
         try:
             from app.services.subscription_service import PLAN_CONFIG
             plan = values.get('plan')
             if plan and plan in PLAN_CONFIG:
                 expected = float(PLAN_CONFIG[plan]['price_monthly'])
-                if abs(v - expected) > 0.01:  # Tolérance de 1 centime
-                    # Warning au lieu d'erreur pour permettre les ajustements manuels
+                if abs(v - expected) > 0.01:
                     import logging
                     logging.warning(f"Montant {v} différent du prix standard {expected} pour le plan {plan}")
         except ImportError:
-            pass  # Ignorer la validation si le service n'est pas disponible
+            pass
         return v
     
     model_config = ConfigDict(from_attributes=True)
@@ -202,6 +200,78 @@ class SubscriptionDetailSchema(SubscriptionResponseSchema):
     billing_cycle: Optional[str] = None
     auto_renew: Optional[bool] = True
     config: Optional[Dict[str, Any]] = None
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+# =======================
+# SCHÉMAS POUR CODES D'ABONNEMENT
+# =======================
+
+class SubscriptionCodeCreate(BaseModel):
+    """
+    Schéma pour la création d'un code d'abonnement.
+    """
+    plan_type: str = Field(..., description="Type de plan (starter, pro, enterprise)")
+    billing_cycle: Optional[str] = Field("monthly", description="Cycle de facturation (monthly/yearly)")
+    duration_days: Optional[int] = Field(None, description="Durée en jours de l'abonnement")
+    price: Optional[float] = Field(None, description="Prix personnalisé (laisser vide pour prix par défaut)")
+    currency: Optional[str] = Field("EUR", description="Devise")
+    valid_from: Optional[datetime] = Field(None, description="Date de début de validité")
+    valid_until: Optional[datetime] = Field(None, description="Date de fin de validité")
+    expiry_days: Optional[int] = Field(90, description="Durée de validité du code en jours")
+    code_length: Optional[int] = Field(8, description="Longueur du code")
+    notes: Optional[str] = Field(None, description="Notes additionnelles")
+    tenant_id: Optional[UUID] = Field(None, description="ID de la pharmacie associée")
+    user_id: Optional[UUID] = Field(None, description="ID de l'utilisateur associé")
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ActivateSubscriptionCode(BaseModel):
+    """
+    Schéma pour l'activation d'un code d'abonnement.
+    """
+    code: str = Field(..., description="Code à activer")
+    force: bool = Field(False, description="Forcer l'activation même si abonnement actif")
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SubscriptionCodeResponse(BaseModel):
+    """
+    Schéma de réponse pour un code d'abonnement.
+    """
+    success: bool
+    code: str
+    plan_type: str
+    plan_name: str
+    price: float
+    currency: str
+    duration_days: int
+    valid_until: Optional[datetime]
+    created_at: datetime
+    status: str
+    tenant_id: Optional[str] = None
+    user_id: Optional[str] = None
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ValidateCodeResponse(BaseModel):
+    """
+    Schéma de réponse pour la validation d'un code.
+    """
+    valid: bool
+    message: str
+    status: Optional[str] = None
+    valid_until: Optional[str] = None
+    plan: Optional[Dict[str, Any]] = None
+    price: Optional[float] = None
+    currency: Optional[str] = None
+    code: Optional[str] = None
+    tenant_id: Optional[str] = None
+    user_id: Optional[str] = None
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -276,7 +346,6 @@ class SubscriptionBase(BaseModel):
             elif billing_period == BillingPeriodEnum.YEARLY and yearly_price:
                 return yearly_price
             elif billing_period == BillingPeriodEnum.QUARTERLY and monthly_price:
-                # Trimestriel = 3 x mensuel
                 return monthly_price * 3
             elif monthly_price:
                 return monthly_price
@@ -297,7 +366,6 @@ class SubscriptionBase(BaseModel):
         if start_date and v and v <= start_date:
             raise ValueError('La date de fin d\'essai doit être après la date de début')
         
-        # Vérifier que la période d'essai ne dépasse pas 90 jours
         if start_date and v:
             trial_days = (v - start_date).days
             if trial_days > 90:
@@ -452,19 +520,15 @@ class SubscriptionResponse(SubscriptionBase):
             discount_amount = values.get('discount_amount', Decimal('0.00'))
             tax_rate = values.get('tax_rate', Decimal('0.00'))
             
-            # Appliquer la remise en pourcentage
             if discount_percent > 0:
                 discount = (current_price * discount_percent) / Decimal('100')
                 current_price -= discount
             
-            # Appliquer la remise fixe
             current_price -= discount_amount
             
-            # S'assurer que le montant n'est pas négatif
             if current_price < 0:
                 current_price = Decimal('0.00')
             
-            # Ajouter les taxes
             if tax_rate > 0:
                 tax_amount = (current_price * tax_rate) / Decimal('100')
                 current_price += tax_amount
@@ -730,42 +794,6 @@ class SubscriptionInDB(SubscriptionResponse):
     """Schéma pour les données stockées en base de données"""
     pass
 
-class SubscriptionCodeCreate(BaseModel):
-    plan_type: str
-    billing_cycle: Optional[str] = "monthly"
-    duration_days: Optional[int] = None
-    price: Optional[float] = None
-    currency: Optional[str] = "USD"
-    valid_from: Optional[datetime] = None
-    valid_until: Optional[datetime] = None
-    expiry_days: Optional[int] = 90  # Durée de validité du code
-    code_length: Optional[int] = 8
-    notes: Optional[str] = None
-
-class ActivateSubscriptionCode(BaseModel):
-    code: str
-    force: bool = False  # Pour forcer l'activation même si abonnement actif
-
-class SubscriptionCodeResponse(BaseModel):
-    success: bool
-    code: str
-    plan_type: str
-    plan_name: str
-    price: float
-    currency: str
-    duration_days: int
-    valid_until: Optional[datetime]
-    created_at: datetime
-    status: str
-
-class ManualActivationSchema(BaseModel):
-    user_id: UUID
-    plan: str
-    billing_cycle: str = "monthly"
-    payment_id: Optional[str] = None
-    payment_method: str = "manual"
-    reference: Optional[str] = None
-    notes: Optional[str] = None
 
 # =======================
 # EXPORTS
@@ -786,6 +814,12 @@ __all__ = [
     "SubscriptionFilterSchema",
     "SubscriptionResponseSchema",
     "SubscriptionDetailSchema",
+    
+    # Schémas pour codes d'abonnement
+    "SubscriptionCodeCreate",
+    "ActivateSubscriptionCode",
+    "SubscriptionCodeResponse",
+    "ValidateCodeResponse",
     
     # Schémas complets
     "SubscriptionBase",

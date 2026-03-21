@@ -79,7 +79,7 @@ class WorkingHoursConfig(BaseModel):
             "Africa/Lubumbashi",    # UTC+2
             "Africa/Johannesburg",  # UTC+2
             "Africa/Lagos",         # UTC+1
-            "Europe/Paris",          # UTC+1/UTC+2 (DST)
+            "Europe/Paris",         # UTC+1/UTC+2 (DST)
             "UTC"
         ]
         if v not in supported_zones:
@@ -174,6 +174,7 @@ class PharmacyInfoConfig(BaseModel):
     email: EmailStr = Field(..., description="Email de contact")
     licenseNumber: str = Field(..., description="Numéro de licence")
     logo: Optional[str] = Field(None, description="URL du logo")
+    logoUrl: Optional[str] = Field(None, description="URL du logo (alias)")
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -185,6 +186,60 @@ class PharmacyInfoConfig(BaseModel):
 class ThemeConfig(BaseModel):
     """Configuration du thème de l'application"""
     theme: str = Field(..., pattern=r"^(light|dark|system)$", description="Thème: light, dark ou system")
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ============================================
+# SCHÉMAS DE CONFIGURATION - NOUVEAUX CHAMPS
+# ============================================
+
+class SalesTypeConfig(BaseModel):
+    """Type de vente autorisé"""
+    type: str = Field(..., pattern=r"^(wholesale|retail|both)$", description="Type de vente: wholesale, retail ou both")
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ExpiredProductsConfig(BaseModel):
+    """Configuration des produits périmés"""
+    allowSale: bool = Field(False, description="Autoriser la vente de produits périmés")
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OvertimeConfig(BaseModel):
+    """Configuration des heures supplémentaires"""
+    enabled: bool = Field(False, description="Activer les heures supplémentaires")
+    endTime: str = Field(
+        "22:00", 
+        pattern=r"^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$",
+        description="Heure de fin des heures supplémentaires"
+    )
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ProfitabilityConfig(BaseModel):
+    """Configuration du calcul de rentabilité"""
+    enabled: bool = Field(False, description="Activer le calcul automatique du prix de vente")
+    rate: float = Field(30.0, ge=0, le=500, description="Taux de rentabilité en %")
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class InvoiceConfig(BaseModel):
+    """Configuration de la facturation"""
+    autoPrint: bool = Field(False, description="Impression automatique après vente")
+    autoSave: bool = Field(True, description="Sauvegarde automatique des factures")
+    fontSize: int = Field(12, ge=8, le=24, description="Taille de police pour la facture (px)")
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ReportConfig(BaseModel):
+    """Configuration des rapports"""
+    defaultFontSize: int = Field(12, ge=8, le=24, description="Taille de police par défaut pour les rapports (px)")
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -211,6 +266,15 @@ class PharmacyConfig(BaseModel):
     branchConfig: BranchConfig
     createdAt: datetime
     updatedAt: datetime
+    
+    # Nouveaux champs
+    salesType: SalesTypeConfig = Field(default_factory=SalesTypeConfig)
+    expiredProducts: ExpiredProductsConfig = Field(default_factory=ExpiredProductsConfig)
+    overtime: OvertimeConfig = Field(default_factory=OvertimeConfig)
+    sellByExchangeRate: bool = Field(True, description="Vente selon le taux de change")
+    profitability: ProfitabilityConfig = Field(default_factory=ProfitabilityConfig)
+    invoice: InvoiceConfig = Field(default_factory=InvoiceConfig)
+    report: ReportConfig = Field(default_factory=ReportConfig)
     
     model_config = ConfigDict(from_attributes=True)
     
@@ -317,6 +381,15 @@ class PharmacyConfigUpdate(BaseModel):
     theme: Optional[str] = Field(None, pattern=r"^(light|dark|system)$")
     initialCapital: Optional[float] = Field(None, ge=0)
     branchConfig: Optional[BranchConfig] = None
+    
+    # Nouveaux champs
+    salesType: Optional[SalesTypeConfig] = None
+    expiredProducts: Optional[ExpiredProductsConfig] = None
+    overtime: Optional[OvertimeConfig] = None
+    sellByExchangeRate: Optional[bool] = None
+    profitability: Optional[ProfitabilityConfig] = None
+    invoice: Optional[InvoiceConfig] = None
+    report: Optional[ReportConfig] = None
     
     # Champs pour rétrocompatibilité
     require_prescription: Optional[bool] = None
