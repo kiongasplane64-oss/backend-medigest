@@ -33,3 +33,4 @@ jinja2
 openpyxl
 pandas
 pytz
+python-multipart
