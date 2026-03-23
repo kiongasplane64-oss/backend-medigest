@@ -1,5 +1,5 @@
 # app/schemas/sale.py
-from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict
+from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict, computed_field
 from typing import Optional, List, Dict, Any, Union
 from datetime import datetime, date
 from uuid import UUID
@@ -134,7 +134,7 @@ class SaleFilter(BaseModel):
 
 
 # ============================
-# DAILY STATS RESPONSE (AJOUTÉ)
+# DAILY STATS RESPONSE
 # ============================
 class TopProductStats(BaseModel):
     """Statistiques d'un produit en top"""
@@ -192,8 +192,6 @@ class SaleInDB(BaseModel):
     total_discount: Decimal
     total_tva: Decimal
     total_amount: Decimal
-    amount_paid: Decimal
-    amount_due: Decimal
     status: str
     invoice_number: Optional[str]
     invoice_path: Optional[str]
@@ -206,10 +204,55 @@ class SaleInDB(BaseModel):
     cancelled_by: Optional[UUID]
     cancel_reason: Optional[str]
     
-    # Propriétés calculées
-    is_paid: bool
-    credit_status: str
-    days_overdue: int
+    @computed_field
+    @property
+    def amount_paid(self) -> float:
+        """Montant total payé"""
+        # Pour les ventes au comptant (non crédit), le montant total est payé
+        if not self.is_credit:
+            return float(self.total_amount)
+        # Pour les crédits, calculer depuis les paiements si disponibles
+        # Sinon, retourner le dépôt de garantie
+        if self.guarantee_deposit:
+            return float(self.guarantee_deposit)
+        return 0.0
+    
+    @computed_field
+    @property
+    def amount_due(self) -> float:
+        """Montant restant à payer"""
+        total = float(self.total_amount)
+        paid = self.amount_paid
+        return max(0.0, total - paid)
+    
+    @computed_field
+    @property
+    def is_paid(self) -> bool:
+        """Vérifie si la vente est entièrement payée"""
+        return self.amount_due <= 0.01
+    
+    @computed_field
+    @property
+    def credit_status(self) -> str:
+        """Statut du crédit"""
+        if not self.is_credit:
+            return "not_credit"
+        if self.is_paid:
+            return "paid"
+        if self.credit_due_date and date.today() > self.credit_due_date:
+            return "overdue"
+        return "pending"
+    
+    @computed_field
+    @property
+    def days_overdue(self) -> int:
+        """Nombre de jours de retard (si crédit)"""
+        if not self.is_credit or not self.credit_due_date or self.is_paid:
+            return 0
+        today = date.today()
+        if today > self.credit_due_date:
+            return (today - self.credit_due_date).days
+        return 0
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -289,6 +332,25 @@ class SalesStatsResponse(BaseModel):
     week: PeriodStats
     month: PeriodStats
     year: PeriodStats
+
+
+# ============================
+# PERIOD STATS RESPONSE
+# ============================
+class PeriodDataPoint(BaseModel):
+    """Point de données pour les statistiques par période"""
+    date: Optional[str] = None
+    sales_count: int
+    total_amount: float
+    average_basket: float
+
+
+class PeriodStatsResponse(BaseModel):
+    """Réponse pour les statistiques par période"""
+    period: str
+    start_date: str
+    end_date: str
+    data: List[PeriodDataPoint]
 
 
 # ============================
@@ -437,13 +499,3 @@ class SaleImpactResponse(BaseModel):
     sale_count: int
     average_price: float
     stock_impact: int  # Impact négatif sur le stock
-
-
-# ============================
-# PERIOD STATS (pour compatibilité)
-# ============================
-class PeriodStatsResponse(BaseModel):
-    """Statistiques pour une période (compatibilité)"""
-    total: float
-    count: int
-    average: float

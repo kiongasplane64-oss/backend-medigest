@@ -283,7 +283,7 @@ async def create_sale(
             total_discount += global_discount_amount
             total_amount -= global_discount_amount
 
-        # Création de la vente
+        # CORRECTION: Supprimer les champs amount_paid et amount_due qui sont des propriétés calculées
         sale = Sale(
             tenant_id=tenant_id,
             pharmacy_id=pharmacy.id,
@@ -307,10 +307,11 @@ async def create_sale(
             total_discount=total_discount,
             total_tva=total_tva,
             total_amount=total_amount,
-            amount_paid=total_amount if not sale_data.is_credit else Decimal('0'),
-            amount_due=total_amount if sale_data.is_credit else Decimal('0'),
             status="pending" if sale_data.is_credit else "completed",
-            invoice_number=sale_data.invoice_number
+            invoice_number=sale_data.invoice_number,
+            cancelled_at=None,
+            cancelled_by=None,
+            cancel_reason=None
         )
         
         db.add(sale)
@@ -371,6 +372,7 @@ async def create_sale(
             # Créer un mouvement de stock
             movement = StockMovement(
                 tenant_id=tenant_id,
+                branch_id=getattr(pharmacy, 'branch_id', None),
                 product_id=product.id,
                 pharmacy_id=pharmacy.id,
                 quantity_before=old_quantity,
@@ -380,7 +382,7 @@ async def create_sale(
                 reason="vente",
                 reference=sale.reference,
                 batch_number=item.batch_number,
-                cost_price=product.purchase_price,
+                purchase_price=product.purchase_price,
                 selling_price=Decimal(str(item.unit_price)),
                 sale_id=sale.id,
                 sale_item_id=sale_item.id,

@@ -459,7 +459,8 @@ async def get_subscription_usage(
         return payload
 
     try:
-        from app.models.inventory import Inventory
+        # CORRECTION: Importer les bons modèles d'inventaire
+        from app.models.inventory import PhysicalInventory, InventoryItem
         from app.models.pharmacy import Pharmacy
         from app.models.product import Product
         from app.models.sale import Sale
@@ -487,9 +488,17 @@ async def get_subscription_usage(
             Sale.created_at >= thirty_days_ago,
         ).count()
 
-        low_stock_count = db.query(Inventory).filter(
-            Inventory.tenant_id == tenant_id,
-            Inventory.quantity <= Inventory.min_threshold,
+        # CORRECTION: Utiliser PhysicalInventory au lieu de Inventory
+        # Compter le nombre de produits avec un stock bas
+        low_stock_count = db.query(Product).filter(
+            Product.tenant_id == tenant_id,
+            Product.quantity <= Product.alert_threshold,
+            Product.is_active == True
+        ).count()
+
+        # Compter le nombre d'inventaires physiques
+        physical_inventory_count = db.query(PhysicalInventory).filter(
+            PhysicalInventory.tenant_id == tenant_id
         ).count()
 
         users_limit = int(plan_config.get("max_users_per_tenant", 0) or 0)
@@ -506,6 +515,7 @@ async def get_subscription_usage(
             "pharmacies": pharmacies_count,
             "sales_last_30_days": sales_count,
             "low_stock_items": low_stock_count,
+            "physical_inventories": physical_inventory_count,
         }
 
         payload["limits"] = {

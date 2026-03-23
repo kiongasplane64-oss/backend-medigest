@@ -32,6 +32,11 @@ class Sale(Base):
     # CORRECTION: Changé seller_id à created_by pour correspondre au modèle User
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     seller_name = Column(String(100), nullable=False)
+
+    # Champs pour l'annulation
+    cancelled_at = Column(DateTime, nullable=True)
+    cancelled_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    cancel_reason = Column(Text, nullable=True)
     
     # Ajout pour validation des ventes
     validated_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
