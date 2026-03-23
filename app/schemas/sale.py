@@ -134,6 +134,36 @@ class SaleFilter(BaseModel):
 
 
 # ============================
+# DAILY STATS RESPONSE (AJOUTÉ)
+# ============================
+class TopProductStats(BaseModel):
+    """Statistiques d'un produit en top"""
+    product: str
+    quantity: int
+    amount: float
+
+
+class PharmacyDailyStats(BaseModel):
+    """Statistiques par pharmacie pour une journée"""
+    pharmacy_id: str
+    pharmacy_name: str
+    sales_count: int
+    total_amount: float
+    percentage: float
+
+
+class DailyStatsResponse(BaseModel):
+    """Réponse pour les statistiques quotidiennes"""
+    date: str
+    sales_count: int
+    total_amount: float
+    average_basket: float
+    items_sold: int
+    top_products: List[TopProductStats]
+    by_pharmacy: List[PharmacyDailyStats]
+
+
+# ============================
 # SALE RESPONSE / IN DB
 # ============================
 class SaleInDB(BaseModel):
@@ -246,11 +276,19 @@ class PharmacyStats(BaseModel):
     percentage_of_total: float
 
 
+class PeriodStats(BaseModel):
+    """Statistiques pour une période"""
+    total: float
+    count: int
+    average: float
+
+
 class SalesStatsResponse(BaseModel):
-    period: Dict[str, date]
-    total_stats: DailyStats
-    by_pharmacy: List[PharmacyStats]
-    trends: Dict[str, List[float]]
+    """Réponse pour les statistiques globales des ventes"""
+    today: DailyStatsResponse
+    week: PeriodStats
+    month: PeriodStats
+    year: PeriodStats
 
 
 # ============================
@@ -383,3 +421,29 @@ class SaleExportResponse(BaseModel):
     record_count: int
     file_size: str
     generated_at: datetime
+
+
+# ============================
+# SALE IMPACT RESPONSE
+# ============================
+class SaleImpactResponse(BaseModel):
+    """Réponse pour l'impact des ventes sur le stock"""
+    product_id: UUID
+    product_code: str
+    product_name: str
+    unit: str
+    total_sold: int
+    total_revenue: float
+    sale_count: int
+    average_price: float
+    stock_impact: int  # Impact négatif sur le stock
+
+
+# ============================
+# PERIOD STATS (pour compatibilité)
+# ============================
+class PeriodStatsResponse(BaseModel):
+    """Statistiques pour une période (compatibilité)"""
+    total: float
+    count: int
+    average: float

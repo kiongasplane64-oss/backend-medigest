@@ -24,10 +24,12 @@ from app.api.v1.clients import router as clients_router
 from app.api.v1.reports import router as reports_router
 from app.api.v1.payments_saas import router as saas_payments_router
 from app.api.v1.endpoints.stock import router as stock_router
-from app.api.v1.endpoints.products import router as products_router
 from app.api.v1 import users
 from app.api.v1.categories import router as categories_router
 from app.api.v1 import session
+from app.api.v1.sync import router as sync_router
+
+
 
 
 
@@ -217,12 +219,12 @@ include_router_auto(app, reports_router)
 include_router_auto(app, saas_payments_router)
 include_router_auto(app, superadmin_router)
 include_router_auto(app, stock_router, tags=["Stock"])
-include_router_auto(app, products_router, tags=["Products"])
 include_router_auto(app, inventory_router, tags=["Inventory"])
 include_router_auto(app, users.router, tags=["Users"])
 include_router_auto(app, subscription_codes_router)
 include_router_auto(app, categories_router)
 app.include_router(session.router, prefix="/api/v1")
+app.include_router(sync_router, prefix="/api/v1", tags=["Synchronization"])
 
 
 # ============================================================================

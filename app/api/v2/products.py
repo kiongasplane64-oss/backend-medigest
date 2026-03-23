@@ -59,7 +59,7 @@ async def list_products(
             )
         
         if category:
-            query = query.filter(Product.category == category)
+            query = query.filter(Product.category_id == category)
         
         if stock_status:
             query = query.filter(Product.stock_status == stock_status)

@@ -50,6 +50,12 @@ class StockMovement(Base):
     # Raison et notes
     reason = Column(String(200), nullable=True)
     notes = Column(Text, nullable=True)
+    reference = Column(String, nullable=True) 
+    movement_type = Column(String, nullable=False)
+
+    # Lien avec la vente (communication avec module sales)
+    sale_id = Column(UUID, ForeignKey("sales.id"), nullable=True)
+    sale_item_id = Column(UUID, ForeignKey("sale_items.id"), nullable=True)
 
     # Utilisateur responsable
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
@@ -64,6 +70,8 @@ class StockMovement(Base):
     tenant = relationship("Tenant")
     product = relationship("Product", back_populates="stock_movements")
     user = relationship("User", foreign_keys=[created_by])
+    sale = relationship("Sale", foreign_keys=[sale_id])
+    sale_item = relationship("SaleItem", foreign_keys=[sale_item_id])
 
     __table_args__ = (
         Index("ix_stock_movements_tenant_date", "tenant_id", "created_at"),

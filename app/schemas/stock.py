@@ -5,7 +5,7 @@ from datetime import date, datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 from uuid import UUID
-
+from decimal import Decimal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
@@ -35,6 +35,42 @@ class ExportFormat(str, Enum):
     EXCEL = "excel"
     PDF = "pdf"
     CSV = "csv"
+
+class SalesImpactResponse(BaseModel):
+    """Réponse pour l'impact des ventes sur le stock"""
+    product_id: UUID
+    product_code: str
+    product_name: str
+    unit: str
+    total_sold: int
+    total_revenue: float
+    sale_count: int
+    average_price: float
+    current_stock: Optional[int] = None
+    alert_threshold: Optional[int] = None
+    stock_status: Optional[str] = None
+    stock_value: Optional[float] = None
+
+class StockMovementResponse(BaseModel):
+    """Réponse pour les mouvements de stock"""
+    id: UUID
+    product_id: UUID
+    product_name: str
+    product_code: str
+    pharmacy_id: UUID
+    quantity_before: Decimal
+    quantity_after: Decimal
+    quantity_change: Decimal
+    movement_type: str
+    reason: str
+    reference: Optional[str] = None
+    batch_number: Optional[str] = None
+    cost_price: Optional[Decimal] = None
+    selling_price: Optional[Decimal] = None
+    sale_id: Optional[UUID] = None
+    sale_item_id: Optional[UUID] = None
+    created_at: datetime
+    created_by: Optional[UUID] = None
 
 
 # =========================================================

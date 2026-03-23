@@ -1,13 +1,16 @@
-# app/api/v1/sales.py
+# app/api/v1/endpoints/sales.py
+"""
+API de gestion des ventes avec intégration complète du stock
+"""
+
 from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks
 from sqlalchemy.orm import Session, selectinload, joinedload
-from sqlalchemy import func, desc, and_, or_
+from sqlalchemy import func, desc, and_, or_, distinct
 from typing import List, Optional, Dict, Any
 from uuid import UUID
 from datetime import datetime, date, timedelta
 import logging
 from decimal import Decimal
-import json
 
 from app.db.session import get_db
 from app.models.sale import Sale, SaleItem
@@ -17,12 +20,14 @@ from app.models.user import User
 from app.models.pharmacy import Pharmacy
 from app.models.user_pharmacy import UserPharmacy
 from app.models.tenant import Tenant
+from app.models.stock_movement import StockMovement
 from app.schemas.sale import (
     SaleCreate, SaleResponse, SaleInDB, SaleUpdate, SaleFilter,
-    DailyStats, SaleListResponse, QuickSaleRequest, SaleRefundRequest,
-    CreditSaleCreate, ReceiptData, SaleItemCreate, SaleDetailResponse,
-    SalesStatsResponse, PharmacyStats, SaleExportRequest, SaleExportResponse,
-    UserPharmacyAccess, SaleValidationRequest, SaleItemResponse
+    DailyStatsResponse, SaleListResponse, QuickSaleRequest, 
+    SaleRefundRequest, CreditSaleCreate, ReceiptData, SaleItemCreate, 
+    SaleDetailResponse, SalesStatsResponse, PharmacyStats, SaleExportRequest, 
+    SaleExportResponse, UserPharmacyAccess, SaleValidationRequest, 
+    SaleItemResponse, SaleImpactResponse, PeriodStatsResponse
 )
 from app.schemas.client import ClientCreate, ClientInDB
 from app.api.deps import (
@@ -30,24 +35,24 @@ from app.api.deps import (
     get_current_user, 
     get_current_active_user, 
     require_role, 
-    require_permission
+    require_permission,
+    get_current_pharmacy_entity,
+    get_current_branch_entity,
+    can_user_access_pharmacy
 )
-from app.core.security import require_permission, require_role
 from app.services.inventory import InventoryService
 from app.services.reporting import ReportService
-from app.services.notification_service import NotificationService
 from app.services.receipt import ReceiptService
 from app.core.config import settings
-from app.utils.pagination import paginate
-from app.utils.export import export_to_excel
-from app.utils.validators import validate_stock_availability
 
 router = APIRouter(prefix="/sales", tags=["Ventes"])
 logger = logging.getLogger(__name__)
 
+
 # =======================
 # Tâches en arrière-plan
 # =======================
+
 async def generate_sale_receipt(sale_id: UUID, tenant_id: UUID, pharmacy_id: UUID, db: Session):
     """Génère un reçu PDF pour la vente"""
     try:
@@ -66,141 +71,123 @@ async def generate_sale_receipt(sale_id: UUID, tenant_id: UUID, pharmacy_id: UUI
     except Exception as e:
         logger.error(f"Erreur génération reçu pour vente {sale_id}: {str(e)}")
 
-async def send_sale_notification(sale_id: UUID, tenant_id: UUID, pharmacy_id: UUID, db: Session):
-    """Envoie des notifications pour la vente"""
-    try:
-        notification_service = NotificationService(db)
-        sale = db.query(Sale).options(
-            joinedload(Sale.client),
-            joinedload(Sale.creator),
-            joinedload(Sale.pharmacy)
-        ).filter(
-            Sale.id == sale_id,
-            Sale.tenant_id == tenant_id,
-            Sale.pharmacy_id == pharmacy_id
-        ).first()
-        
-        if sale:
-            # Notification au vendeur
-            await notification_service.send_sale_confirmation(sale)
-            
-            # Notification au client si email/téléphone disponible
-            if sale.client and (sale.client.email or sale.client.telephone):
-                await notification_service.send_customer_receipt(sale)
-                
-            logger.info(f"Notifications envoyées pour la vente {sale.reference}")
-    except Exception as e:
-        logger.error(f"Erreur notification pour vente {sale_id}: {str(e)}")
 
 async def update_sales_statistics(tenant_id: UUID, pharmacy_id: UUID, sale_date: date, db: Session):
     """Met à jour les statistiques de ventes"""
     try:
-        report_service = ReportService(db)
+        report_service = ReportService(db, tenant_id)
         await report_service.update_daily_sales_stats(tenant_id, pharmacy_id, sale_date)
         logger.info(f"Statistiques mises à jour pour {sale_date}")
     except Exception as e:
         logger.error(f"Erreur mise à jour statistiques: {str(e)}")
 
+
 # =======================
 # Helpers
 # =======================
-def get_user_accessible_pharmacies(db: Session, user_id: UUID, tenant_id: UUID) -> List[UUID]:
-    """Récupère la liste des pharmacies accessibles par l'utilisateur"""
-    if user_id:
-        accessible_pharmacies = db.query(UserPharmacy.pharmacy_id).filter(
-            UserPharmacy.user_id == user_id
-        ).all()
-        return [p.pharmacy_id for p in accessible_pharmacies]
-    return []
 
-def get_current_pharmacy(
-    db: Session, 
-    user_id: UUID, 
+def get_user_accessible_pharmacies(db: Session, user_id: UUID, tenant_id: Optional[UUID] = None) -> List[UUID]:
+    """Récupère la liste des pharmacies accessibles par l'utilisateur"""
+    if not user_id:
+        return []
+    
+    query = db.query(UserPharmacy.pharmacy_id).filter(UserPharmacy.user_id == user_id)
+    
+    if tenant_id:
+        query = query.join(Pharmacy).filter(Pharmacy.tenant_id == tenant_id)
+    
+    return [p.pharmacy_id for p in query.all()]
+
+
+def check_stock_availability_for_sale(
+    db: Session,
     tenant_id: UUID,
-    requested_pharmacy_id: Optional[UUID] = None
-) -> Pharmacy:
-    """Détermine la pharmacie courante pour l'utilisateur"""
-    # Si une pharmacie est spécifiée, vérifier l'accès
-    if requested_pharmacy_id:
-        user_pharmacy = db.query(UserPharmacy).filter(
-            UserPharmacy.user_id == user_id,
-            UserPharmacy.pharmacy_id == requested_pharmacy_id
-        ).first()
-        
-        if not user_pharmacy:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Accès non autorisé à cette pharmacie"
-            )
-        
-        pharmacy = db.query(Pharmacy).filter(
-            Pharmacy.id == requested_pharmacy_id,
-            Pharmacy.tenant_id == tenant_id,
-            Pharmacy.is_active == True
-        ).first()
-    else:
-        # Utiliser la pharmacie principale de l'utilisateur
-        user_pharmacy = db.query(UserPharmacy).filter(
-            UserPharmacy.user_id == user_id,
-            UserPharmacy.is_primary == True
-        ).first()
-        
-        if not user_pharmacy:
-            # Prendre la première pharmacie accessible
-            user_pharmacy = db.query(UserPharmacy).filter(
-                UserPharmacy.user_id == user_id
-            ).first()
-        
-        if not user_pharmacy:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Aucune pharmacie configurée pour l'utilisateur"
-            )
-        
-        pharmacy = db.query(Pharmacy).filter(
-            Pharmacy.id == user_pharmacy.pharmacy_id,
-            Pharmacy.tenant_id == tenant_id,
-            Pharmacy.is_active == True
-        ).first()
+    pharmacy_id: UUID,
+    items: List[SaleItemCreate],
+    inventory_service: InventoryService
+) -> tuple[List[Dict], List[Dict]]:
+    """
+    Vérifie la disponibilité des stocks
+    Retourne (items_disponibles, items_indisponibles)
+    """
+    available_items = []
+    unavailable_items = []
     
-    if not pharmacy:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Pharmacie non trouvée ou inactive"
-        )
+    for item in items:
+        product = db.query(Product).filter(
+            Product.id == item.product_id,
+            Product.tenant_id == tenant_id,
+            Product.pharmacy_id == pharmacy_id,
+            Product.is_active == True
+        ).first()
+        
+        if not product:
+            unavailable_items.append({
+                "product_id": str(item.product_id),
+                "product_name": "Unknown",
+                "requested": float(item.quantity),
+                "available": 0,
+                "reason": "Produit non trouvé"
+            })
+            continue
+        
+        # Récupérer le stock disponible
+        available_quantity = product.available_quantity
+        
+        if available_quantity < item.quantity:
+            unavailable_items.append({
+                "product_id": str(item.product_id),
+                "product_name": product.name,
+                "requested": float(item.quantity),
+                "available": float(available_quantity),
+                "unit": product.unit,
+                "reason": "Stock insuffisant"
+            })
+        else:
+            available_items.append({
+                "product": product,
+                "item": item,
+                "available_stock": available_quantity
+            })
     
-    return pharmacy
+    return available_items, unavailable_items
+
 
 # =======================
 # Routes principales
 # =======================
+
 @router.post("/", response_model=SaleResponse, status_code=status.HTTP_201_CREATED)
-@require_permission("sales:create")
 async def create_sale(
     sale_data: SaleCreate,
     db: Session = Depends(get_db),
-    current_tenant: Tenant = Depends(get_current_tenant),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_user: User = Depends(get_current_active_user),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """
     Crée une nouvelle vente avec gestion complète par pharmacie
+    et mise à jour automatique du stock avec traçabilité
     """
-    try:
-        # Vérifier le rôle
-        if current_user.role not in ["admin", "vendeur", "gerant", "caissier"]:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Rôle insuffisant pour créer une vente"
-            )
-
-        # Déterminer la pharmacie
-        pharmacy = get_current_pharmacy(
-            db=db,
-            user_id=current_user.id,
-            tenant_id=current_tenant.id,
-            requested_pharmacy_id=sale_data.pharmacy_id
+    # Vérifier les permissions
+    allowed_roles = ["admin", "super_admin", "superadmin", "vendeur", "gerant", "caissier"]
+    if current_user.role not in allowed_roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Rôle insuffisant pour créer une vente. Rôles autorisés: {allowed_roles}"
         )
+    
+    try:
+        # Déterminer la pharmacie
+        pharmacy = current_pharmacy
+        if not pharmacy:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Aucune pharmacie active sélectionnée"
+            )
+        
+        tenant_id = current_tenant.id if current_tenant else None
 
         # Validation des données
         if not sale_data.items or len(sale_data.items) == 0:
@@ -209,12 +196,34 @@ async def create_sale(
                 detail="La vente doit contenir au moins un article"
             )
 
+        # Service d'inventaire
+        inventory_service = InventoryService(db, tenant_id)
+
+        # Vérification des stocks
+        available_items, unavailable_items = check_stock_availability_for_sale(
+            db=db,
+            tenant_id=tenant_id,
+            pharmacy_id=pharmacy.id,
+            items=sale_data.items,
+            inventory_service=inventory_service
+        )
+
+        if unavailable_items:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "message": "Stock insuffisant pour certains articles",
+                    "unavailable_items": unavailable_items,
+                    "pharmacy": pharmacy.name
+                }
+            )
+
         # Vérification client
         client = None
         if sale_data.client_id:
             client = db.query(Client).filter(
                 Client.id == sale_data.client_id,
-                Client.tenant_id == current_tenant.id,
+                Client.tenant_id == tenant_id,
                 Client.is_active == True
             ).first()
             
@@ -232,83 +241,74 @@ async def create_sale(
                         detail="Client non éligible au crédit"
                     )
                 
-                credit_limit = getattr(client, 'credit_limit', 0)
-                current_debt = getattr(client, 'dette_actuelle', 0)
+                credit_limit = getattr(client, 'credit_limit', Decimal('0'))
+                current_debt = getattr(client, 'dette_actuelle', Decimal('0'))
                 credit_available = credit_limit - current_debt
                 
                 if sale_data.total_amount > credit_available:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Crédit insuffisant. Disponible: {credit_available:.2f}, Requis: {sale_data.total_amount:.2f}"
+                        detail=f"Crédit insuffisant. Disponible: {float(credit_available):.2f}, Requis: {float(sale_data.total_amount):.2f}"
                     )
-
-        # Vérification des stocks par pharmacie
-        inventory_service = InventoryService(db, current_tenant.id)
-        unavailable_items = []
-        
-        for item in sale_data.items:
-            # Produit spécifique à la pharmacie
-            product = db.query(Product).filter(
-                Product.id == item.product_id,
-                Product.tenant_id == current_tenant.id,
-                Product.pharmacy_id == pharmacy.id,
-                Product.is_active == True
-            ).first()
-            
-            if not product:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Produit {item.product_id} non trouvé dans la pharmacie {pharmacy.name}"
-                )
-            
-            # Vérification stock
-            available_stock = getattr(product, 'quantity', 0)
-            if available_stock < item.quantity:
-                unavailable_items.append({
-                    "product": getattr(product, 'name', 'Unknown'),
-                    "requested": item.quantity,
-                    "available": available_stock,
-                    "pharmacy": pharmacy.name
-                })
-        
-        if unavailable_items:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "message": "Stock insuffisant pour certains articles",
-                    "unavailable_items": unavailable_items,
-                    "pharmacy": pharmacy.name
-                }
-            )
 
         # Génération référence
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        reference = f"VNT-{timestamp}-{pharmacy.pharmacy_code}"
+        pharmacy_code = getattr(pharmacy, 'pharmacy_code', 'PHARM')
+        reference = f"VNT-{timestamp}-{pharmacy_code}"
+
+        # Calcul des totaux
+        subtotal = Decimal('0')
+        total_discount = Decimal('0')
+        total_tva = Decimal('0')
+        total_amount = Decimal('0')
+        
+        for available in available_items:
+            item = available["item"]
+            product = available["product"]
+            
+            item_subtotal = Decimal(str(item.unit_price)) * Decimal(str(item.quantity))
+            item_discount = item_subtotal * (Decimal(str(item.discount_percent)) / Decimal('100'))
+            item_after_discount = item_subtotal - item_discount
+            item_tva = item_after_discount * (Decimal(str(item.tva_rate)) / Decimal('100'))
+            item_total = item_after_discount + item_tva
+            
+            subtotal += item_subtotal
+            total_discount += item_discount
+            total_tva += item_tva
+            total_amount += item_total
+        
+        # Appliquer la remise globale
+        if sale_data.global_discount:
+            global_discount_amount = total_amount * (Decimal(str(sale_data.global_discount)) / Decimal('100'))
+            total_discount += global_discount_amount
+            total_amount -= global_discount_amount
 
         # Création de la vente
         sale = Sale(
-            tenant_id=current_tenant.id,
+            tenant_id=tenant_id,
             pharmacy_id=pharmacy.id,
             reference=reference,
             client_id=sale_data.client_id,
             client_name=client.nom_complet if client else sale_data.client_name,
             client_phone=client.telephone if client else sale_data.client_phone,
             created_by=current_user.id,
-            seller_name=current_user.nom_complet,
+            seller_name=getattr(current_user, 'nom_complet', current_user.email),
             payment_method=sale_data.payment_method.value,
             reference_payment=sale_data.reference_payment,
             payment_date=datetime.utcnow() if sale_data.payment_method.value != "credit" else None,
             is_credit=sale_data.is_credit,
             credit_due_date=sale_data.credit_due_date,
-            guarantee_deposit=sale_data.guarantee_deposit or Decimal('0.00'),
+            guarantee_deposit=Decimal(str(sale_data.guarantee_deposit)) if sale_data.guarantee_deposit else Decimal('0'),
             guarantor_name=sale_data.guarantor_name,
             guarantor_phone=sale_data.guarantor_phone,
-            global_discount=sale_data.global_discount or Decimal('0.00'),
+            global_discount=Decimal(str(sale_data.global_discount)) if sale_data.global_discount else Decimal('0'),
             notes=sale_data.notes,
-            subtotal=sale_data.subtotal,
-            total_discount=sale_data.total_discount,
-            total_tva=sale_data.total_tva,
-            total_amount=sale_data.total_amount,
+            subtotal=subtotal,
+            total_discount=total_discount,
+            total_tva=total_tva,
+            total_amount=total_amount,
+            amount_paid=total_amount if not sale_data.is_credit else Decimal('0'),
+            amount_due=total_amount if sale_data.is_credit else Decimal('0'),
             status="pending" if sale_data.is_credit else "completed",
             invoice_number=sale_data.invoice_number
         )
@@ -316,61 +316,90 @@ async def create_sale(
         db.add(sale)
         db.flush()
 
-        # Création des items
-        for item in sale_data.items:
-            product = db.query(Product).filter(
-                Product.id == item.product_id,
-                Product.pharmacy_id == pharmacy.id
-            ).first()
+        # Création des items et mise à jour des stocks
+        sale_items = []
+        
+        for available in available_items:
+            product = available["product"]
+            item = available["item"]
             
+            # Calcul des montants pour l'item
+            item_subtotal = Decimal(str(item.unit_price)) * Decimal(str(item.quantity))
+            item_discount = item_subtotal * (Decimal(str(item.discount_percent)) / Decimal('100'))
+            item_after_discount = item_subtotal - item_discount
+            item_tva = item_after_discount * (Decimal(str(item.tva_rate)) / Decimal('100'))
+            item_total = item_after_discount + item_tva
+            
+            # Créer l'item de vente
             sale_item = SaleItem(
                 sale_id=sale.id,
-                tenant_id=current_tenant.id,
+                tenant_id=tenant_id,
                 pharmacy_id=pharmacy.id,
                 product_id=item.product_id,
-                product_code=getattr(product, 'code', f"PRD-{product.id[:6]}"),
-                product_name=getattr(product, 'name', 'Unknown'),
+                product_code=product.code,
+                product_name=product.name,
                 quantity=item.quantity,
-                unit_price=item.unit_price,
-                discount_percent=item.discount_percent or Decimal('0.00'),
-                tva_rate=item.tva_rate or getattr(product, 'tva_rate', Decimal('0.00')),
+                unit_price=Decimal(str(item.unit_price)),
+                discount_percent=Decimal(str(item.discount_percent)) if item.discount_percent else Decimal('0'),
+                discount_amount=item_discount,
+                tva_rate=Decimal(str(item.tva_rate)) if item.tva_rate else Decimal('0'),
+                tva_amount=item_tva,
+                subtotal=item_subtotal,
+                total=item_total,
                 batch_number=item.batch_number,
                 expiry_date=item.expiry_date
             )
-            sale_item.calculate_totals()
             db.add(sale_item)
+            sale_items.append(sale_item)
             
-            # Mise à jour stock
-            try:
-                inventory_service.update_stock(
-                    product_id=item.product_id,
-                    pharmacy_id=pharmacy.id,
-                    quantity_change=-item.quantity,
-                    reason="vente",
-                    reference=sale.reference,
-                    batch_number=item.batch_number,
-                    cost_price=getattr(product, 'purchase_price', Decimal('0.00')),
-                    selling_price=item.unit_price
-                )
-            except Exception as e:
-                logger.error(f"Erreur mise à jour stock: {str(e)}")
+            # Mettre à jour le stock
+            old_quantity = product.quantity
+            new_quantity = old_quantity - item.quantity
+            
+            if new_quantity < 0:
                 raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Erreur mise à jour stock: {str(e)}"
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Stock insuffisant pour {product.name}"
                 )
+            
+            product.quantity = new_quantity
+            product.available_quantity = max(0, new_quantity - (product.reserved_quantity or 0))
+            product.total_sold = (product.total_sold or 0) + item.quantity
+            product.last_sale_date = datetime.utcnow()
+            product.refresh_statuses()
+            
+            # Créer un mouvement de stock
+            movement = StockMovement(
+                tenant_id=tenant_id,
+                product_id=product.id,
+                pharmacy_id=pharmacy.id,
+                quantity_before=old_quantity,
+                quantity_after=new_quantity,
+                quantity_change=-item.quantity,
+                movement_type="sale",
+                reason="vente",
+                reference=sale.reference,
+                batch_number=item.batch_number,
+                cost_price=product.purchase_price,
+                selling_price=Decimal(str(item.unit_price)),
+                sale_id=sale.id,
+                sale_item_id=sale_item.id,
+                created_by=current_user.id
+            )
+            db.add(movement)
 
         # Mise à jour client
         if client:
-            client.total_achats = (getattr(client, 'total_achats', 0) or 0) + sale_data.total_amount
+            client.total_achats = (getattr(client, 'total_achats', Decimal('0')) or Decimal('0')) + total_amount
             client.nombre_achats = (getattr(client, 'nombre_achats', 0) or 0) + 1
             client.dernier_achat = datetime.utcnow()
-            client.dernier_montant = sale_data.total_amount
+            client.dernier_montant = total_amount
             
             if sale_data.is_credit:
-                client.dette_actuelle = (getattr(client, 'dette_actuelle', 0) or 0) + sale_data.total_amount
+                client.dette_actuelle = (getattr(client, 'dette_actuelle', Decimal('0')) or Decimal('0')) + total_amount
 
         # Validation automatique si configuré
-        if settings.AUTO_VALIDATE_SALES and current_user.role in ["admin", "gerant"]:
+        if getattr(settings, 'AUTO_VALIDATE_SALES', False) and current_user.role in ["admin", "super_admin", "superadmin", "gerant"]:
             sale.status = "completed"
             sale.validated_by = current_user.id
             sale.validated_at = datetime.utcnow()
@@ -379,27 +408,29 @@ async def create_sale(
         db.refresh(sale)
 
         # Tâches en arrière-plan
-        background_tasks.add_task(generate_sale_receipt, sale.id, current_tenant.id, pharmacy.id, db)
-        background_tasks.add_task(send_sale_notification, sale.id, current_tenant.id, pharmacy.id, db)
-        background_tasks.add_task(update_sales_statistics, current_tenant.id, pharmacy.id, datetime.now().date(), db)
+        background_tasks.add_task(generate_sale_receipt, sale.id, tenant_id, pharmacy.id, db)
+        background_tasks.add_task(update_sales_statistics, tenant_id, pharmacy.id, datetime.now().date(), db)
 
-        # Préparation de la réponse
-        sale_dict = sale.to_dict() if hasattr(sale, 'to_dict') else {}
-        sale_in_db = SaleInDB(**sale_dict, pharmacy_name=pharmacy.name, pharmacy_code=pharmacy.pharmacy_code)
-        
+        logger.info(
+            f"Vente créée: {sale.reference} - {len(sale_items)} articles - "
+            f"Pharmacie: {pharmacy.name} par {current_user.email}"
+        )
+
+        # Construction de la réponse
         return SaleResponse(
             message="Vente créée avec succès",
-            sale=sale_in_db,
+            sale=SaleInDB.model_validate(sale),
             pharmacy={
                 "id": str(pharmacy.id),
                 "name": pharmacy.name,
-                "code": pharmacy.pharmacy_code
+                "code": getattr(pharmacy, 'pharmacy_code', None)
             },
             receipt_available=True,
-            receipt_url=f"/api/v1/sales/{sale.id}/receipt" if hasattr(sale, 'receipt_path') and sale.receipt_path else None
+            receipt_url=f"/api/v1/sales/{sale.id}/receipt"
         )
 
     except HTTPException:
+        db.rollback()
         raise
     except Exception as e:
         db.rollback()
@@ -409,171 +440,136 @@ async def create_sale(
             detail=f"Erreur création vente: {str(e)}"
         )
 
-@router.get("/", response_model=SaleListResponse)
-@require_permission("sales:read")
-async def list_sales(
+
+# =======================
+# Endpoint: Impact des ventes sur le stock
+# =======================
+
+@router.get("/stock-impact", response_model=List[SaleImpactResponse])
+async def get_sales_stock_impact(
     db: Session = Depends(get_db),
-    current_tenant: Tenant = Depends(get_current_tenant),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_user: User = Depends(get_current_active_user),
+    product_id: Optional[UUID] = Query(None, description="Filtrer par produit"),
     pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
-    status: Optional[str] = Query(None, description="Statut de la vente"),
-    payment_method: Optional[str] = Query(None, description="Méthode de paiement"),
-    is_credit: Optional[bool] = Query(None, description="Ventes à crédit uniquement"),
     start_date: Optional[date] = Query(None, description="Date de début"),
     end_date: Optional[date] = Query(None, description="Date de fin"),
-    client_id: Optional[UUID] = Query(None, description="ID du client"),
-    seller_id: Optional[UUID] = Query(None, description="ID du vendeur"),
-    search: Optional[str] = Query(None, description="Recherche texte"),
-    skip: int = Query(0, ge=0),
-    limit: int = Query(100, ge=1, le=1000),
-    sort_by: str = Query("created_at"),
-    sort_order: str = Query("desc")
+    limit: int = Query(100, ge=1, le=1000)
 ):
     """
-    Liste les ventes avec filtres avancés par pharmacie
+    Récupère l'impact des ventes sur le stock
+    Point de communication avec le module stock
     """
     try:
+        tenant_id = current_tenant.id if current_tenant else None
+        
         # Déterminer les pharmacies accessibles
-        if current_user.role == "admin":
-            accessible_pharmacies = db.query(Pharmacy.id).filter(
-                Pharmacy.tenant_id == current_tenant.id,
-                Pharmacy.is_active == True
-            ).all()
-            pharmacy_ids = [p.id for p in accessible_pharmacies]
+        if current_user.role in ["super_admin", "superadmin", "admin"]:
+            pharmacies_query = db.query(Pharmacy.id).filter(Pharmacy.is_active == True)
+            if tenant_id:
+                pharmacies_query = pharmacies_query.filter(Pharmacy.tenant_id == tenant_id)
+            if pharmacy_id:
+                pharmacies_query = pharmacies_query.filter(Pharmacy.id == pharmacy_id)
+            pharmacy_ids = [p.id for p in pharmacies_query.all()]
         else:
-            pharmacy_ids = get_user_accessible_pharmacies(db, current_user.id, current_tenant.id)
-        
-        if not pharmacy_ids:
-            return SaleListResponse(items=[], total=0, page=1, size=limit, has_more=False)
-        
-        # Construction de la requête
-        query = db.query(Sale).options(
-            joinedload(Sale.pharmacy)
-        ).filter(
-            Sale.tenant_id == current_tenant.id,
-            Sale.pharmacy_id.in_(pharmacy_ids)
-        )
-        
-        # Filtres
-        if pharmacy_id:
-            if pharmacy_id not in pharmacy_ids:
+            pharmacy_ids = get_user_accessible_pharmacies(db, current_user.id, tenant_id)
+            if pharmacy_id and pharmacy_id not in pharmacy_ids:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Accès non autorisé à cette pharmacie"
                 )
-            query = query.filter(Sale.pharmacy_id == pharmacy_id)
+            if pharmacy_id:
+                pharmacy_ids = [pharmacy_id]
         
-        if status:
-            query = query.filter(Sale.status == status)
+        if not pharmacy_ids:
+            return []
         
-        if payment_method:
-            query = query.filter(Sale.payment_method == payment_method)
+        # Construction de la requête
+        query = db.query(
+            Product.id.label("product_id"),
+            Product.code,
+            Product.name,
+            Product.unit,
+            func.coalesce(func.sum(SaleItem.quantity), 0).label("total_sold"),
+            func.coalesce(func.sum(SaleItem.total), 0).label("total_revenue"),
+            func.count(distinct(Sale.id)).label("sale_count"),
+            func.avg(SaleItem.unit_price).label("average_price")
+        ).join(
+            SaleItem, SaleItem.product_id == Product.id
+        ).join(
+            Sale, Sale.id == SaleItem.sale_id
+        ).filter(
+            Sale.status == "completed",
+            Sale.pharmacy_id.in_(pharmacy_ids)
+        )
         
-        if is_credit is not None:
-            query = query.filter(Sale.is_credit == is_credit)
+        if tenant_id:
+            query = query.filter(Product.tenant_id == tenant_id)
+            query = query.filter(Sale.tenant_id == tenant_id)
+        
+        if product_id:
+            query = query.filter(Product.id == product_id)
         
         if start_date:
             query = query.filter(func.date(Sale.created_at) >= start_date)
-        
         if end_date:
             query = query.filter(func.date(Sale.created_at) <= end_date)
         
-        if client_id:
-            query = query.filter(Sale.client_id == client_id)
+        results = query.group_by(
+            Product.id, Product.code, Product.name, Product.unit
+        ).order_by(
+            desc("total_sold")
+        ).limit(limit).all()
         
-        if seller_id:
-            query = query.filter(Sale.created_by == seller_id)
-        
-        if search:
-            search_term = f"%{search}%"
-            query = query.filter(
-                or_(
-                    Sale.reference.ilike(search_term),
-                    Sale.client_name.ilike(search_term),
-                    Sale.invoice_number.ilike(search_term)
-                )
+        return [
+            SaleImpactResponse(
+                product_id=row.product_id,
+                product_code=row.code,
+                product_name=row.name,
+                unit=row.unit,
+                total_sold=int(row.total_sold),
+                total_revenue=float(row.total_revenue),
+                sale_count=int(row.sale_count),
+                average_price=float(row.average_price),
+                stock_impact=-int(row.total_sold)
             )
+            for row in results
+        ]
         
-        # Tri
-        sort_column = getattr(Sale, sort_by, Sale.created_at)
-        if sort_order == "desc":
-            query = query.order_by(desc(sort_column))
-        else:
-            query = query.order_by(sort_column)
-        
-        # Pagination
-        total = query.count()
-        sales = query.offset(skip).limit(limit).all()
-        
-        # Conversion en SaleInDB
-        sales_in_db = []
-        for sale in sales:
-            sale_dict = sale.to_dict() if hasattr(sale, 'to_dict') else {}
-            pharmacy = sale.pharmacy
-            sales_in_db.append(SaleInDB(
-                **sale_dict,
-                pharmacy_name=pharmacy.name if pharmacy else None,
-                pharmacy_code=pharmacy.pharmacy_code if pharmacy else None
-            ))
-        
-        # Calcul des statistiques par pharmacie
-        pharmacies_summary = {}
-        if pharmacy_id:
-            # Statistiques pour la pharmacie spécifique
-            stats = db.query(
-                func.count(Sale.id).label('count'),
-                func.sum(Sale.total_amount).label('total')
-            ).filter(
-                Sale.tenant_id == current_tenant.id,
-                Sale.pharmacy_id == pharmacy_id,
-                Sale.status == 'completed'
-            ).first()
-            
-            pharmacies_summary = {
-                "pharmacy_id": str(pharmacy_id),
-                "total_sales": stats.count or 0,
-                "total_amount": float(stats.total or 0)
-            }
-        
-        return SaleListResponse(
-            items=sales_in_db,
-            total=total,
-            page=skip // limit + 1 if limit > 0 else 1,
-            size=limit,
-            has_more=skip + limit < total,
-            pharmacies_summary=pharmacies_summary
-        )
-        
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Erreur listing ventes: {str(e)}")
+        logger.error(f"Erreur récupération impact stock: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erreur listing ventes: {str(e)}"
+            detail=f"Erreur récupération impact stock: {str(e)}"
         )
 
-@router.get("/{sale_id}", response_model=SaleDetailResponse)
-@require_permission("sales:read")
-async def get_sale_detail(
+
+# =======================
+# Endpoint: Mouvements de stock liés à une vente
+# =======================
+
+@router.get("/stock-movements/{sale_id}")
+async def get_sale_stock_movements(
     sale_id: UUID,
     db: Session = Depends(get_db),
-    current_tenant: Tenant = Depends(get_current_tenant),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_user: User = Depends(get_current_active_user)
 ):
     """
-    Récupère les détails d'une vente spécifique
+    Récupère tous les mouvements de stock liés à une vente spécifique
+    Point de communication avec le module stock
     """
     try:
-        sale = db.query(Sale).options(
-            selectinload(Sale.items),
-            selectinload(Sale.pharmacy),
-            selectinload(Sale.client),
-            selectinload(Sale.creator),
-            selectinload(Sale.payments),
-            selectinload(Sale.refunds)
-        ).filter(
-            Sale.id == sale_id,
-            Sale.tenant_id == current_tenant.id
-        ).first()
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        # Vérifier que la vente existe et est accessible
+        sale_query = db.query(Sale).filter(Sale.id == sale_id)
+        if tenant_id:
+            sale_query = sale_query.filter(Sale.tenant_id == tenant_id)
+        
+        sale = sale_query.first()
         
         if not sale:
             raise HTTPException(
@@ -582,116 +578,98 @@ async def get_sale_detail(
             )
         
         # Vérifier l'accès à la pharmacie
-        if current_user.role != "admin":
-            accessible_pharmacies = get_user_accessible_pharmacies(db, current_user.id, current_tenant.id)
+        if current_user.role not in ["super_admin", "superadmin", "admin"]:
+            accessible_pharmacies = get_user_accessible_pharmacies(db, current_user.id, tenant_id)
             if sale.pharmacy_id not in accessible_pharmacies:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Accès non autorisé à cette vente"
                 )
         
-        # Conversion des items
-        items_response = []
-        for item in sale.items:
-            items_response.append(SaleItemResponse(
-                id=item.id,
-                sale_id=item.sale_id,
-                tenant_id=item.tenant_id,
-                pharmacy_id=item.pharmacy_id,
-                product_id=item.product_id,
-                product_code=item.product_code,
-                product_name=item.product_name,
-                quantity=item.quantity,
-                unit_price=item.unit_price,
-                discount_percent=item.discount_percent,
-                tva_rate=item.tva_rate,
-                batch_number=item.batch_number,
-                expiry_date=item.expiry_date,
-                subtotal=item.subtotal,
-                discount_amount=item.discount_amount,
-                tva_amount=item.tva_amount,
-                total=item.total,
-                created_at=item.created_at
-            ))
+        # Récupérer les mouvements de stock liés à cette vente
+        movements = db.query(StockMovement).filter(
+            StockMovement.sale_id == sale_id,
+            StockMovement.tenant_id == tenant_id
+        ).all()
         
-        # Préparation des données
-        sale_dict = sale.to_dict() if hasattr(sale, 'to_dict') else {}
-        pharmacy = sale.pharmacy
-        client = sale.client
-        creator = sale.creator
-        
-        sale_in_db = SaleInDB(
-            **sale_dict,
-            pharmacy_name=pharmacy.name if pharmacy else None,
-            pharmacy_code=pharmacy.pharmacy_code if pharmacy else None
-        )
-        
-        can_refund = sale.status == "completed" and not sale.is_credit
-        can_cancel = sale.status in ["draft", "pending"]
-        can_validate = sale.status == "pending" and current_user.role in ["admin", "gerant"]
-        
-        return SaleDetailResponse(
-            sale=sale_in_db,
-            items=items_response,
-            pharmacy={
-                "id": str(pharmacy.id) if pharmacy else None,
-                "name": pharmacy.name if pharmacy else None,
-                "code": pharmacy.pharmacy_code if pharmacy else None,
-                "address": pharmacy.address if pharmacy else None
-            },
-            client={
-                "id": str(client.id) if client else None,
-                "name": client.nom_complet if client else None,
-                "phone": client.telephone if client else None
-            } if client else None,
-            creator={
-                "id": str(creator.id) if creator else None,
-                "name": creator.nom_complet if creator else None,
-                "role": creator.role if creator else None
-            },
-            payments=[],  # À implémenter selon ton modèle
-            refunds=[],   # À implémenter selon ton modèle
-            can_refund=can_refund,
-            can_cancel=can_cancel,
-            can_validate=can_validate
-        )
+        return {
+            "sale_id": str(sale.id),
+            "sale_reference": sale.reference,
+            "pharmacy_id": str(sale.pharmacy_id),
+            "movements": [
+                {
+                    "id": str(m.id),
+                    "product_id": str(m.product_id),
+                    "product_name": getattr(m.product, "name", None),
+                    "quantity_change": float(m.quantity_change) if m.quantity_change else 0,
+                    "quantity_before": float(m.quantity_before) if m.quantity_before else 0,
+                    "quantity_after": float(m.quantity_after) if m.quantity_after else 0,
+                    "movement_type": m.movement_type,
+                    "reason": m.reason,
+                    "created_at": m.created_at.isoformat() if m.created_at else None,
+                    "batch_number": m.batch_number
+                }
+                for m in movements
+            ],
+            "total_movements": len(movements)
+        }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erreur récupération vente {sale_id}: {str(e)}")
+        logger.error(f"Erreur récupération mouvements stock pour vente {sale_id}: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erreur récupération vente: {str(e)}"
+            detail=f"Erreur récupération mouvements stock: {str(e)}"
         )
 
-@router.get("/stats/daily", response_model=Dict[str, Any])
-@require_permission("sales:stats")
-async def get_daily_stats(
+
+# =======================
+# Endpoint: Ventes par produit
+# =======================
+
+@router.get("/by-product/{product_id}")
+async def get_sales_by_product(
+    product_id: UUID,
     db: Session = Depends(get_db),
-    current_tenant: Tenant = Depends(get_current_tenant),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_user: User = Depends(get_current_active_user),
-    date_param: Optional[date] = Query(None, description="Date spécifique (défaut: aujourd'hui)"),
-    pharmacy_id: Optional[UUID] = Query(None, description="Pharmacie spécifique")
+    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
+    start_date: Optional[date] = Query(None, description="Date de début"),
+    end_date: Optional[date] = Query(None, description="Date de fin"),
+    limit: int = Query(100, ge=1, le=1000)
 ):
     """
-    Statistiques quotidiennes des ventes par pharmacie
+    Récupère toutes les ventes pour un produit spécifique
+    Utile pour l'analyse des ventes par produit
     """
     try:
-        target_date = date_param or date.today()
+        tenant_id = current_tenant.id if current_tenant else None
         
-        # Déterminer les pharmacies
-        if current_user.role == "admin":
+        # Vérifier que le produit existe
+        product_query = db.query(Product).filter(Product.id == product_id)
+        if tenant_id:
+            product_query = product_query.filter(Product.tenant_id == tenant_id)
+        
+        product = product_query.first()
+        
+        if not product:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Produit non trouvé"
+            )
+        
+        # Déterminer les pharmacies accessibles
+        if current_user.role in ["super_admin", "superadmin", "admin"]:
             if pharmacy_id:
                 pharmacies = [pharmacy_id]
             else:
-                pharmacies = db.query(Pharmacy.id).filter(
-                    Pharmacy.tenant_id == current_tenant.id,
-                    Pharmacy.is_active == True
-                ).all()
-                pharmacies = [p.id for p in pharmacies]
+                pharmacies_query = db.query(Pharmacy.id).filter(Pharmacy.is_active == True)
+                if tenant_id:
+                    pharmacies_query = pharmacies_query.filter(Pharmacy.tenant_id == tenant_id)
+                pharmacies = [p.id for p in pharmacies_query.all()]
         else:
-            accessible_pharmacies = get_user_accessible_pharmacies(db, current_user.id, current_tenant.id)
+            accessible_pharmacies = get_user_accessible_pharmacies(db, current_user.id, tenant_id)
             if pharmacy_id and pharmacy_id not in accessible_pharmacies:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -701,395 +679,492 @@ async def get_daily_stats(
         
         if not pharmacies:
             return {
-                "date": target_date.isoformat(),
-                "sales_count": 0,
-                "total_amount": 0.0,
-                "average_basket": 0.0,
-                "items_sold": 0,
-                "top_products": [],
-                "by_pharmacy": []
+                "product_id": str(product_id),
+                "product_name": product.name,
+                "product_code": product.code,
+                "sales": [],
+                "total_sales": 0,
+                "total_quantity": 0,
+                "total_revenue": 0
             }
         
-        # Statistiques globales
-        sales_today = db.query(Sale).filter(
-            Sale.tenant_id == current_tenant.id,
-            func.date(Sale.created_at) == target_date,
+        # Construire la requête
+        query = db.query(
+            Sale.id,
+            Sale.reference,
+            Sale.created_at,
+            Sale.client_name,
+            Sale.seller_name,
+            SaleItem.quantity,
+            SaleItem.unit_price,
+            SaleItem.total,
+            Sale.pharmacy_id
+        ).join(
+            SaleItem, SaleItem.sale_id == Sale.id
+        ).filter(
+            SaleItem.product_id == product_id,
             Sale.status == "completed",
             Sale.pharmacy_id.in_(pharmacies)
-        ).all()
+        )
         
-        total_amount = sum(sale.total_amount for sale in sales_today)
-        sales_count = len(sales_today)
-        average_basket = total_amount / sales_count if sales_count > 0 else Decimal('0.00')
+        if tenant_id:
+            query = query.filter(Sale.tenant_id == tenant_id)
+            query = query.filter(SaleItem.tenant_id == tenant_id)
         
-        # Produits vendus
-        items_sold = db.query(func.sum(SaleItem.quantity)).join(Sale).filter(
-            Sale.tenant_id == current_tenant.id,
-            func.date(Sale.created_at) == target_date,
+        if start_date:
+            query = query.filter(func.date(Sale.created_at) >= start_date)
+        if end_date:
+            query = query.filter(func.date(Sale.created_at) <= end_date)
+        
+        results = query.order_by(desc(Sale.created_at)).limit(limit).all()
+        
+        total_quantity = sum(r.quantity for r in results)
+        total_revenue = sum(float(r.total) for r in results)
+        
+        return {
+            "product_id": str(product_id),
+            "product_name": product.name,
+            "product_code": product.code,
+            "sales": [
+                {
+                    "sale_id": str(r.id),
+                    "reference": r.reference,
+                    "date": r.created_at.isoformat() if r.created_at else None,
+                    "client_name": r.client_name,
+                    "seller_name": r.seller_name,
+                    "quantity": int(r.quantity),
+                    "unit_price": float(r.unit_price),
+                    "total": float(r.total),
+                    "pharmacy_id": str(r.pharmacy_id) if r.pharmacy_id else None
+                }
+                for r in results
+            ],
+            "total_sales": len(results),
+            "total_quantity": int(total_quantity),
+            "total_revenue": float(total_revenue)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur récupération ventes pour produit {product_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur récupération ventes: {str(e)}"
+        )
+
+
+# =======================
+# Endpoint: Statistiques quotidiennes
+# =======================
+
+@router.get("/stats/daily", response_model=DailyStatsResponse)
+async def get_daily_stats(
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+    target_date: Optional[date] = Query(None, description="Date (format YYYY-MM-DD)"),
+    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie")
+):
+    """
+    Récupère les statistiques de ventes pour une journée spécifique.
+    Si la date n'est pas fournie, utilise la date du jour.
+    """
+    try:
+        if target_date is None:
+            target_date = datetime.now().date()
+        
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        # Déterminer les pharmacies accessibles
+        if current_user.role in ["super_admin", "superadmin", "admin"]:
+            if pharmacy_id:
+                pharmacies = [pharmacy_id]
+            else:
+                pharmacies_query = db.query(Pharmacy.id).filter(Pharmacy.is_active == True)
+                if tenant_id:
+                    pharmacies_query = pharmacies_query.filter(Pharmacy.tenant_id == tenant_id)
+                pharmacies = [p.id for p in pharmacies_query.all()]
+        else:
+            accessible_pharmacies = get_user_accessible_pharmacies(db, current_user.id, tenant_id)
+            if pharmacy_id and pharmacy_id not in accessible_pharmacies:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Accès non autorisé à cette pharmacie"
+                )
+            pharmacies = [pharmacy_id] if pharmacy_id else accessible_pharmacies
+        
+        if not pharmacies:
+            return DailyStatsResponse(
+                date=target_date.isoformat(),
+                sales_count=0,
+                total_amount=0,
+                average_basket=0,
+                items_sold=0,
+                top_products=[],
+                by_pharmacy=[]
+            )
+        
+        # Date range pour la journée
+        start_datetime = datetime.combine(target_date, datetime.min.time())
+        end_datetime = datetime.combine(target_date, datetime.max.time())
+        
+        # Requête principale
+        stats_query = db.query(
+            func.count(distinct(Sale.id)).label("sales_count"),
+            func.coalesce(func.sum(Sale.total_amount), 0).label("total_amount"),
+            func.coalesce(func.sum(SaleItem.quantity), 0).label("items_sold"),
+            func.avg(Sale.total_amount).label("average_basket")
+        ).join(
+            SaleItem, SaleItem.sale_id == Sale.id
+        ).filter(
             Sale.status == "completed",
-            Sale.pharmacy_id.in_(pharmacies)
-        ).scalar() or 0
+            Sale.pharmacy_id.in_(pharmacies),
+            Sale.created_at >= start_datetime,
+            Sale.created_at <= end_datetime
+        )
+        
+        if tenant_id:
+            stats_query = stats_query.filter(Sale.tenant_id == tenant_id)
+        
+        stats_result = stats_query.first()
         
         # Top produits
-        top_products = db.query(
-            SaleItem.product_name,
+        top_products_query = db.query(
+            Product.id.label("product_id"),
+            Product.name.label("product_name"),
             func.sum(SaleItem.quantity).label("total_quantity"),
             func.sum(SaleItem.total).label("total_amount")
-        ).join(Sale).filter(
-            Sale.tenant_id == current_tenant.id,
-            func.date(Sale.created_at) == target_date,
+        ).join(
+            SaleItem, SaleItem.product_id == Product.id
+        ).join(
+            Sale, Sale.id == SaleItem.sale_id
+        ).filter(
             Sale.status == "completed",
-            Sale.pharmacy_id.in_(pharmacies)
-        ).group_by(SaleItem.product_name).order_by(desc("total_quantity")).limit(5).all()
+            Sale.pharmacy_id.in_(pharmacies),
+            Sale.created_at >= start_datetime,
+            Sale.created_at <= end_datetime
+        )
         
-        # Statistiques par pharmacie
+        if tenant_id:
+            top_products_query = top_products_query.filter(Sale.tenant_id == tenant_id)
+        
+        top_products = top_products_query.group_by(
+            Product.id, Product.name
+        ).order_by(
+            desc("total_quantity")
+        ).limit(5).all()
+        
+        # Par pharmacie
+        by_pharmacy_query = db.query(
+            Pharmacy.id.label("pharmacy_id"),
+            Pharmacy.name.label("pharmacy_name"),
+            func.count(distinct(Sale.id)).label("sales_count"),
+            func.coalesce(func.sum(Sale.total_amount), 0).label("total_amount")
+        ).join(
+            Sale, Sale.pharmacy_id == Pharmacy.id
+        ).filter(
+            Sale.status == "completed",
+            Sale.pharmacy_id.in_(pharmacies),
+            Sale.created_at >= start_datetime,
+            Sale.created_at <= end_datetime
+        )
+        
+        if tenant_id:
+            by_pharmacy_query = by_pharmacy_query.filter(Sale.tenant_id == tenant_id)
+        
+        by_pharmacy_results = by_pharmacy_query.group_by(
+            Pharmacy.id, Pharmacy.name
+        ).all()
+        
+        total_sales = float(stats_result.total_amount or 0)
         by_pharmacy = []
-        for pharmacy in pharmacies:
-            pharmacy_sales = db.query(Sale).filter(
-                Sale.tenant_id == current_tenant.id,
-                func.date(Sale.created_at) == target_date,
-                Sale.status == "completed",
-                Sale.pharmacy_id == pharmacy
-            ).all()
-            
-            if pharmacy_sales:
-                ph = db.query(Pharmacy).filter(Pharmacy.id == pharmacy).first()
-                ph_total = sum(s.total_amount for s in pharmacy_sales)
-                ph_count = len(pharmacy_sales)
-                
-                by_pharmacy.append({
-                    "pharmacy_id": str(pharmacy),
-                    "pharmacy_name": ph.name if ph else "Unknown",
-                    "sales_count": ph_count,
-                    "total_amount": float(ph_total),
-                    "percentage": float((ph_total / total_amount * 100) if total_amount > 0 else 0)
-                })
-        
-        return {
-            "date": target_date.isoformat(),
-            "sales_count": sales_count,
-            "total_amount": float(total_amount),
-            "average_basket": float(average_basket),
-            "items_sold": items_sold,
-            "top_products": [
-                {
-                    "product": product,
-                    "quantity": int(quantity),
-                    "amount": float(amount)
-                }
-                for product, quantity, amount in top_products
-            ],
-            "by_pharmacy": by_pharmacy
-        }
-        
-    except Exception as e:
-        logger.error(f"Erreur stats quotidiennes: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erreur stats quotidiennes: {str(e)}"
-        )
-
-@router.post("/{sale_id}/validate", response_model=SaleResponse)
-@require_role(["admin", "gerant"])
-async def validate_sale(
-    sale_id: UUID,
-    validation_data: SaleValidationRequest,
-    db: Session = Depends(get_db),
-    current_tenant: Tenant = Depends(get_current_tenant),
-    current_user: User = Depends(get_current_active_user)
-):
-    """
-    Valide une vente (pour les ventes à crédit ou nécessitant validation)
-    """
-    try:
-        sale = db.query(Sale).filter(
-            Sale.id == sale_id,
-            Sale.tenant_id == current_tenant.id
-        ).first()
-        
-        if not sale:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Vente non trouvée"
-            )
-        
-        if sale.status != "pending":
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"La vente n'est pas en attente de validation (statut: {sale.status})"
-            )
-        
-        # Validation
-        sale.status = "completed"
-        sale.validated_by = current_user.id
-        sale.validated_at = datetime.utcnow()
-        
-        if validation_data.validator_notes:
-            sale.notes = f"{sale.notes or ''}\nValidation: {validation_data.validator_notes}"
-        
-        db.commit()
-        
-        logger.info(f"Vente validée: {sale.reference} par {current_user.nom_complet}")
-        
-        # Conversion en SaleInDB
-        sale_dict = sale.to_dict() if hasattr(sale, 'to_dict') else {}
-        sale_in_db = SaleInDB(**sale_dict)
-        
-        return SaleResponse(
-            message="Vente validée avec succès",
-            sale=sale_in_db
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Erreur validation vente {sale_id}: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erreur validation vente: {str(e)}"
-        )
-
-@router.post("/{sale_id}/cancel", response_model=SaleResponse)
-@require_permission("sales:cancel")
-async def cancel_sale(
-    sale_id: UUID,
-    cancel_reason: str = Query(..., description="Raison de l'annulation"),
-    db: Session = Depends(get_db),
-    current_tenant: Tenant = Depends(get_current_tenant),
-    current_user: User = Depends(get_current_active_user)
-):
-    """
-    Annule une vente et restaure les stocks
-    """
-    try:
-        sale = db.query(Sale).options(selectinload(Sale.items)).filter(
-            Sale.id == sale_id,
-            Sale.tenant_id == current_tenant.id
-        ).first()
-        
-        if not sale:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Vente non trouvée"
-            )
-        
-        if sale.status in ["cancelled", "refunded"]:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"La vente est déjà {sale.status}"
-            )
-        
-        # Vérifier les permissions
-        can_cancel = (
-            current_user.role in ["admin", "gerant"] or
-            (current_user.id == sale.created_by and 
-             (datetime.utcnow() - sale.created_at).total_seconds() < 3600)
-        )
-        
-        if not can_cancel:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Vous n'êtes pas autorisé à annuler cette vente"
-            )
-        
-        # Restaurer les stocks
-        inventory_service = InventoryService(db, current_tenant.id)
-        for item in sale.items:
-            inventory_service.update_stock(
-                product_id=item.product_id,
-                pharmacy_id=sale.pharmacy_id,
-                quantity_change=item.quantity,
-                reason="annulation_vente",
-                reference=f"ANN-{sale.reference}"
-            )
-        
-        # Mise à jour client si crédit
-        if sale.client_id and sale.is_credit:
-            client = db.query(Client).filter(
-                Client.id == sale.client_id,
-                Client.tenant_id == current_tenant.id
-            ).first()
-            if client and hasattr(client, 'dette_actuelle'):
-                client.dette_actuelle -= sale.total_amount - (sale.guarantee_deposit or Decimal('0.00'))
-        
-        # Annulation
-        sale.status = "cancelled"
-        sale.cancelled_by = current_user.id
-        sale.cancelled_at = datetime.utcnow()
-        sale.cancel_reason = f"{cancel_reason} (par {current_user.nom_complet})"
-        
-        db.commit()
-        
-        logger.warning(f"Vente annulée: {sale.reference} - Raison: {cancel_reason}")
-        
-        # Conversion en SaleInDB
-        sale_dict = sale.to_dict() if hasattr(sale, 'to_dict') else {}
-        sale_in_db = SaleInDB(**sale_dict)
-        
-        return SaleResponse(
-            message="Vente annulée avec succès",
-            sale=sale_in_db
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Erreur annulation vente {sale_id}: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erreur annulation vente: {str(e)}"
-        )
-
-@router.get("/pharmacy/context", response_model=UserPharmacyAccess)
-async def get_pharmacy_context(
-    db: Session = Depends(get_db),
-    current_tenant: Tenant = Depends(get_current_tenant),
-    current_user: User = Depends(get_current_active_user)
-):
-    """
-    Récupère le contexte des pharmacies accessibles pour l'utilisateur
-    """
-    try:
-        # Pharmacies accessibles
-        accessible_pharmacies = []
-        if current_user.role == "admin":
-            pharmacies = db.query(Pharmacy).filter(
-                Pharmacy.tenant_id == current_tenant.id,
-                Pharmacy.is_active == True
-            ).order_by(Pharmacy.is_main.desc(), Pharmacy.name).all()
-        else:
-            user_pharmacies = db.query(UserPharmacy).filter(
-                UserPharmacy.user_id == current_user.id
-            ).all()
-            
-            pharmacy_ids = [up.pharmacy_id for up in user_pharmacies]
-            pharmacies = db.query(Pharmacy).filter(
-                Pharmacy.id.in_(pharmacy_ids),
-                Pharmacy.tenant_id == current_tenant.id,
-                Pharmacy.is_active == True
-            ).order_by(Pharmacy.is_main.desc(), Pharmacy.name).all()
-        
-        for pharmacy in pharmacies:
-            accessible_pharmacies.append({
-                "id": pharmacy.id,
-                "name": pharmacy.name,
-                "code": pharmacy.pharmacy_code,
-                "address": pharmacy.address,
-                "phone": pharmacy.phone,
-                "is_main": pharmacy.is_main,
-                "is_active": pharmacy.is_active
+        for pharm in by_pharmacy_results:
+            percentage = (float(pharm.total_amount) / total_sales * 100) if total_sales > 0 else 0
+            by_pharmacy.append({
+                "pharmacy_id": str(pharm.pharmacy_id),
+                "pharmacy_name": pharm.pharmacy_name,
+                "sales_count": pharm.sales_count,
+                "total_amount": float(pharm.total_amount),
+                "percentage": percentage
             })
         
-        # Pharmacie courante
-        current_pharmacy = None
-        user_pharmacy = db.query(UserPharmacy).filter(
-            UserPharmacy.user_id == current_user.id,
-            UserPharmacy.is_primary == True
-        ).first()
-        
-        if user_pharmacy:
-            pharmacy = db.query(Pharmacy).filter(Pharmacy.id == user_pharmacy.pharmacy_id).first()
-            if pharmacy:
-                current_pharmacy = {
-                    "id": pharmacy.id,
-                    "name": pharmacy.name,
-                    "code": pharmacy.pharmacy_code,
-                    "address": pharmacy.address,
-                    "phone": pharmacy.phone,
-                    "is_main": pharmacy.is_main,
-                    "is_active": pharmacy.is_active
+        return DailyStatsResponse(
+            date=target_date.isoformat(),
+            sales_count=stats_result.sales_count or 0,
+            total_amount=float(stats_result.total_amount or 0),
+            average_basket=float(stats_result.average_basket or 0),
+            items_sold=int(stats_result.items_sold or 0),
+            top_products=[
+                {
+                    "product": p.product_name,
+                    "quantity": int(p.total_quantity),
+                    "amount": float(p.total_amount)
                 }
-        
-        return UserPharmacyAccess(
-            accessible_pharmacies=accessible_pharmacies,
-            current_pharmacy=current_pharmacy,
-            can_switch=len(accessible_pharmacies) > 1
+                for p in top_products
+            ],
+            by_pharmacy=by_pharmacy
         )
-        
-    except Exception as e:
-        logger.error(f"Erreur contexte pharmacie: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erreur contexte pharmacie: {str(e)}"
-        )
-
-@router.post("/pharmacy/switch/{pharmacy_id}")
-async def switch_active_pharmacy(
-    pharmacy_id: UUID,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
-):
-    """
-    Change la pharmacie active pour l'utilisateur
-    """
-    try:
-        # Vérifier l'accès
-        user_pharmacy = db.query(UserPharmacy).filter(
-            UserPharmacy.user_id == current_user.id,
-            UserPharmacy.pharmacy_id == pharmacy_id
-        ).first()
-        
-        if not user_pharmacy:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Accès non autorisé à cette pharmacie"
-            )
-        
-        # Réinitialiser toutes les pharmacies principales
-        db.query(UserPharmacy).filter(
-            UserPharmacy.user_id == current_user.id
-        ).update({"is_primary": False})
-        
-        # Définir la nouvelle pharmacie principale
-        user_pharmacy.is_primary = True
-        user_pharmacy.updated_at = datetime.utcnow()
-        
-        db.commit()
-        
-        # Récupérer la pharmacie
-        pharmacy = db.query(Pharmacy).filter(Pharmacy.id == pharmacy_id).first()
-        
-        return {
-            "message": f"Pharmacie active changée vers {pharmacy.name}",
-            "pharmacy": {
-                "id": str(pharmacy.id),
-                "name": pharmacy.name,
-                "code": pharmacy.pharmacy_code,
-                "is_main": pharmacy.is_main,
-                "address": pharmacy.address
-            }
-        }
         
     except HTTPException:
         raise
     except Exception as e:
-        db.rollback()
-        logger.error(f"Erreur changement pharmacie: {str(e)}")
+        logger.error(f"Erreur récupération stats quotidiennes: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erreur changement pharmacie: {str(e)}"
+            detail=f"Erreur récupération stats: {str(e)}"
         )
 
+
 # =======================
-# Route de test
+# Endpoint: Statistiques globales (overview)
 # =======================
+
+@router.get("/stats/overview", response_model=SalesStatsResponse)
+async def get_sales_stats(
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie")
+):
+    """
+    Récupère les statistiques globales des ventes.
+    """
+    try:
+        tenant_id = current_tenant.id if current_tenant else None
+        today = datetime.now().date()
+        
+        # Déterminer les pharmacies accessibles
+        if current_user.role in ["super_admin", "superadmin", "admin"]:
+            if pharmacy_id:
+                pharmacies = [pharmacy_id]
+            else:
+                pharmacies_query = db.query(Pharmacy.id).filter(Pharmacy.is_active == True)
+                if tenant_id:
+                    pharmacies_query = pharmacies_query.filter(Pharmacy.tenant_id == tenant_id)
+                pharmacies = [p.id for p in pharmacies_query.all()]
+        else:
+            accessible_pharmacies = get_user_accessible_pharmacies(db, current_user.id, tenant_id)
+            if pharmacy_id and pharmacy_id not in accessible_pharmacies:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Accès non autorisé à cette pharmacie"
+                )
+            pharmacies = [pharmacy_id] if pharmacy_id else accessible_pharmacies
+        
+        if not pharmacies:
+            empty_period = {"total": 0, "count": 0, "average": 0}
+            empty_daily = DailyStatsResponse(
+                date=today.isoformat(),
+                sales_count=0,
+                total_amount=0,
+                average_basket=0,
+                items_sold=0,
+                top_products=[],
+                by_pharmacy=[]
+            )
+            return SalesStatsResponse(
+                today=empty_daily,
+                week=empty_period,
+                month=empty_period,
+                year=empty_period
+            )
+        
+        def get_stats_for_period(start: datetime, end: datetime) -> Dict[str, Any]:
+            query = db.query(
+                func.count(distinct(Sale.id)).label("count"),
+                func.coalesce(func.sum(Sale.total_amount), 0).label("total")
+            ).filter(
+                Sale.status == "completed",
+                Sale.pharmacy_id.in_(pharmacies),
+                Sale.created_at >= start,
+                Sale.created_at <= end
+            )
+            if tenant_id:
+                query = query.filter(Sale.tenant_id == tenant_id)
+            result = query.first()
+            total = float(result.total or 0)
+            count = result.count or 0
+            return {
+                "total": total,
+                "count": count,
+                "average": total / count if count > 0 else 0
+            }
+        
+        # Statistiques du jour
+        today_stats = await get_daily_stats(
+            db=db,
+            current_tenant=current_tenant,
+            current_user=current_user,
+            target_date=today,
+            pharmacy_id=pharmacy_id
+        )
+        
+        # Statistiques de la semaine
+        week_start = datetime.combine(today - timedelta(days=today.weekday()), datetime.min.time())
+        week_end = datetime.combine(today, datetime.max.time())
+        week_stats = get_stats_for_period(week_start, week_end)
+        
+        # Statistiques du mois
+        month_start = datetime.combine(today.replace(day=1), datetime.min.time())
+        month_end = datetime.combine(today, datetime.max.time())
+        month_stats = get_stats_for_period(month_start, month_end)
+        
+        # Statistiques de l'année
+        year_start = datetime.combine(today.replace(month=1, day=1), datetime.min.time())
+        year_end = datetime.combine(today, datetime.max.time())
+        year_stats = get_stats_for_period(year_start, year_end)
+        
+        return SalesStatsResponse(
+            today=today_stats,
+            week=week_stats,
+            month=month_stats,
+            year=year_stats
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur récupération stats globales: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur récupération stats: {str(e)}"
+        )
+
+
+# =======================
+# Endpoint: Statistiques par période
+# =======================
+
+@router.get("/stats/period", response_model=PeriodStatsResponse)
+async def get_period_stats(
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+    period: str = Query("day", description="Période: day, week, month, year"),
+    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie")
+):
+    """
+    Récupère les statistiques agrégées par période.
+    """
+    try:
+        tenant_id = current_tenant.id if current_tenant else None
+        today = datetime.now().date()
+        
+        # Déterminer les pharmacies accessibles
+        if current_user.role in ["super_admin", "superadmin", "admin"]:
+            if pharmacy_id:
+                pharmacies = [pharmacy_id]
+            else:
+                pharmacies_query = db.query(Pharmacy.id).filter(Pharmacy.is_active == True)
+                if tenant_id:
+                    pharmacies_query = pharmacies_query.filter(Pharmacy.tenant_id == tenant_id)
+                pharmacies = [p.id for p in pharmacies_query.all()]
+        else:
+            accessible_pharmacies = get_user_accessible_pharmacies(db, current_user.id, tenant_id)
+            if pharmacy_id and pharmacy_id not in accessible_pharmacies:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Accès non autorisé à cette pharmacie"
+                )
+            pharmacies = [pharmacy_id] if pharmacy_id else accessible_pharmacies
+        
+        if not pharmacies:
+            return PeriodStatsResponse(
+                period=period,
+                start_date=datetime.now().isoformat(),
+                end_date=datetime.now().isoformat(),
+                data=[]
+            )
+        
+        # Déterminer le nombre de jours à retourner
+        if period == "day":
+            days = 1
+            group_by = func.date(Sale.created_at)
+        elif period == "week":
+            days = 7
+            group_by = func.date_trunc('week', Sale.created_at)
+        elif period == "month":
+            days = 30
+            group_by = func.date_trunc('month', Sale.created_at)
+        elif period == "year":
+            days = 365
+            group_by = func.date_trunc('year', Sale.created_at)
+        else:
+            days = 7
+            group_by = func.date(Sale.created_at)
+        
+        start_date = datetime.combine(today - timedelta(days=days), datetime.min.time())
+        
+        # Requête
+        results = db.query(
+            group_by.label("date"),
+            func.count(distinct(Sale.id)).label("sales_count"),
+            func.coalesce(func.sum(Sale.total_amount), 0).label("total_amount"),
+            func.avg(Sale.total_amount).label("average_basket")
+        ).filter(
+            Sale.status == "completed",
+            Sale.pharmacy_id.in_(pharmacies),
+            Sale.created_at >= start_date
+        )
+        
+        if tenant_id:
+            results = results.filter(Sale.tenant_id == tenant_id)
+        
+        results = results.group_by("date").order_by("date").all()
+        
+        return PeriodStatsResponse(
+            period=period,
+            start_date=start_date.isoformat(),
+            end_date=datetime.now().isoformat(),
+            data=[
+                {
+                    "date": r.date.isoformat() if r.date else None,
+                    "sales_count": r.sales_count,
+                    "total_amount": float(r.total_amount),
+                    "average_basket": float(r.average_basket or 0)
+                }
+                for r in results
+            ]
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur récupération stats par période: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur récupération stats: {str(e)}"
+        )
+
+
+# =======================
+# Endpoint de test
+# =======================
+
 @router.get("/test", include_in_schema=False)
-async def test_sales():
+async def test_sales(
+    current_user: User = Depends(get_current_active_user)
+):
     """
     Endpoint de test
     """
     return {
         "message": "Module Ventes avec Pharmacies opérationnel",
-        "version": "3.0.0",
+        "version": "3.1.0",
+        "user": {
+            "id": str(current_user.id),
+            "email": current_user.email,
+            "role": current_user.role
+        },
         "features": [
             "Gestion complète des ventes par pharmacie",
             "Multi-pharmacies pour les admin",
             "Contrôle d'accès par pharmacie",
             "Statistiques par pharmacie",
-            "Transferts entre pharmacies",
-            "Gestion des stocks par pharmacie"
+            "Gestion des stocks par pharmacie",
+            "Communication bidirectionnelle avec le module stock",
+            "Traçabilité complète des mouvements de stock"
         ],
         "timestamp": datetime.utcnow().isoformat()
     }

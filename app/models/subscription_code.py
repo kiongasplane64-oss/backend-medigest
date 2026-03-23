@@ -41,9 +41,17 @@ class SubscriptionCode(Base):
     created_by_user = relationship("User", foreign_keys=[created_by_user_id])
     created_at = Column(DateTime, default=datetime.utcnow)
     
+    # Associations avec tenant et utilisateur (NOUVEAUX CHAMPS)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    
     # Métadonnées
     notes = Column(String(500), nullable=True)
     is_active = Column(Boolean, default=True)
+    
+    # Relations supplémentaires (NOUVELLES RELATIONS)
+    tenant = relationship("Tenant", foreign_keys=[tenant_id], backref="subscription_codes")
+    assigned_user = relationship("User", foreign_keys=[user_id], backref="assigned_codes")
     
     def is_valid(self) -> bool:
         """Vérifie si le code est encore valide"""

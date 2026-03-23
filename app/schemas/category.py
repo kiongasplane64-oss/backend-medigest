@@ -1,6 +1,6 @@
 # app/schemas/category.py
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 from uuid import UUID
 from datetime import datetime
 
@@ -34,3 +34,26 @@ class CategoryResponse(CategoryBase):
     
     class Config:
         from_attributes = True
+
+
+class CategoryListResponse(BaseModel):
+    """Réponse pour la liste des catégories"""
+    total: int
+    skip: int
+    limit: int
+    categories: List[CategoryResponse]
+    
+    class Config:
+        from_attributes = True
+
+
+class CategoryTreeResponse(CategoryResponse):
+    """Catégorie avec ses sous-catégories"""
+    children: List['CategoryTreeResponse'] = []
+    
+    class Config:
+        from_attributes = True
+
+
+# Pour résoudre la référence récursive
+CategoryTreeResponse.model_rebuild()

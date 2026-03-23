@@ -90,7 +90,7 @@ class Pharmacy(Base):
                 "thursday": True,
                 "friday": True,
                 "saturday": True,
-                "sunday": False
+                "sunday": True
             }
         },
         

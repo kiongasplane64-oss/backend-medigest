@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.security import verify_token as security_verify_token
 from app.db.session import get_db
+from app.models.branch import Branch
 from app.models.pharmacy import Pharmacy
 from app.models.tenant import Tenant
 from app.models.user import User
@@ -54,6 +55,7 @@ PERMISSION_MAP = {
         "user:view", "user:create", "user:update", "user:delete",
         "report:view", "report:export",
         "settings:view", "settings:update",
+        "branch:view", "branch:create", "branch:update", "branch:delete",
     ],
     "gerant": [
         "stock:view", "stock:create", "stock:update", "stock:adjust",
@@ -61,11 +63,13 @@ PERMISSION_MAP = {
         "pharmacy:view",
         "user:view",
         "report:view", "report:export",
+        "branch:view",
     ],
     "pharmacien": [
         "stock:view", "stock:create", "stock:update", "stock:adjust",
         "sales:view", "sales:create", "sales:cancel",
         "report:view",
+        "branch:view",
     ],
     "vendeur": [
         "stock:view",
@@ -80,6 +84,7 @@ PERMISSION_MAP = {
         "pharmacy:view",
         "user:view",
         "report:view", "report:export",
+        "branch:view",
     ],
     "technicien": [
         "stock:view", "stock:adjust",
@@ -129,13 +134,11 @@ def _get_token_from_request(request: Request) -> Optional[str]:
 
 def get_current_user(
     db: Session = Depends(get_db),
-    token: str = Depends(oauth2_scheme), # FastAPI lève déjà une 401 si absent avec oauth2_scheme
+    token: str = Depends(oauth2_scheme),
 ) -> User:
     """
     Récupère l'utilisateur courant à partir du token JWT.
     """
-    # Note : Si oauth2_scheme est utilisé, FastAPI gère l'absence de token 
-    # automatiquement. Le code ci-dessous devient une sécurité supplémentaire.
     if not token:
         logger.warning("❌ Aucun token trouvé dans les headers")
         raise HTTPException(
@@ -145,10 +148,8 @@ def get_current_user(
         )
 
     try:
-        # 1. Décodage et vérification de la signature
         payload = security_verify_token(token)
         
-        # 2. Extraction du sujet (ID utilisateur)
         user_id: str = payload.get("sub")
         if not user_id:
             logger.error("❌ Payload invalide : champ 'sub' manquant")
@@ -157,7 +158,6 @@ def get_current_user(
                 detail="Token invalide : identifiant manquant",
             )
 
-        # 3. Recherche de l'utilisateur
         user = db.query(User).filter(User.id == user_id).first()
         
         if not user:
@@ -167,16 +167,13 @@ def get_current_user(
                 detail="Utilisateur non trouvé",
             )
 
-        # 4. Vérification du statut du compte
-        if not getattr(user, "is_active", True): # Utilise le nom de champ correct (is_active ou actif)
+        if not getattr(user, "is_active", True):
             logger.warning("⚠️ Tentative de connexion sur compte désactivé : %s", user.email)
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Compte inactif",
             )
 
-        # 5. Injection des données contextuelles (Impersonation, etc.)
-        # On utilise .setattr ou l'accès direct si ces champs existent sur ton modèle
         user.is_impersonated = bool(payload.get("is_impersonation", False))
         user.impersonated_by = payload.get("impersonated_by")
         user.jwt_payload = payload
@@ -192,15 +189,14 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     except HTTPException:
-        # On laisse remonter les exceptions FastAPI (403, 404)
         raise
     except Exception as e:
-        # Capture les erreurs imprévues (ex: DB down, erreur attribut)
         logger.critical("🔥 Erreur système lors de l'authentification : %s", str(e), exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Erreur interne d'authentification",
         )
+
 
 def get_current_active_user(
     current_user: User = Depends(get_current_user),
@@ -219,7 +215,7 @@ def get_current_active_user(
             detail=f"Compte verrouillé. Réessayez dans {remaining} minutes.",
         )
 
-    if not getattr(current_user, "actif", False):
+    if not getattr(current_user, "is_active", True):
         logger.warning("⚠️ Compte désactivé: %s", getattr(current_user, "email", None))
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -402,7 +398,7 @@ async def require_active_subscription(
         return current_user
 
     sub_status = check_user_subscription(db, str(current_user.id))
-
+    
     if not sub_status.get("has_subscription", False):
         logger.warning("⚠️ Pas d'abonnement pour %s", getattr(current_user, "email", None))
         raise HTTPException(
@@ -492,6 +488,21 @@ async def check_admin_limits(
             },
         )
 
+    if action == "create_branch" and not limits.get("can_create_branch", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "branch_limit_reached",
+                "message": (
+                    f"Limite de succursales atteinte "
+                    f"({limits['current_usage']['branches']} / {limits['limits']['max_branches']})"
+                ),
+                "current": limits["current_usage"].get("branches", 0),
+                "limit": limits["limits"].get("max_branches", 0),
+                "suggestion": "Passez à un plan supérieur pour créer plus de succursales",
+            },
+        )
+
     if action and not can_user_access_feature(current_user, action):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -532,6 +543,32 @@ def can_user_access_pharmacy(
     ).first()
 
     return association is not None
+
+
+def can_user_access_branch(
+    user: User,
+    branch: Branch,
+    db: Session,
+) -> bool:
+    """
+    Vérifie si un utilisateur a accès à une succursale spécifique.
+    """
+    if _is_super_admin(user):
+        return True
+
+    if getattr(user, "role", None) == "admin":
+        return True
+
+    # Vérifier via la pharmacie parente
+    if branch.parent_pharmacy_id:
+        from app.models.user_pharmacy import UserPharmacy
+        association = db.query(UserPharmacy).filter(
+            UserPharmacy.user_id == user.id,
+            UserPharmacy.pharmacy_id == branch.parent_pharmacy_id,
+        ).first()
+        return association is not None
+
+    return False
 
 
 def get_current_pharmacy_entity(
@@ -608,6 +645,80 @@ def get_current_pharmacy_entity(
     )
 
 
+def get_current_branch_entity(
+    request: Request,
+    current_user: User = Depends(get_current_active_user),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
+    db: Session = Depends(get_db),
+) -> Optional[Branch]:
+    """
+    Retourne l'entité SQLAlchemy Branch courante.
+
+    Ordre de recherche :
+    1. header X-Branch-ID
+    2. branch_id du JWT
+    3. première succursale active de la pharmacie courante
+    """
+    header_branch_id = request.headers.get("X-Branch-ID")
+    branch_uuid = _parse_uuid(header_branch_id)
+
+    if _is_super_admin(current_user):
+        if branch_uuid:
+            return db.query(Branch).filter(
+                Branch.id == branch_uuid,
+                Branch.is_active.is_(True),
+            ).first()
+        return None
+
+    if not current_tenant:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tenant introuvable pour la succursale courante",
+        )
+
+    if not branch_uuid:
+        token = _get_token_from_request(request)
+        if token:
+            payload = _decode_token_without_verification(token)
+            branch_uuid = _parse_uuid(payload.get("branch_id"))
+
+    if branch_uuid:
+        branch = db.query(Branch).filter(
+            Branch.id == branch_uuid,
+            Branch.tenant_id == current_tenant.id,
+            Branch.is_active.is_(True),
+        ).first()
+
+        if branch:
+            if not can_user_access_branch(current_user, branch, db):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Vous n'avez pas accès à cette succursale",
+                )
+            return branch
+
+    if current_pharmacy:
+        branch = db.query(Branch).filter(
+            Branch.tenant_id == current_tenant.id,
+            Branch.parent_pharmacy_id == current_pharmacy.id,
+            Branch.is_active.is_(True),
+            Branch.is_main_branch.is_(True),
+        ).first()
+        if branch:
+            return branch
+
+        branch = db.query(Branch).filter(
+            Branch.tenant_id == current_tenant.id,
+            Branch.parent_pharmacy_id == current_pharmacy.id,
+            Branch.is_active.is_(True),
+        ).first()
+        if branch:
+            return branch
+
+    return None
+
+
 def get_current_pharmacy(
     pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
     current_user: User = Depends(get_current_active_user),
@@ -639,6 +750,39 @@ def get_current_pharmacy(
         "is_main": getattr(pharmacy, "is_main", False),
         "is_active": getattr(pharmacy, "is_active", False),
         "config": getattr(pharmacy, "config", {}) or {},
+    }
+
+
+def get_current_branch(
+    branch: Optional[Branch] = Depends(get_current_branch_entity),
+    current_user: User = Depends(get_current_active_user),
+) -> Optional[Dict[str, Any]]:
+    """
+    Retourne la succursale courante sous forme sérialisée.
+    """
+    if _is_super_admin(current_user) and branch is None:
+        return {
+            "id": None,
+            "name": "Accès super admin",
+            "is_global": True,
+            "role": current_user.role,
+        }
+
+    if not branch:
+        return None
+
+    return {
+        "id": str(branch.id),
+        "name": branch.name,
+        "code": branch.code,
+        "address": branch.address,
+        "city": branch.city,
+        "phone": branch.phone,
+        "email": branch.email,
+        "is_main_branch": branch.is_main_branch,
+        "is_active": branch.is_active,
+        "parent_pharmacy_id": str(branch.parent_pharmacy_id) if branch.parent_pharmacy_id else None,
+        "config": branch.config or {},
     }
 
 
@@ -682,6 +826,42 @@ def require_pharmacy_access(
         return current_pharmacy
 
     return pharmacy_checker
+
+
+def require_branch_access(
+    allow_admin_override: bool = True,
+    require_active: bool = True,
+):
+    """
+    Dépendance factory pour s'assurer que l'utilisateur a accès à une succursale.
+    """
+    def branch_checker(
+        current_branch: Optional[Dict[str, Any]] = Depends(get_current_branch),
+        current_user: User = Depends(get_current_active_user),
+    ) -> Dict[str, Any]:
+        if not current_branch:
+            if allow_admin_override and (getattr(current_user, "role", None) in ADMIN_OVERRIDE_ROLES):
+                return {
+                    "id": None,
+                    "name": "Accès global",
+                    "is_global": True,
+                    "role": current_user.role,
+                }
+
+            return None
+
+        if require_active and current_branch.get("is_active") is False:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": "branch_inactive",
+                    "message": "La succursale sélectionnée est inactive",
+                },
+            )
+
+        return current_branch
+
+    return branch_checker
 
 
 def get_pharmacy_or_main(
@@ -808,7 +988,6 @@ def require_permission(permission: str) -> Callable:
             permission,
         )
 
-        # Vérifier si l'utilisateur a la permission spécifique ou "*"
         if permission not in user_permissions and "*" not in user_permissions:
             logger.warning(
                 "⛔ Permission refusée - Rôle: %s, Permission requise: %s",
@@ -839,6 +1018,7 @@ def get_authenticated_context(
     current_user: User = Depends(get_current_active_user),
     current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_pharmacy: Optional[Dict[str, Any]] = Depends(get_current_pharmacy),
+    current_branch: Optional[Dict[str, Any]] = Depends(get_current_branch),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
@@ -852,6 +1032,7 @@ def get_authenticated_context(
         "user": current_user,
         "tenant": current_tenant,
         "pharmacy": current_pharmacy,
+        "branch": current_branch,
         "subscription": sub_status,
         "db": db,
     }
@@ -861,6 +1042,7 @@ def get_current_user_with_context(
     current_user: User = Depends(get_current_active_user),
     current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_pharmacy: Optional[Dict[str, Any]] = Depends(get_current_pharmacy),
+    current_branch: Optional[Dict[str, Any]] = Depends(get_current_branch),
 ) -> Dict[str, Any]:
     """
     Retourne un contexte utilisateur enrichi.
@@ -869,7 +1051,9 @@ def get_current_user_with_context(
         "user": current_user,
         "tenant": current_tenant,
         "pharmacy": current_pharmacy,
+        "branch": current_branch,
         "has_pharmacy_access": current_pharmacy is not None,
+        "has_branch_access": current_branch is not None,
         "role": getattr(current_user, "role", None),
         "is_super_admin": _is_super_admin(current_user),
     }
@@ -1002,10 +1186,14 @@ __all__ = [
     "require_active_subscription",
     "check_admin_limits",
     "get_current_pharmacy_entity",
+    "get_current_branch_entity",
     "get_current_pharmacy",
+    "get_current_branch",
     "require_pharmacy_access",
+    "require_branch_access",
     "get_pharmacy_or_main",
     "can_user_access_pharmacy",
+    "can_user_access_branch",
     "require_role",
     "require_permission",
     "get_authenticated_context",

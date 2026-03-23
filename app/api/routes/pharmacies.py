@@ -737,17 +737,10 @@ def check_service_status(
     pharmacy_id: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    current_tenant: Tenant = Depends(get_current_tenant)
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant)
 ):
     """
     Vérifie si la pharmacie est en service selon les heures configurées.
-    
-    Logique CORRIGÉE:
-    - workingHours.enabled = True -> Les restrictions sont actives
-    - daysOff = Jours OUVERTS (True = ouvert, False = fermé) - COHERENT AVEC LE FRONTEND
-    - La pharmacie est en service si:
-        * Aujourd'hui est un jour OUVERT (daysOff[aujourd'hui] = True)
-        * ET l'heure actuelle est entre startTime et endTime
     """
     # Validation de l'UUID
     try:
@@ -758,11 +751,19 @@ def check_service_status(
             detail="Format d'ID de pharmacie invalide"
         )
     
-    # Récupérer la pharmacie
-    pharmacy = db.query(Pharmacy).filter(
-        Pharmacy.id == pharmacy_id,
-        Pharmacy.tenant_id == current_tenant.id
-    ).first()
+    # Récupérer la pharmacie - super admin peut voir toutes les pharmacies
+    pharmacy_query = db.query(Pharmacy).filter(Pharmacy.id == pharmacy_id)
+    
+    # Si l'utilisateur n'est pas super admin, filtrer par tenant
+    if current_user.role not in ["super_admin", "superadmin"]:
+        if not current_tenant:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Accès non autorisé"
+            )
+        pharmacy_query = pharmacy_query.filter(Pharmacy.tenant_id == current_tenant.id)
+    
+    pharmacy = pharmacy_query.first()
     
     if not pharmacy:
         raise HTTPException(
@@ -814,26 +815,25 @@ def check_service_status(
     logger.info(f"Heure actuelle: {now_local.hour:02d}:{now_local.minute:02d} ({current_minutes} minutes)")
     
     # Récupérer la configuration des jours de service
-    # CORRECTION: daysOff: True = jour OUVERT (comme dans le frontend)
     days_off = working_hours.get("daysOff", {})
     logger.info(f"Configuration daysOff (True = OUVERT): {days_off}")
     
-    # Si days_off est vide, utiliser les valeurs par défaut (ouvert du lundi au samedi, fermé dimanche)
+    # Si days_off est vide, utiliser les valeurs par défaut
     if not days_off:
         days_off = {
-            "monday": True,    # Lundi OUVERT
-            "tuesday": True,   # Mardi OUVERT
-            "wednesday": True, # Mercredi OUVERT
-            "thursday": True,  # Jeudi OUVERT
-            "friday": True,    # Vendredi OUVERT
-            "saturday": True,  # Samedi OUVERT
-            "sunday": False    # Dimanche FERMÉ
+            "monday": True,
+            "tuesday": True,
+            "wednesday": True,
+            "thursday": True,
+            "friday": True,
+            "saturday": True,
+            "sunday": False
         }
         logger.info(f"Utilisation des valeurs par défaut: {days_off}")
     
-    # CORRECTION: Vérifier si aujourd'hui est un jour OUVERT
-    is_open_today = days_off.get(current_day, False)  # True = ouvert
-    is_working_day = is_open_today  # C'est un jour travaillé si c'est ouvert
+    # Vérifier si aujourd'hui est un jour OUVERT
+    is_open_today = days_off.get(current_day, False)
+    is_working_day = is_open_today
     
     logger.info(f"Aujourd'hui est ouvert? {is_open_today} -> Jour travaillé? {is_working_day}")
     
@@ -851,12 +851,11 @@ def check_service_status(
     except (ValueError, IndexError) as e:
         logger.error(f"Erreur format heure: {e}, utilisation valeurs par défaut")
         start_minutes = 8 * 60  # 08:00
-        end_minutes = 20 * 60    # 20:00
+        end_minutes = 20 * 60   # 20:00
         start_time_str = "08:00"
         end_time_str = "20:00"
     
     # Vérifier si l'heure actuelle est dans la plage d'ouverture
-    # Gestion du cas où l'heure de fin est après minuit (ex: 20:00 - 02:00)
     if end_minutes < start_minutes:
         # Service qui passe minuit
         if current_minutes >= start_minutes or current_minutes <= end_minutes:
@@ -870,7 +869,7 @@ def check_service_status(
         is_within_hours = start_minutes <= current_minutes <= end_minutes
         logger.info(f"Heure {current_minutes} dans plage {start_minutes}-{end_minutes}? {is_within_hours}")
     
-    # CORRECTION: Déterminer si la pharmacie est en service
+    # Déterminer si la pharmacie est en service
     in_service = is_working_day and is_within_hours
     logger.info(f"Résultat final - Jour ouvert: {is_working_day}, Dans heures: {is_within_hours} -> EN SERVICE? {in_service}")
     
@@ -907,7 +906,6 @@ def check_service_status(
         "message": "✅ En service" if in_service else "❌ Hors service",
     }
     
-    # Ajouter les informations sur le prochain service si disponible
     if next_service_info:
         response["next_service_time"] = next_service_info
     
