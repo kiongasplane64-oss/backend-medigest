@@ -20,7 +20,7 @@ from .sync_log import SyncLog
 # Gestion / Business
 # =========================
 from .client import Client
-from .product import Product
+from .product import Product, ProductStock
 from .sale import Sale
 
 from .invoice import Invoice, InvoiceItem
@@ -39,13 +39,14 @@ from .debt import Debt
 from .debt_payment import DebtPayment
 from .payment import Payment
 
-from .transfert import ProductTransfer, TransferItem, TransferStatus, TransferType
+from .transfert import ProductTransfer, TransferItem, TransferStatus, TransferType, TransferPriority
 from .stock_movement import StockMovement, InventoryCount, InventoryCountItem
 from app.models.stock_adjustment import StockAdjustment, StockAdjustmentItem
 from app.models.customer import Customer  
 from app.models.branch import Branch 
 from app.models.subscription_code import SubscriptionCode, SubscriptionCodeStatus
 from app.models.category import Category
+from app.models.user_session import UserSession
 
 __all__ = [
     # Core
@@ -93,5 +94,9 @@ __all__ = [
     "SubscriptionCodeStatus",
     "Category",
     "StockAdjustment",
-    "StockAdjustmentItem"
+    "StockAdjustmentItem",
+    "UserSession",
+    "TransferPriority",
+    "StockMovement",
+    "ProductStock"
 ]

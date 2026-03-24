@@ -52,6 +52,7 @@ class Product(Base):
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True)
     pharmacy_id = Column(UUID(as_uuid=True), ForeignKey("pharmacies.id"), nullable=False, index=True)
     branch_id = sa.Column(sa.UUID, sa.ForeignKey("branches.id"), nullable=True)
+    
     # =====================================
     # IDENTIFICATION DU PRODUIT
     # =====================================
@@ -251,10 +252,6 @@ class Product(Base):
 
     @validates("expiry_date")
     def validate_expiry_date(self, key, value):
-        """
-        Tolère une date passée sur mise à jour/import historique.
-        Si tu veux bloquer seulement à la création via API, fais-le plutôt dans le schéma Pydantic.
-        """
         return value
 
     @validates("name")
@@ -515,6 +512,7 @@ class Product(Base):
 class ProductStock(Base):
     """
     Stock par lot, pour la traçabilité.
+    Chaque lot est associé à une pharmacie spécifique.
     """
     __tablename__ = "product_stocks"
 
@@ -523,6 +521,10 @@ class ProductStock(Base):
     # =====================================
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True)
+    
+    # ✅ AJOUT CRITIQUE: pharmacy_id pour la gestion multi-pharmacies
+    pharmacy_id = Column(UUID(as_uuid=True), ForeignKey("pharmacies.id"), nullable=False, index=True)
+    
     product_id = Column(UUID(as_uuid=True), ForeignKey("products.id"), nullable=False, index=True)
 
     # =====================================
@@ -582,6 +584,7 @@ class ProductStock(Base):
     # =====================================
     product = relationship("Product", back_populates="product_stocks")
     tenant = relationship("Tenant")
+    pharmacy = relationship("Pharmacy", back_populates="product_stocks")
 
     stock_movements = relationship(
         "StockMovement",
@@ -598,6 +601,8 @@ class ProductStock(Base):
         Index("ix_product_stocks_product_status", "product_id", "status"),
         Index("ix_product_stocks_expiry_status", "expiry_date", "status"),
         Index("ix_product_stocks_tenant_active", "tenant_id", "is_active"),
+        Index("ix_product_stocks_pharmacy_product", "pharmacy_id", "product_id"),
+        Index("ix_product_stocks_pharmacy_status", "pharmacy_id", "status"),
     )
 
     # =====================================
@@ -627,6 +632,12 @@ class ProductStock(Base):
 
     @validates("expiry_date")
     def validate_expiry_date(self, key, value):
+        return value
+
+    @validates("pharmacy_id")
+    def validate_pharmacy_id(self, key, value):
+        if value is None:
+            raise ValueError("pharmacy_id est obligatoire pour ProductStock")
         return value
 
     # =====================================
@@ -758,6 +769,7 @@ class ProductStock(Base):
         return {
             "id": str(self.id),
             "tenant_id": str(self.tenant_id) if self.tenant_id else None,
+            "pharmacy_id": str(self.pharmacy_id) if self.pharmacy_id else None,
             "product_id": str(self.product_id) if self.product_id else None,
             "batch_number": self.batch_number,
             "expiry_date": self.expiry_date.isoformat() if self.expiry_date else None,
@@ -785,7 +797,7 @@ class ProductStock(Base):
         }
 
     def __repr__(self) -> str:
-        return f"<ProductStock {self.batch_number} - {self.expiry_date} (Disponible: {self.quantity_available})>"
+        return f"<ProductStock {self.batch_number} - {self.expiry_date} (Pharmacy: {self.pharmacy_id}, Disponible: {self.quantity_available})>"
 
 
 from app.models import stock_movement as _stock_movement  # noqa: E402,F401

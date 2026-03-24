@@ -213,6 +213,7 @@ class Pharmacy(Base):
     purchases = relationship("Purchase", back_populates="pharmacy", cascade="all, delete-orphan")
     customers = relationship("Customer", back_populates="pharmacy", cascade="all, delete-orphan")
     branches = relationship("Branch", back_populates="parent_pharmacy", cascade="all, delete-orphan")
+    product_stocks = relationship("ProductStock", back_populates="pharmacy", cascade="all, delete-orphan")
     
     # =========================
     # Validations

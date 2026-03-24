@@ -48,20 +48,27 @@ class InventoryService:
         # Récupérer le produit
         product = self.db.query(Product).filter(
             Product.id == product_id,
-            Product.tenant_id == self.tenant_id
+            Product.tenant_id == self.tenant_id,
+            Product.pharmacy_id == pharmacy_id
         ).first()
         
         if not product:
-            raise ValueError(f"Produit {product_id} non trouvé")
+            raise ValueError(f"Produit {product_id} non trouvé dans cette pharmacie")
         
-        # Récupérer le stock actuel
-        stock = self.db.query(ProductStock).filter(
+        # Récupérer le stock actuel (par lot si batch_number fourni, sinon premier disponible)
+        stock_query = self.db.query(ProductStock).filter(
             ProductStock.product_id == product_id,
             ProductStock.pharmacy_id == pharmacy_id,
-            ProductStock.tenant_id == self.tenant_id
-        ).first()
+            ProductStock.tenant_id == self.tenant_id,
+            ProductStock.is_active == True
+        )
         
-        quantity_before = Decimal(str(stock.quantity)) if stock else Decimal('0')
+        if batch_number:
+            stock_query = stock_query.filter(ProductStock.batch_number == batch_number)
+        
+        stock = stock_query.order_by(ProductStock.expiry_date).first()
+        
+        quantity_before = Decimal(str(stock.quantity_available)) if stock else Decimal('0')
         quantity_after = quantity_before + quantity_change
         
         # S'assurer que le stock ne devient pas négatif
@@ -73,53 +80,65 @@ class InventoryService:
         
         # Créer ou mettre à jour le stock
         if stock:
-            stock.quantity = quantity_after
+            stock.quantity_available = int(quantity_after)
             stock.updated_at = datetime.utcnow()
-            if user_id:
-                stock.updated_by = user_id
+            
+            # Mettre à jour les compteurs selon le type de mouvement
+            if reason == "vente":
+                stock.quantity_sold += abs(int(quantity_change))
+            elif reason == "perte":
+                stock.quantity_lost += abs(int(quantity_change))
+            elif reason == "avarie":
+                stock.quantity_damaged += abs(int(quantity_change))
+            
+            stock.update_status()
         else:
+            # Créer un nouveau lot
             stock = ProductStock(
                 tenant_id=self.tenant_id,
                 product_id=product_id,
                 pharmacy_id=pharmacy_id,
-                quantity=quantity_after,
-                created_at=datetime.utcnow(),
-                created_by=user_id
+                batch_number=batch_number or f"BATCH-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
+                expiry_date=product.expiry_date or date.today() + timedelta(days=365),
+                quantity_received=int(quantity_after),
+                quantity_available=int(quantity_after),
+                quantity_reserved=0,
+                quantity_sold=0,
+                quantity_lost=0,
+                quantity_damaged=0,
+                cost_price=cost_price or product.purchase_price,
+                created_at=datetime.utcnow()
             )
             self.db.add(stock)
         
         # Déterminer le type de mouvement
-        if reason == "vente":
-            movement_type = "sale"
-        elif reason == "annulation_vente":
-            movement_type = "sale_cancellation"
-        elif reason == "achat":
-            movement_type = "purchase"
-        elif reason == "retour":
-            movement_type = "return"
-        elif reason == "transfert":
-            movement_type = "transfer"
-        elif reason == "inventaire":
-            movement_type = "inventory_count"
-        elif reason == "perte":
-            movement_type = "loss"
-        else:
-            movement_type = "adjustment"
+        movement_type_map = {
+            "vente": "sale",
+            "annulation_vente": "sale_cancellation",
+            "achat": "purchase",
+            "retour": "return",
+            "transfert": "transfer",
+            "inventaire": "inventory_count",
+            "perte": "loss",
+            "avarie": "damage"
+        }
+        movement_type = movement_type_map.get(reason, "adjustment")
         
         # Créer le mouvement de stock
         movement = StockMovement(
             tenant_id=self.tenant_id,
             pharmacy_id=pharmacy_id,
             product_id=product_id,
+            product_stock_id=stock.id,
             product_name=product.name,
             product_code=product.code,
-            quantity_before=quantity_before,
-            quantity_after=quantity_after,
-            quantity_change=quantity_change,
+            quantity_before=int(quantity_before),
+            quantity_after=int(quantity_after),
+            quantity_change=int(quantity_change),
             movement_type=movement_type,
             reason=reason,
             reference=reference,
-            batch_number=batch_number,
+            batch_number=batch_number or stock.batch_number,
             cost_price=cost_price or product.purchase_price,
             selling_price=selling_price or product.selling_price,
             sale_id=sale_id,
@@ -131,19 +150,26 @@ class InventoryService:
         self.db.add(movement)
         self.db.flush()
         
-        # Mettre à jour les compteurs du produit
+        # Mettre à jour les compteurs du produit principal
         if reason == "vente":
-            product.total_sold = (product.total_sold or 0) + abs(quantity_change)
+            product.total_sold = (product.total_sold or 0) + abs(int(quantity_change))
             product.last_sale_date = datetime.utcnow().date()
+            # Mettre à jour la quantité du produit
+            product.quantity = max(0, (product.quantity or 0) - abs(int(quantity_change)))
         elif reason == "achat":
-            product.total_purchased = (product.total_purchased or 0) + abs(quantity_change)
+            product.total_purchased = (product.total_purchased or 0) + abs(int(quantity_change))
             product.last_purchase_date = datetime.utcnow().date()
+            # Mettre à jour la quantité du produit
+            product.quantity = (product.quantity or 0) + abs(int(quantity_change))
+        
+        product.sync_quantities()
+        product.refresh_statuses()
         
         self.db.commit()
         
         logger.info(
             f"Stock mis à jour: {product.code} - {quantity_before} -> {quantity_after} "
-            f"(variation: {quantity_change}) - Raison: {reason}"
+            f"(variation: {quantity_change}) - Raison: {reason} - Pharmacie: {pharmacy_id}"
         )
         
         return movement
@@ -161,7 +187,8 @@ class InventoryService:
         """
         product = self.db.query(Product).filter(
             Product.id == product_id,
-            Product.tenant_id == self.tenant_id
+            Product.tenant_id == self.tenant_id,
+            Product.pharmacy_id == pharmacy_id
         ).first()
         
         if not product:
@@ -171,28 +198,25 @@ class InventoryService:
                 "product_id": str(product_id)
             }
         
-        stock = self.db.query(ProductStock).filter(
+        # Récupérer le stock total par lots
+        stocks = self.db.query(ProductStock).filter(
             ProductStock.product_id == product_id,
             ProductStock.pharmacy_id == pharmacy_id,
-            ProductStock.tenant_id == self.tenant_id
-        ).first()
+            ProductStock.tenant_id == self.tenant_id,
+            ProductStock.is_active == True,
+            ProductStock.status.in_(["available", "reserved"])
+        ).all()
         
-        available_quantity = stock.quantity if stock else 0
+        total_available = sum(s.quantity_available for s in stocks)
+        total_reserved = sum(s.quantity_reserved for s in stocks)
+        
+        available_quantity = total_available
         
         if include_reserved:
-            # Calculer les quantités réservées (ventes en cours)
-            reserved = self.db.query(
-                func.coalesce(func.sum(SaleItem.quantity), 0)
-            ).join(Sale).filter(
-                SaleItem.product_id == product_id,
-                SaleItem.tenant_id == self.tenant_id,
-                Sale.pharmacy_id == pharmacy_id,
-                Sale.status == "pending"
-            ).scalar() or 0
-            
-            available_quantity -= reserved
+            # Les réservations sont déjà dans les stocks, donc available = disponible - réservé
+            available_quantity = total_available
         
-        is_available = available_quantity >= quantity
+        is_available = available_quantity >= int(quantity)
         
         details = {
             "available": is_available,
@@ -201,8 +225,18 @@ class InventoryService:
             "product_code": product.code,
             "requested_quantity": float(quantity),
             "available_quantity": float(available_quantity),
-            "current_stock": float(stock.quantity) if stock else 0,
-            "unit": product.unit
+            "current_stock": float(total_available),
+            "reserved_quantity": float(total_reserved),
+            "unit": product.unit,
+            "lots": [
+                {
+                    "batch_number": s.batch_number,
+                    "expiry_date": s.expiry_date.isoformat(),
+                    "available": s.quantity_available,
+                    "reserved": s.quantity_reserved
+                }
+                for s in stocks
+            ]
         }
         
         if not is_available:
@@ -229,18 +263,55 @@ class InventoryService:
         if not product:
             return False
         
-        stock = self.db.query(ProductStock).filter(
+        # Récupérer les lots disponibles (FIFO)
+        stocks = self.db.query(ProductStock).filter(
             ProductStock.product_id == product_id,
             ProductStock.pharmacy_id == pharmacy_id,
-            ProductStock.tenant_id == self.tenant_id
-        ).first()
+            ProductStock.tenant_id == self.tenant_id,
+            ProductStock.is_active == True,
+            ProductStock.status == "available",
+            ProductStock.quantity_available > 0
+        ).order_by(ProductStock.expiry_date).all()
         
-        if not stock or stock.quantity < quantity:
+        remaining = int(quantity)
+        
+        for stock in stocks:
+            if remaining <= 0:
+                break
+            
+            available = stock.quantity_available
+            to_reserve = min(available, remaining)
+            
+            stock.reserve(to_reserve)
+            remaining -= to_reserve
+            
+            # Enregistrer le mouvement de réservation
+            movement = StockMovement(
+                tenant_id=self.tenant_id,
+                pharmacy_id=pharmacy_id,
+                product_id=product_id,
+                product_stock_id=stock.id,
+                product_name=product.name,
+                product_code=product.code,
+                quantity_before=available,
+                quantity_after=available - to_reserve,
+                quantity_change=-to_reserve,
+                movement_type="reservation",
+                reason="réservation_vente",
+                reference=str(sale_item_id),
+                batch_number=stock.batch_number,
+                sale_item_id=sale_item_id,
+                created_at=datetime.utcnow()
+            )
+            self.db.add(movement)
+        
+        if remaining > 0:
+            self.db.rollback()
             return False
         
-        # Stock réservé (champ à ajouter au modèle ProductStock)
-        stock.reserved_quantity = (stock.reserved_quantity or 0) + quantity
-        stock.updated_at = datetime.utcnow()
+        # Mettre à jour la quantité réservée du produit
+        product.reserved_quantity = (product.reserved_quantity or 0) + int(quantity)
+        product.sync_quantities()
         
         self.db.commit()
         
@@ -266,17 +337,35 @@ class InventoryService:
         if not product:
             return False
         
-        stock = self.db.query(ProductStock).filter(
+        # Récupérer les lots réservés
+        stocks = self.db.query(ProductStock).filter(
             ProductStock.product_id == product_id,
             ProductStock.pharmacy_id == pharmacy_id,
-            ProductStock.tenant_id == self.tenant_id
-        ).first()
+            ProductStock.tenant_id == self.tenant_id,
+            ProductStock.is_active == True,
+            ProductStock.status == "reserved",
+            ProductStock.quantity_reserved > 0
+        ).order_by(ProductStock.expiry_date).all()
         
-        if not stock:
+        remaining = int(quantity)
+        
+        for stock in stocks:
+            if remaining <= 0:
+                break
+            
+            reserved = stock.quantity_reserved
+            to_release = min(reserved, remaining)
+            
+            stock.release_reservation(to_release)
+            remaining -= to_release
+        
+        if remaining > 0:
+            self.db.rollback()
             return False
         
-        stock.reserved_quantity = max(0, (stock.reserved_quantity or 0) - quantity)
-        stock.updated_at = datetime.utcnow()
+        # Mettre à jour la quantité réservée du produit
+        product.reserved_quantity = max(0, (product.reserved_quantity or 0) - int(quantity))
+        product.sync_quantities()
         
         self.db.commit()
         
@@ -296,27 +385,29 @@ class InventoryService:
         """
         Récupère les produits en rupture ou stock critique
         """
-        query = self.db.query(Product, ProductStock).outerjoin(
-            ProductStock,
-            and_(
-                Product.id == ProductStock.product_id,
-                Product.tenant_id == ProductStock.tenant_id,
-                ProductStock.pharmacy_id == pharmacy_id if pharmacy_id else True
-            )
-        ).filter(
+        # Requête sur les produits avec leur stock
+        query = self.db.query(Product).filter(
             Product.tenant_id == self.tenant_id,
             Product.is_active == True
         )
         
         if pharmacy_id:
-            query = query.filter(ProductStock.pharmacy_id == pharmacy_id)
+            query = query.filter(Product.pharmacy_id == pharmacy_id)
         
-        results = query.all()
+        products = query.all()
         
         low_stock = []
-        for product, stock in results:
-            current_stock = stock.quantity if stock else 0
-            reserved = stock.reserved_quantity if stock else 0
+        for product in products:
+            # Calculer le stock total disponible
+            stocks = self.db.query(ProductStock).filter(
+                ProductStock.product_id == product.id,
+                ProductStock.pharmacy_id == product.pharmacy_id,
+                ProductStock.tenant_id == self.tenant_id,
+                ProductStock.is_active == True
+            ).all()
+            
+            current_stock = sum(s.quantity_available for s in stocks)
+            reserved = sum(s.quantity_reserved for s in stocks)
             available = current_stock - reserved
             
             if available <= 0:
@@ -356,33 +447,30 @@ class InventoryService:
         """
         Récupère les produits qui vont bientôt expirer
         """
-        expiry_date = datetime.utcnow().date() + timedelta(days=days)
+        expiry_limit = datetime.utcnow().date() + timedelta(days=days)
         
-        query = self.db.query(Product, ProductStock).outerjoin(
-            ProductStock,
-            and_(
-                Product.id == ProductStock.product_id,
-                Product.tenant_id == ProductStock.tenant_id,
-                ProductStock.pharmacy_id == pharmacy_id if pharmacy_id else True
-            )
-        ).filter(
-            Product.tenant_id == self.tenant_id,
-            Product.is_active == True,
-            Product.expiry_date != None,
-            Product.expiry_date <= expiry_date
-        ).order_by(Product.expiry_date)
+        # Requête sur les lots qui expirent bientôt
+        query = self.db.query(ProductStock).filter(
+            ProductStock.tenant_id == self.tenant_id,
+            ProductStock.is_active == True,
+            ProductStock.expiry_date <= expiry_limit,
+            ProductStock.quantity_available > 0
+        ).order_by(ProductStock.expiry_date)
         
         if pharmacy_id:
             query = query.filter(ProductStock.pharmacy_id == pharmacy_id)
         
-        results = query.all()
+        stocks = query.all()
         
         expiring = []
         today = datetime.utcnow().date()
         
-        for product, stock in results:
-            days_remaining = (product.expiry_date - today).days
-            current_stock = stock.quantity if stock else 0
+        for stock in stocks:
+            product = stock.product
+            if not product:
+                continue
+                
+            days_remaining = (stock.expiry_date - today).days
             
             if days_remaining < 0:
                 status = "expired"
@@ -402,12 +490,13 @@ class InventoryService:
                 "product_id": str(product.id),
                 "product_name": product.name,
                 "product_code": product.code,
-                "current_stock": float(current_stock),
-                "expiry_date": product.expiry_date,
+                "current_stock": float(stock.quantity_available),
+                "expiry_date": stock.expiry_date,
                 "days_remaining": days_remaining,
                 "status": status,
                 "alert_level": alert_level,
-                "batch_number": product.batch_number
+                "batch_number": stock.batch_number,
+                "location": stock.location
             })
         
         return expiring
@@ -419,39 +508,51 @@ class InventoryService:
     ) -> Dict[str, Any]:
         """
         Calcule la valeur totale du stock
+        valuation_method: "purchase", "selling", "average"
         """
-        query = self.db.query(Product, ProductStock).join(
-            ProductStock,
-            and_(
-                Product.id == ProductStock.product_id,
-                Product.tenant_id == ProductStock.tenant_id,
-                ProductStock.pharmacy_id == pharmacy_id if pharmacy_id else True
-            )
-        ).filter(
+        # Requête sur les produits
+        product_query = self.db.query(Product).filter(
             Product.tenant_id == self.tenant_id,
             Product.is_active == True
         )
         
         if pharmacy_id:
-            query = query.filter(ProductStock.pharmacy_id == pharmacy_id)
+            product_query = product_query.filter(Product.pharmacy_id == pharmacy_id)
         
-        results = query.all()
+        products = product_query.all()
         
         total_purchase = Decimal('0')
         total_selling = Decimal('0')
         total_margin = Decimal('0')
         product_details = []
         
-        for product, stock in results:
-            quantity = stock.quantity if stock else 0
-            reserved = stock.reserved_quantity if stock else 0
+        for product in products:
+            # Récupérer le stock total pour ce produit
+            stocks = self.db.query(ProductStock).filter(
+                ProductStock.product_id == product.id,
+                ProductStock.pharmacy_id == product.pharmacy_id,
+                ProductStock.tenant_id == self.tenant_id,
+                ProductStock.is_active == True
+            ).all()
+            
+            quantity = sum(s.quantity_available for s in stocks)
+            reserved = sum(s.quantity_reserved for s in stocks)
             available = quantity - reserved
             
-            purchase_price = product.purchase_price or Decimal('0')
-            selling_price = product.selling_price or Decimal('0')
+            if quantity == 0:
+                continue
             
-            purchase_value = purchase_price * quantity
-            selling_value = selling_price * quantity
+            # Calculer la valeur selon la méthode choisie
+            if valuation_method == "purchase":
+                unit_price = product.purchase_price or Decimal('0')
+            elif valuation_method == "selling":
+                unit_price = product.selling_price or Decimal('0')
+            else:  # average
+                total_cost = sum(s.cost_price * s.quantity_available for s in stocks)
+                unit_price = total_cost / quantity if quantity > 0 else Decimal('0')
+            
+            purchase_value = (product.purchase_price or Decimal('0')) * quantity
+            selling_value = (product.selling_price or Decimal('0')) * quantity
             margin_value = selling_value - purchase_value
             
             total_purchase += purchase_value
@@ -465,10 +566,10 @@ class InventoryService:
                 "quantity": float(quantity),
                 "reserved": float(reserved),
                 "available": float(available),
-                "purchase_price": float(purchase_price),
-                "selling_price": float(selling_price),
-                "purchase_value": float(purchase_value),
-                "selling_value": float(selling_value),
+                "unit_price": float(unit_price),
+                "purchase_price": float(product.purchase_price or 0),
+                "selling_price": float(product.selling_price or 0),
+                "value": float(unit_price * quantity),
                 "margin": float(margin_value)
             })
         
@@ -480,7 +581,8 @@ class InventoryService:
             "potential_margin": float(total_margin),
             "margin_percentage": float(margin_percentage),
             "product_count": len(product_details),
-            "products": product_details[:20]  # Limiter pour la performance
+            "valuation_method": valuation_method,
+            "products": product_details[:20]
         }
     
     # ============================================
@@ -540,11 +642,14 @@ class InventoryService:
         impacts = []
         for row in results:
             # Récupérer le stock actuel
-            stock = self.db.query(ProductStock).filter(
+            stocks = self.db.query(ProductStock).filter(
                 ProductStock.product_id == row.product_id,
                 ProductStock.pharmacy_id == pharmacy_id if pharmacy_id else True,
-                ProductStock.tenant_id == self.tenant_id
-            ).first()
+                ProductStock.tenant_id == self.tenant_id,
+                ProductStock.is_active == True
+            ).all()
+            
+            current_stock = sum(s.quantity_available for s in stocks)
             
             impacts.append({
                 "product_id": str(row.product_id),
@@ -555,7 +660,7 @@ class InventoryService:
                 "total_revenue": float(row.total_revenue),
                 "sale_count": int(row.sale_count),
                 "average_price": float(row.average_price),
-                "current_stock": float(stock.quantity) if stock else 0,
+                "current_stock": float(current_stock),
                 "stock_impact": -int(row.total_sold)
             })
         
@@ -571,7 +676,7 @@ class InventoryService:
         movements = self.db.query(StockMovement).filter(
             StockMovement.sale_id == sale_id,
             StockMovement.tenant_id == self.tenant_id,
-            StockMovement.movement_type == "sale"
+            StockMovement.movement_type.in_(["sale", "sale_cancellation"])
         ).order_by(StockMovement.created_at).all()
         
         return movements
@@ -626,16 +731,21 @@ class InventoryService:
         }
         
         # Stock actuel
-        stock_query = self.db.query(ProductStock).filter(
-            ProductStock.tenant_id == self.tenant_id
+        stock_query = self.db.query(
+            ProductStock.product_id,
+            func.sum(ProductStock.quantity_available).label("total_stock")
+        ).filter(
+            ProductStock.tenant_id == self.tenant_id,
+            ProductStock.is_active == True
         )
         
         if pharmacy_id:
             stock_query = stock_query.filter(ProductStock.pharmacy_id == pharmacy_id)
         
-        stock_by_product = {}
-        for stock in stock_query.all():
-            stock_by_product[str(stock.product_id)] = float(stock.quantity)
+        stock_by_product = {
+            str(row.product_id): float(row.total_stock)
+            for row in stock_query.group_by(ProductStock.product_id).all()
+        }
         
         # Calculer les taux
         results = []
@@ -756,6 +866,8 @@ class InventoryService:
                 critical_alerts.append({
                     "type": "low_stock",
                     "product": item["product_name"],
+                    "product_id": item["product_id"],
+                    "product_code": item["product_code"],
                     "message": f"Rupture de stock: {item['product_name']}",
                     "details": item
                 })
@@ -763,7 +875,9 @@ class InventoryService:
                 warning_alerts.append({
                     "type": "low_stock",
                     "product": item["product_name"],
-                    "message": f"Stock bas: {item['product_name']} (plus que {item['available']})",
+                    "product_id": item["product_id"],
+                    "product_code": item["product_code"],
+                    "message": f"Stock bas: {item['product_name']} (plus que {item['available']} {item.get('unit', 'unités')})",
                     "details": item
                 })
         
@@ -772,14 +886,18 @@ class InventoryService:
                 critical_alerts.append({
                     "type": "expiry",
                     "product": item["product_name"],
-                    "message": f"Produit expiré ou critique: {item['product_name']}",
+                    "product_id": item["product_id"],
+                    "product_code": item["product_code"],
+                    "message": f"Produit expiré ou critique: {item['product_name']} (lot: {item['batch_number']})",
                     "details": item
                 })
             elif item["alert_level"] == "medium":
                 warning_alerts.append({
                     "type": "expiry",
                     "product": item["product_name"],
-                    "message": f"Produit expire dans {item['days_remaining']} jours: {item['product_name']}",
+                    "product_id": item["product_id"],
+                    "product_code": item["product_code"],
+                    "message": f"Produit expire dans {item['days_remaining']} jours: {item['product_name']} (lot: {item['batch_number']})",
                     "details": item
                 })
         
@@ -831,26 +949,35 @@ class InventoryService:
             }
         
         # Récupérer les stocks actuels
-        stock_query = self.db.query(ProductStock).filter(
-            ProductStock.tenant_id == self.tenant_id
+        stock_query = self.db.query(
+            ProductStock.product_id,
+            func.sum(ProductStock.quantity_available).label("total_available"),
+            func.sum(ProductStock.quantity_reserved).label("total_reserved")
+        ).filter(
+            ProductStock.tenant_id == self.tenant_id,
+            ProductStock.is_active == True
         )
         
         if pharmacy_id:
             stock_query = stock_query.filter(ProductStock.pharmacy_id == pharmacy_id)
         
-        stock_by_product = {
-            str(stock.product_id): {
-                "quantity": float(stock.quantity),
-                "reserved": float(stock.reserved_quantity or 0)
+        stock_by_product = {}
+        for row in stock_query.group_by(ProductStock.product_id).all():
+            stock_by_product[str(row.product_id)] = {
+                "quantity": float(row.total_available),
+                "reserved": float(row.total_reserved or 0)
             }
-            for stock in stock_query.all()
-        }
         
         # Récupérer les produits
-        products = self.db.query(Product).filter(
+        product_query = self.db.query(Product).filter(
             Product.tenant_id == self.tenant_id,
             Product.is_active == True
-        ).all()
+        )
+        
+        if pharmacy_id:
+            product_query = product_query.filter(Product.pharmacy_id == pharmacy_id)
+        
+        products = product_query.all()
         
         suggestions = []
         
@@ -865,14 +992,14 @@ class InventoryService:
             available = current_stock - reserved
             
             # Calculer le stock de sécurité
-            lead_time_days = product.lead_time_days or 7
+            lead_time_days = getattr(product, "lead_time_days", 7) or 7
             safety_stock = avg_daily * lead_time_days
             reorder_point = safety_stock
             
             # Calculer la quantité à commander
             if available < reorder_point:
                 recommended_qty = max(
-                    product.minimum_order_quantity or 0,
+                    getattr(product, "minimum_order_quantity", 0) or 0,
                     safety_stock * 2 - available
                 )
                 
@@ -888,10 +1015,46 @@ class InventoryService:
                     "reorder_point": round(reorder_point, 2),
                     "recommended_quantity": max(0, round(recommended_qty)),
                     "priority": "high" if available < reorder_point / 2 else "medium",
-                    "supplier": product.main_supplier
+                    "supplier": getattr(product, "main_supplier", None)
                 })
         
         # Trier par priorité
         suggestions.sort(key=lambda x: 0 if x["priority"] == "high" else 1)
         
         return suggestions
+    
+    # ============================================
+    # GESTION DES LOTS
+    # ============================================
+    
+    def get_product_lots(
+        self,
+        product_id: UUID,
+        pharmacy_id: UUID
+    ) -> List[Dict[str, Any]]:
+        """
+        Récupère tous les lots d'un produit dans une pharmacie
+        """
+        stocks = self.db.query(ProductStock).filter(
+            ProductStock.product_id == product_id,
+            ProductStock.pharmacy_id == pharmacy_id,
+            ProductStock.tenant_id == self.tenant_id
+        ).order_by(ProductStock.expiry_date).all()
+        
+        return [stock.to_dict() for stock in stocks]
+    
+    def get_lot_by_batch(
+        self,
+        batch_number: str,
+        pharmacy_id: UUID
+    ) -> Optional[ProductStock]:
+        """
+        Récupère un lot par son numéro de lot
+        """
+        stock = self.db.query(ProductStock).filter(
+            ProductStock.batch_number == batch_number,
+            ProductStock.pharmacy_id == pharmacy_id,
+            ProductStock.tenant_id == self.tenant_id
+        ).first()
+        
+        return stock

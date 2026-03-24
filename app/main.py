@@ -28,6 +28,7 @@ from app.api.v1 import users
 from app.api.v1.categories import router as categories_router
 from app.api.v1 import session
 from app.api.v1.sync import router as sync_router
+from app.api.v1.dashboard import router as dashboard_router
 
 
 
@@ -225,6 +226,7 @@ include_router_auto(app, subscription_codes_router)
 include_router_auto(app, categories_router)
 app.include_router(session.router, prefix="/api/v1")
 app.include_router(sync_router, prefix="/api/v1", tags=["Synchronization"])
+include_router_auto(app, dashboard_router)
 
 
 # ============================================================================

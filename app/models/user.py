@@ -76,6 +76,7 @@ class User(Base):
     costs_created = relationship("Cost", foreign_keys="Cost.created_by", back_populates="creator", lazy="noload")
     costs_approved = relationship("Cost", foreign_keys="Cost.approved_by", back_populates="approver", lazy="noload")
     budgets_owned = relationship("Budget", foreign_keys="Budget.owner_id", back_populates="owner", lazy="noload")
+    sessions = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
     
     processed_debt_payments = relationship(
         "DebtPayment", 

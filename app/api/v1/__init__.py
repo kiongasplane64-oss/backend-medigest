@@ -12,6 +12,7 @@ from app.api.v1.subscription_codes import router as subscription_codes_router
 from app.api.v1 import sales, categories
 from app.api.routes import pharmacies
 from app.api.v1.sync import router as sync_router
+from app.api.v1.dashboard import router as dashboard_router
 
 api_router = APIRouter()
 
@@ -30,3 +31,4 @@ api_router.include_router(sales.router, prefix="/sales", tags=["Sales"])
 api_router.include_router(categories.router, prefix="/categories", tags=["Categories"])
 api_router.include_router(pharmacies.router, prefix="/pharmacies", tags=["Pharmacies"])
 api_router.include_router(sync_router, prefix="/sync", tags=["Synchronization"]) 
+api_router.include_router(dashboard_router, prefix="/dashboard",tags=["Dashboard"])
