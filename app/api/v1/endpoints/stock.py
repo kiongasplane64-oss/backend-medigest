@@ -953,6 +953,7 @@ async def create_product(
         product.refresh_statuses()
         
         db.add(product)
+        db.flush()
         
         # Créer un mouvement de stock initial
         if product.quantity > 0:

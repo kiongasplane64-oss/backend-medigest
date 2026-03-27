@@ -35,4 +35,4 @@ api_router.include_router(pharmacies.router, prefix="/pharmacies", tags=["Pharma
 api_router.include_router(sync_router, prefix="/sync", tags=["Synchronization"]) 
 api_router.include_router(dashboard_router, prefix="/dashboard",tags=["Dashboard"])
 api_router.include_router(orders.router, prefix="/orders", tags=["Orders"])
-api_router.include_router(transfers_router, prefix="/transfers", tags=["transfers"])
+api_router.include_router(transfers_router, prefix="/transfers", tags=["Transfers"])

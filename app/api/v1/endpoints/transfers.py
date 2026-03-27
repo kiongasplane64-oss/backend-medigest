@@ -1,7 +1,8 @@
-# app/api/v1/transfers.py
+# app/api/v1/endpoints/transfers.py
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
@@ -33,7 +34,91 @@ from app.schemas.transfer import (
 )
 from app.services.transfer_service import TransferService
 
-router = APIRouter()
+# Configuration du logger
+logger = logging.getLogger(__name__)
+
+# Routeur avec préfixe explicite pour éviter les conflits
+router = APIRouter(prefix="/transfers", tags=["Transfers"])
+
+
+# ============================================================================
+# FONCTIONS UTILITAIRES (helpers)
+# ============================================================================
+
+def _get_current_user_pharmacy_id(current_user: User) -> Optional[UUID]:
+    """
+    Retourne l'ID de la pharmacie principale de l'utilisateur.
+    """
+    try:
+        # Vérifier si l'utilisateur a un attribut pharmacy_id
+        if hasattr(current_user, 'pharmacy_id') and current_user.pharmacy_id:
+            logger.debug(f"Utilisation pharmacy_id direct: {current_user.pharmacy_id}")
+            return current_user.pharmacy_id
+        
+        # Essayer la méthode get_primary_pharmacy
+        if hasattr(current_user, 'get_primary_pharmacy'):
+            primary_pharmacy = current_user.get_primary_pharmacy()
+            if primary_pharmacy and hasattr(primary_pharmacy, 'id'):
+                logger.debug(f"Utilisation get_primary_pharmacy: {primary_pharmacy.id}")
+                return primary_pharmacy.id
+        
+        # Pour les admins, retourner None pour permettre l'accès à toutes les pharmacies
+        if hasattr(current_user, 'role') and current_user.role in ['admin', 'super_admin']:
+            logger.info(f"Admin {current_user.email} - accès toutes pharmacies")
+            return None
+        
+        logger.error(f"Aucune pharmacie trouvée pour l'utilisateur {current_user.email}")
+        return None
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération de la pharmacie: {e}")
+        return None
+
+
+def _is_super_admin(user: User) -> bool:
+    """
+    Vérifie si l'utilisateur est super admin.
+    """
+    is_admin = bool(getattr(user, "is_super_admin", False)) or getattr(user, "role", "") in ['admin', 'super_admin']
+    if is_admin:
+        logger.debug(f"Utilisateur {user.email} est admin")
+    return is_admin
+
+
+def _validate_pharmacy_access(
+    current_user: User,
+    tenant_id: UUID,
+    requested_pharmacy_id: Optional[UUID],
+) -> Optional[UUID]:
+    """
+    Détermine la pharmacie à utiliser et vérifie les droits d'accès.
+    """
+    user_pharmacy_id = _get_current_user_pharmacy_id(current_user)
+    
+    # Si l'utilisateur n'a pas de pharmacie assignée (admin) et qu'aucune pharmacie n'est demandée
+    if user_pharmacy_id is None and requested_pharmacy_id is None:
+        if _is_super_admin(current_user):
+            logger.info(f"Admin {current_user.email} - pas de pharmacie spécifiée")
+            return None
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Aucune pharmacie associée à l'utilisateur et aucune pharmacie spécifiée",
+        )
+    
+    # Utiliser la pharmacie demandée ou celle de l'utilisateur
+    query_pharmacy_id = requested_pharmacy_id or user_pharmacy_id
+    
+    # Vérifier les droits d'accès
+    if requested_pharmacy_id and user_pharmacy_id and requested_pharmacy_id != user_pharmacy_id:
+        if not _is_super_admin(current_user):
+            logger.warning(f"Accès refusé pour {current_user.email} à la pharmacie {requested_pharmacy_id}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Vous n'avez pas accès aux transferts de cette pharmacie",
+            )
+        logger.info(f"Admin {current_user.email} accède à la pharmacie {requested_pharmacy_id}")
+    
+    logger.debug(f"Pharmacie validée pour {current_user.email}: {query_pharmacy_id}")
+    return query_pharmacy_id
 
 
 # ============================================================================
@@ -51,9 +136,15 @@ def get_pending_transfers(
     """
     Récupère les transferts en attente pour une pharmacie.
     """
+    logger.info(f"📋 GET /transfers/pending - Utilisateur: {current_user.email}")
+    
     query_pharmacy_id = _validate_pharmacy_access(
         current_user, current_tenant.id, pharmacy_id
     )
+    
+    if query_pharmacy_id is None:
+        logger.warning("Aucune pharmacie spécifiée pour les transferts en attente")
+        return []
 
     transfers = (
         db.query(ProductTransfer)
@@ -71,7 +162,8 @@ def get_pending_transfers(
         .order_by(desc(ProductTransfer.created_at))
         .all()
     )
-
+    
+    logger.info(f"📋 {len(transfers)} transferts en attente trouvés")
     return transfers
 
 
@@ -86,9 +178,23 @@ def get_transfer_statistics(
     """
     Récupère les statistiques des transferts.
     """
+    logger.info(f"📊 GET /transfers/statistics/summary - Utilisateur: {current_user.email}")
+    
     query_pharmacy_id = _validate_pharmacy_access(
         current_user, current_tenant.id, pharmacy_id
     )
+    
+    # Si pas de pharmacie spécifiée (admin), retourner des stats vides ou globales
+    if query_pharmacy_id is None:
+        logger.info("Admin - retour des statistiques globales")
+        return TransferStatistics(
+            pending_incoming=0,
+            pending_outgoing=0,
+            in_transit_incoming=0,
+            in_transit_outgoing=0,
+            completed_this_month=0,
+            total_value_transferred_sum=0.0,
+        )
 
     incoming = db.query(ProductTransfer).filter(
         ProductTransfer.tenant_id == current_tenant.id,
@@ -115,7 +221,7 @@ def get_transfer_statistics(
         if value is not None:
             total_value_transferred_sum += float(value)
 
-    return TransferStatistics(
+    stats = TransferStatistics(
         pending_incoming=incoming.filter(
             ProductTransfer.status == TransferStatus.PENDING
         ).count(),
@@ -141,6 +247,9 @@ def get_transfer_statistics(
         ).count(),
         total_value_transferred_sum=total_value_transferred_sum,
     )
+    
+    logger.info(f"📊 Statistiques calculées: {stats.dict()}")
+    return stats
 
 
 # ============================================================================
@@ -181,29 +290,41 @@ def get_transfers(
     """
     Récupère la liste des transferts.
     """
+    logger.info(f"📋 GET /transfers/ - Utilisateur: {current_user.email}, direction: {direction}")
+    
     query_pharmacy_id = _validate_pharmacy_access(
         current_user, current_tenant.id, pharmacy_id
     )
-
+    
     query = db.query(ProductTransfer).filter(
         ProductTransfer.tenant_id == current_tenant.id
     )
 
-    # Filtre par direction
-    if direction == "incoming":
-        query = query.filter(
-            ProductTransfer.destination_pharmacy_id == query_pharmacy_id
-        )
-    elif direction == "outgoing":
-        query = query.filter(
-            ProductTransfer.source_pharmacy_id == query_pharmacy_id
-        )
-    else:
-        query = query.filter(
-            or_(
-                ProductTransfer.source_pharmacy_id == query_pharmacy_id,
-                ProductTransfer.destination_pharmacy_id == query_pharmacy_id,
+    # Filtre par direction - si pas de pharmacie spécifiée (admin), retourner tous
+    if query_pharmacy_id is not None:
+        if direction == "incoming":
+            query = query.filter(
+                ProductTransfer.destination_pharmacy_id == query_pharmacy_id
             )
+        elif direction == "outgoing":
+            query = query.filter(
+                ProductTransfer.source_pharmacy_id == query_pharmacy_id
+            )
+        else:
+            query = query.filter(
+                or_(
+                    ProductTransfer.source_pharmacy_id == query_pharmacy_id,
+                    ProductTransfer.destination_pharmacy_id == query_pharmacy_id,
+                )
+            )
+    elif not _is_super_admin(current_user):
+        # Si pas de pharmacie et pas admin, retourner vide
+        logger.warning(f"Utilisateur {current_user.email} sans pharmacie et non-admin")
+        return TransferListResponse(
+            transfers=[],
+            total=0,
+            skip=skip,
+            limit=limit,
         )
 
     # Filtres optionnels
@@ -233,6 +354,7 @@ def get_transfers(
         )
 
     total = query.count()
+    logger.debug(f"📊 Total des transferts avant pagination: {total}")
 
     transfers = (
         query.options(
@@ -251,7 +373,8 @@ def get_transfers(
         .limit(limit)
         .all()
     )
-
+    
+    logger.info(f"📋 {len(transfers)} transferts retournés")
     return TransferListResponse(
         transfers=transfers,
         total=total,
@@ -271,16 +394,22 @@ def create_transfer(
     """
     Crée un nouveau transfert.
     """
+    logger.info(f"➕ POST /transfers/ - Utilisateur: {current_user.email}")
+    
     service = TransferService(db, current_user, current_tenant)
 
     try:
-        return service.create_transfer(transfer_data)
+        result = service.create_transfer(transfer_data)
+        logger.info(f"✅ Transfert créé avec succès: {result.id}")
+        return result
     except PermissionError as e:
+        logger.error(f"❌ Permission refusée pour la création de transfert: {e}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=str(e),
         ) from e
     except ValueError as e:
+        logger.error(f"❌ Erreur de validation lors de la création: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
@@ -302,6 +431,8 @@ def get_transfer(
     """
     Récupère un transfert par son ID.
     """
+    logger.info(f"🔍 GET /transfers/{transfer_id} - Utilisateur: {current_user.email}")
+    
     transfer = (
         db.query(ProductTransfer)
         .filter(
@@ -323,6 +454,7 @@ def get_transfer(
     )
 
     if not transfer:
+        logger.warning(f"❌ Transfert {transfer_id} non trouvé")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Transfert non trouvé",
@@ -331,16 +463,18 @@ def get_transfer(
     # Vérifier l'accès à la pharmacie
     user_pharmacy_id = _get_current_user_pharmacy_id(current_user)
     
-    if (
-        transfer.source_pharmacy_id != user_pharmacy_id
-        and transfer.destination_pharmacy_id != user_pharmacy_id
-        and not _is_super_admin(current_user)
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Vous n'avez pas accès à ce transfert",
-        )
-
+    if user_pharmacy_id is not None and not _is_super_admin(current_user):
+        if (
+            transfer.source_pharmacy_id != user_pharmacy_id
+            and transfer.destination_pharmacy_id != user_pharmacy_id
+        ):
+            logger.warning(f"❌ Accès refusé pour {current_user.email} au transfert {transfer_id}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Vous n'avez pas accès à ce transfert",
+            )
+    
+    logger.info(f"✅ Transfert {transfer_id} trouvé")
     return transfer
 
 
@@ -356,16 +490,22 @@ def update_transfer(
     """
     Met à jour un transfert.
     """
+    logger.info(f"✏️ PATCH /transfers/{transfer_id} - Utilisateur: {current_user.email}")
+    
     service = TransferService(db, current_user, current_tenant)
 
     try:
-        return service.update_transfer(transfer_id, transfer_data)
+        result = service.update_transfer(transfer_id, transfer_data)
+        logger.info(f"✅ Transfert {transfer_id} mis à jour")
+        return result
     except PermissionError as e:
+        logger.error(f"❌ Permission refusée pour la mise à jour: {e}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=str(e),
         ) from e
     except ValueError as e:
+        logger.error(f"❌ Erreur de validation lors de la mise à jour: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
@@ -384,16 +524,22 @@ def approve_transfer(
     """
     Approuve un transfert.
     """
+    logger.info(f"✅ POST /transfers/{transfer_id}/approve - Utilisateur: {current_user.email}")
+    
     service = TransferService(db, current_user, current_tenant)
 
     try:
-        return service.approve_transfer(transfer_id, approve_data)
+        result = service.approve_transfer(transfer_id, approve_data)
+        logger.info(f"✅ Transfert {transfer_id} approuvé")
+        return result
     except PermissionError as e:
+        logger.error(f"❌ Permission refusée pour l'approbation: {e}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=str(e),
         ) from e
     except ValueError as e:
+        logger.error(f"❌ Erreur de validation lors de l'approbation: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
@@ -411,16 +557,22 @@ def prepare_transfer(
     """
     Prépare un transfert.
     """
+    logger.info(f"📦 POST /transfers/{transfer_id}/prepare - Utilisateur: {current_user.email}")
+    
     service = TransferService(db, current_user, current_tenant)
 
     try:
-        return service.prepare_transfer(transfer_id)
+        result = service.prepare_transfer(transfer_id)
+        logger.info(f"✅ Transfert {transfer_id} préparé")
+        return result
     except PermissionError as e:
+        logger.error(f"❌ Permission refusée pour la préparation: {e}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=str(e),
         ) from e
     except ValueError as e:
+        logger.error(f"❌ Erreur de validation lors de la préparation: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
@@ -439,16 +591,22 @@ def ship_transfer(
     """
     Expédie un transfert.
     """
+    logger.info(f"🚚 POST /transfers/{transfer_id}/ship - Utilisateur: {current_user.email}")
+    
     service = TransferService(db, current_user, current_tenant)
 
     try:
-        return service.ship_transfer(transfer_id, ship_data)
+        result = service.ship_transfer(transfer_id, ship_data)
+        logger.info(f"✅ Transfert {transfer_id} expédié")
+        return result
     except PermissionError as e:
+        logger.error(f"❌ Permission refusée pour l'expédition: {e}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=str(e),
         ) from e
     except ValueError as e:
+        logger.error(f"❌ Erreur de validation lors de l'expédition: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
@@ -467,16 +625,22 @@ def receive_transfer(
     """
     Enregistre la réception d'un transfert.
     """
+    logger.info(f"📥 POST /transfers/{transfer_id}/receive - Utilisateur: {current_user.email}")
+    
     service = TransferService(db, current_user, current_tenant)
 
     try:
-        return service.receive_transfer(transfer_id, receive_data)
+        result = service.receive_transfer(transfer_id, receive_data)
+        logger.info(f"✅ Transfert {transfer_id} reçu")
+        return result
     except PermissionError as e:
+        logger.error(f"❌ Permission refusée pour la réception: {e}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=str(e),
         ) from e
     except ValueError as e:
+        logger.error(f"❌ Erreur de validation lors de la réception: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
@@ -495,67 +659,23 @@ def cancel_transfer(
     """
     Annule un transfert.
     """
+    logger.info(f"❌ POST /transfers/{transfer_id}/cancel - Utilisateur: {current_user.email}")
+    
     service = TransferService(db, current_user, current_tenant)
 
     try:
-        return service.cancel_transfer(transfer_id, cancel_data)
+        result = service.cancel_transfer(transfer_id, cancel_data)
+        logger.info(f"✅ Transfert {transfer_id} annulé")
+        return result
     except PermissionError as e:
+        logger.error(f"❌ Permission refusée pour l'annulation: {e}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=str(e),
         ) from e
     except ValueError as e:
+        logger.error(f"❌ Erreur de validation lors de l'annulation: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
         ) from e
-
-
-# ============================================================================
-# FONCTIONS UTILITAIRES (helpers)
-# ============================================================================
-
-def _get_current_user_pharmacy_id(current_user: User) -> UUID:
-    """
-    Retourne l'ID de la pharmacie principale de l'utilisateur.
-    """
-    primary_pharmacy = current_user.get_primary_pharmacy()
-
-    if not primary_pharmacy:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Aucune pharmacie associée à l'utilisateur",
-        )
-
-    return primary_pharmacy.id
-
-
-def _is_super_admin(user: User) -> bool:
-    """
-    Vérifie si l'utilisateur est super admin.
-    """
-    return bool(getattr(user, "is_super_admin", False))
-
-
-def _validate_pharmacy_access(
-    current_user: User,
-    tenant_id: UUID,
-    requested_pharmacy_id: Optional[UUID],
-) -> UUID:
-    """
-    Détermine la pharmacie à utiliser et vérifie les droits d'accès.
-    """
-    user_pharmacy_id = _get_current_user_pharmacy_id(current_user)
-    query_pharmacy_id = requested_pharmacy_id or user_pharmacy_id
-
-    if (
-        requested_pharmacy_id
-        and requested_pharmacy_id != user_pharmacy_id
-        and not _is_super_admin(current_user)
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Vous n'avez pas accès aux transferts de cette pharmacie",
-        )
-
-    return query_pharmacy_id

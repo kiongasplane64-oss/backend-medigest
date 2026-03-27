@@ -34,7 +34,6 @@ from app.api.v1.orders import router as orders_router
 
 
 
-
 # Routers admin / legacy
 from app.api.routes.pharmacies import router as pharmacies_router
 from app.api.routes.tenants import router as admin_tenants_router
@@ -227,9 +226,10 @@ include_router_auto(app, subscription_codes_router)
 include_router_auto(app, categories_router)
 app.include_router(session.router, prefix="/api/v1")
 app.include_router(sync_router, prefix="/api/v1", tags=["Synchronization"])
-include_router_auto(app, dashboard_router)
-include_router_auto(app, transfers_router, tags=["transfers"])
 include_router_auto(app, orders_router, tags=["orders"])
+include_router_auto(app, transfers_router, tags=["transfers"])
+include_router_auto(app, dashboard_router)
+
 
 
 # ============================================================================
