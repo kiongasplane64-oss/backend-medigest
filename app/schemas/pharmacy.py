@@ -553,6 +553,63 @@ class OnlineUsersResponse(BaseModel):
     
     model_config = ConfigDict(from_attributes=True)
 
+# ============================================
+# SCHÉMA SALES CONFIG (Configuration de vente)
+# ============================================
+
+class SalesConfig(BaseModel):
+    """
+    Configuration des paramètres de vente
+    Utilisé pour les routes de configuration des ventes
+    """
+    salesType: str = Field(
+        "both",
+        pattern=r"^(wholesale|retail|both)$",
+        description="Type de vente autorisé: wholesale (gros), retail (détail), both (les deux)"
+    )
+    calcul_auto_prix: bool = Field(
+        True,
+        description="Activer le calcul automatique des prix de vente"
+    )
+    marge_par_defaut: float = Field(
+        25.0,
+        ge=0,
+        le=500,
+        description="Marge par défaut en pourcentage pour le calcul automatique"
+    )
+    taux_tva: float = Field(
+        16.0,
+        ge=0,
+        le=100,
+        description="Taux de TVA par défaut en pourcentage"
+    )
+    lock_stock_modification: bool = Field(
+        False,
+        description="Verrouiller la modification du stock après validation"
+    )
+    
+    model_config = ConfigDict(from_attributes=True)
+    
+    @field_validator('salesType')
+    @classmethod
+    def validate_sales_type(cls, v):
+        """Valide le type de vente"""
+        allowed = ["wholesale", "retail", "both"]
+        if v not in allowed:
+            raise ValueError(f"salesType doit être l'un de: {', '.join(allowed)}")
+        return v
+
+
+# ============================================
+# EXPORT POUR COMPATIBILITÉ
+# ============================================
+
+# Ajouter SalesConfig à l'export si nécessaire
+__all__ = [
+    # ... autres exports existants ...
+    "SalesConfig",
+]
+
 
 # ============================================
 # ALIAS POUR COMPATIBILITÉ

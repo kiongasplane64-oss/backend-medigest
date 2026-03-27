@@ -30,7 +30,7 @@ from .purchase import Purchase, PurchaseItem, PurchasePayment
 
 from .inventory import PhysicalInventory, InventoryItem, InventorySchedule
 
-from .finance import FinancialPeriod, FinancialTransaction, Capital, Expense
+from .finance import FinancialPeriod, FinancialTransaction, Expense
 from .cost import Cost, Budget, Supplier
 
 from .audit_log import AuditLog
@@ -47,6 +47,8 @@ from app.models.branch import Branch
 from app.models.subscription_code import SubscriptionCode, SubscriptionCodeStatus
 from app.models.category import Category
 from app.models.user_session import UserSession
+from app.models.order import Order, OrderStatus, PaymentStatus
+from app.models.capital import Capital, CapitalAccount, CapitalTransaction, Turnover
 
 __all__ = [
     # Core
@@ -98,5 +100,11 @@ __all__ = [
     "UserSession",
     "TransferPriority",
     "StockMovement",
-    "ProductStock"
+    "ProductStock",
+    "Order",
+    "OrderStatus",
+    "PaymentStatus",
+    "CapitalAccount", 
+    "CapitalTransaction",
+    "turnover"
 ]

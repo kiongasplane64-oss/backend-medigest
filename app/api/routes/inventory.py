@@ -1,6 +1,7 @@
 # app/api/routes/inventory.py
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -19,6 +20,7 @@ from app.core.security import require_permission
 from app.db.session import SessionLocal, get_db
 from app.models.inventory import InventoryItem, InventorySchedule, PhysicalInventory
 from app.models.product import Product
+from app.models.pharmacy import Pharmacy
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.schemas.inventory import (
@@ -150,12 +152,12 @@ def _build_inventory_item_schema(
 
 
 # =============================================================================
-# INVENTAIRES
+# INVENTAIRES - TOUTES LES ROUTES SONT ASYNCHRONES
 # =============================================================================
 
 @router.post("/", response_model=InventoryInDB)
 @require_permission("inventory_manage")
-def create_inventory(
+async def create_inventory(
     inventory_data: InventoryCreate,
     db: Session = Depends(get_db),
     current_tenant: Tenant = Depends(get_current_tenant),
@@ -236,7 +238,7 @@ def create_inventory(
 
 @router.get("/", response_model=List[InventoryInDB])
 @require_permission("inventory_view")
-def list_inventories(
+async def list_inventories(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
     status_filter: Optional[str] = Query(None, alias="status"),
@@ -275,7 +277,7 @@ def list_inventories(
 
 @router.get("/stats/summary", response_model=Dict[str, Any])
 @require_permission("inventory_view")
-def get_inventory_stats(
+async def get_inventory_stats(
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
     db: Session = Depends(get_db),
@@ -345,18 +347,18 @@ def get_inventory_stats(
 
     return stats
 
+
 @router.get("/alerts", response_model=Dict[str, Any])
-def get_inventory_alerts(
+async def get_inventory_alerts(
     limit: int = Query(10, ge=1, le=100),
     db: Session = Depends(get_db),
-    current_tenant: Optional[Tenant] = Depends(get_current_tenant),  # Modifier: rendre optional
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """
     Récupère les alertes d'inventaire.
     Accessible en lecture même si l'abonnement est inactif.
     """
-    # Si l'utilisateur est super admin et n'a pas de tenant, retourner des données vides
     if current_tenant is None or current_user.role == "super_admin":
         logger.info(f"Super admin {current_user.email} sans tenant - retour des alertes vides")
         return {
@@ -383,7 +385,7 @@ def get_inventory_alerts(
 
     try:
         base_query = db.query(Product).filter(
-            Product.tenant_id == current_tenant.id,  # Maintenant current_tenant n'est pas None
+            Product.tenant_id == current_tenant.id,
         )
 
         if "is_active" in columns:
@@ -476,9 +478,10 @@ def get_inventory_alerts(
             detail="Erreur lors de la récupération des alertes d'inventaire",
         )
 
+
 @router.get("/{inventory_id}", response_model=InventoryReport)
 @require_permission("inventory_view")
-def get_inventory(
+async def get_inventory(
     inventory_id: UUID,
     db: Session = Depends(get_db),
     current_tenant: Tenant = Depends(get_current_tenant),
@@ -539,7 +542,7 @@ def get_inventory(
 
 @router.post("/{inventory_id}/items", response_model=Dict[str, Any])
 @require_permission("inventory_manage")
-def add_inventory_item(
+async def add_inventory_item(
     inventory_id: UUID,
     item_data: InventoryItemCreate,
     db: Session = Depends(get_db),
@@ -614,7 +617,7 @@ def add_inventory_item(
 
 @router.post("/{inventory_id}/start", response_model=Dict[str, Any])
 @require_permission("inventory_manage")
-def start_inventory(
+async def start_inventory(
     inventory_id: UUID,
     db: Session = Depends(get_db),
     current_tenant: Tenant = Depends(get_current_tenant),
@@ -650,7 +653,7 @@ def start_inventory(
 
 @router.post("/{inventory_id}/complete", response_model=Dict[str, Any])
 @require_permission("inventory_manage")
-def complete_inventory(
+async def complete_inventory(
     inventory_id: UUID,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
@@ -733,7 +736,7 @@ def complete_inventory(
 
 @router.get("/{inventory_id}/export", response_model=Dict[str, Any])
 @require_permission("inventory_view")
-def export_inventory(
+async def export_inventory(
     inventory_id: UUID,
     export_format: str = Query("excel", pattern="^(excel|pdf|csv)$"),
     background_tasks: BackgroundTasks = None,
@@ -773,12 +776,163 @@ def export_inventory(
 
 
 # =============================================================================
+# NOUVELLE ROUTE POUR DÉMARRER UNE SESSION D'INVENTAIRE (POUR LE FRONTEND)
+# =============================================================================
+
+@router.post("/start", response_model=Dict[str, Any])
+@require_permission("inventory_manage")
+async def start_inventory_session(
+    start_data: Dict[str, Any],
+    db: Session = Depends(get_db),
+    current_tenant: Tenant = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """
+    Démarre une nouvelle session d'inventaire pour le frontend.
+    Body: {"pharmacyId": "uuid", "date": "2024-01-01T00:00:00Z"}
+    """
+    try:
+        pharmacy_id = UUID(start_data.get("pharmacyId"))
+        planned_date_str = start_data.get("date", datetime.utcnow().isoformat())
+        
+        if isinstance(planned_date_str, str):
+            planned_date = datetime.fromisoformat(planned_date_str.replace('Z', '+00:00')).date()
+        else:
+            planned_date = planned_date_str or datetime.utcnow().date()
+        
+        # Vérifier que la pharmacie existe
+        pharmacy = db.query(Pharmacy).filter(
+            Pharmacy.id == pharmacy_id,
+            Pharmacy.tenant_id == current_tenant.id
+        ).first()
+        
+        if not pharmacy:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Pharmacie non trouvée"
+            )
+        
+        # Créer l'inventaire
+        inventory = PhysicalInventory(
+            tenant_id=current_tenant.id,
+            inventory_number=_inventory_number(),
+            inventory_type="full",
+            description=f"Inventaire complet - {pharmacy.name}",
+            planned_date=planned_date,
+            created_by=current_user.id,
+            status="draft",
+        )
+        db.add(inventory)
+        db.flush()
+        
+        # Ajouter tous les produits actifs de la pharmacie comme items
+        products = db.query(Product).filter(
+            Product.tenant_id == current_tenant.id,
+            Product.pharmacy_id == pharmacy_id,
+            Product.is_active.is_(True),
+        ).all()
+        
+        items = []
+        for product in products:
+            item = InventoryItem(
+                tenant_id=current_tenant.id,
+                inventory_id=inventory.id,
+                product_id=product.id,
+                expected_quantity=getattr(product, "quantity", 0) or 0,
+                expected_value=(
+                    (getattr(product, "quantity", 0) or 0)
+                    * (getattr(product, "purchase_price", 0) or 0)
+                ),
+                status="pending",
+            )
+            items.append(item)
+        
+        if items:
+            db.bulk_save_objects(items)
+        
+        # Démarrer l'inventaire immédiatement
+        inventory.status = "in_progress"
+        inventory.start_date = datetime.utcnow()
+        
+        db.commit()
+        db.refresh(inventory)
+        
+        # Rafraîchir les items pour avoir leurs IDs
+        db_items = db.query(InventoryItem).filter(
+            InventoryItem.inventory_id == inventory.id
+        ).all()
+        
+        # Transformer la réponse pour le frontend
+        return {
+            "id": str(inventory.id),
+            "pharmacyId": str(pharmacy_id),
+            "pharmacyName": pharmacy.name,
+            "date": inventory.created_at.isoformat(),
+            "status": inventory.status,
+            "items": [
+                {
+                    "id": str(item.id),
+                    "productId": str(item.product_id),
+                    "productName": product.name,
+                    "productCode": product.code or "",
+                    "category": getattr(product, "category", "Général"),
+                    "theoreticalStock": item.expected_quantity,
+                    "actualStock": item.counted_quantity or 0,
+                    "difference": item.variance or 0,
+                    "differenceValue": (item.variance or 0) * (product.selling_price or 0),
+                    "unitPrice": float(product.selling_price or 0),
+                    "batchNumber": item.batch_number or "",
+                    "expiryDate": item.expiry_date.isoformat() if item.expiry_date else (product.expiry_date.isoformat() if product.expiry_date else ""),
+                    "location": item.location or "",
+                    "lastCount": item.counted_at.isoformat() if item.counted_at else "",
+                    "countedBy": str(current_user.id),
+                    "notes": item.notes or "",
+                    "status": item.status
+                }
+                for item, product in zip(db_items, products)
+            ],
+            "startedBy": str(current_user.id),
+            "summary": {
+                "totalItems": len(db_items),
+                "countedItems": len([i for i in db_items if i.status != "pending"]),
+                "verifiedItems": len([i for i in db_items if i.status == "verified"]),
+                "positiveDifferences": len([i for i in db_items if (i.variance or 0) > 0]),
+                "positiveDifferenceValue": sum(
+                    ((i.variance or 0) * (p.selling_price or 0)) 
+                    for i, p in zip(db_items, products) 
+                    if (i.variance or 0) > 0
+                ),
+                "negativeDifferences": len([i for i in db_items if (i.variance or 0) < 0]),
+                "negativeDifferenceValue": sum(
+                    ((i.variance or 0) * (p.selling_price or 0)) 
+                    for i, p in zip(db_items, products) 
+                    if (i.variance or 0) < 0
+                ),
+                "totalDifferenceValue": sum(
+                    ((i.variance or 0) * (p.selling_price or 0)) 
+                    for i, p in zip(db_items, products)
+                )
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        logger.error("Erreur création session inventaire: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Erreur lors de la création de la session d'inventaire",
+        )
+
+
+# =============================================================================
 # PLANNINGS
 # =============================================================================
 
 @router.post("/schedules", response_model=Dict[str, Any])
 @require_permission("inventory_manage")
-def create_inventory_schedule(
+async def create_inventory_schedule(
     schedule_data: ScheduleCreate,
     db: Session = Depends(get_db),
     current_tenant: Tenant = Depends(get_current_tenant),

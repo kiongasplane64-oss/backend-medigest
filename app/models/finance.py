@@ -125,49 +125,6 @@ class FinancialTransaction(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-
-# =====================================
-# CAPITAL
-# =====================================
-class Capital(Base):
-    __tablename__ = "capitals"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
-
-    capital_type = Column(
-        String(30),
-        nullable=False,
-        comment="initial, additional, withdrawal, reinvestment",
-    )
-    capital_date = Column(Date, nullable=False)
-    amount = Column(DECIMAL(15, 2), nullable=False)
-
-    description = Column(String(500))
-    reference = Column(String(100))
-    source = Column(String(200), comment="banque, caisse, investisseur")
-    destination = Column(String(200))
-
-    status = Column(
-        String(20),
-        default="pending",
-        comment="pending, approved, completed, cancelled",
-    )
-
-    approved_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
-    approved_at = Column(DateTime)
-
-    tenant = relationship("Tenant", back_populates="capitals")
-    approver = relationship("User")
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(
-        DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-    )
-
-
 # =====================================
 # EXPENSES
 # =====================================

@@ -1168,6 +1168,373 @@ def subscription_required(
 
     return tenant
 
+# =============================================================================
+# 4.1 PHARMACIE ACTIVE (UTILISATEUR)
+# =============================================================================
+
+def get_current_active_pharmacy(
+    request: Request,
+    current_user: User = Depends(get_current_active_user),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    db: Session = Depends(get_db),
+) -> Optional[Pharmacy]:
+    """
+    Récupère la pharmacie active pour l'utilisateur connecté.
+    
+    Ordre de recherche :
+    1. Header X-Pharmacy-ID
+    2. active_pharmacy_id stocké dans l'utilisateur
+    3. pharmacy_id du JWT
+    4. Pharmacie principale du tenant
+    5. Première pharmacie active du tenant
+    
+    Retourne l'entité Pharmacy SQLAlchemy.
+    """
+    # Super admin : accès global ou via header
+    if _is_super_admin(current_user):
+        header_pharmacy_id = request.headers.get("X-Pharmacy-ID")
+        if header_pharmacy_id:
+            pharmacy_uuid = _parse_uuid(header_pharmacy_id)
+            if pharmacy_uuid:
+                pharmacy = db.query(Pharmacy).filter(
+                    Pharmacy.id == pharmacy_uuid,
+                    Pharmacy.is_active.is_(True),
+                ).first()
+                if pharmacy:
+                    return pharmacy
+        return None
+    
+    # Vérifier que l'utilisateur a un tenant
+    if not current_tenant:
+        logger.warning("⚠️ Utilisateur sans tenant pour get_current_active_pharmacy: %s", 
+                       getattr(current_user, "email", None))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tenant non trouvé",
+        )
+    
+    # 1. Vérifier le header X-Pharmacy-ID
+    header_pharmacy_id = request.headers.get("X-Pharmacy-ID")
+    if header_pharmacy_id:
+        pharmacy_uuid = _parse_uuid(header_pharmacy_id)
+        if pharmacy_uuid:
+            pharmacy = db.query(Pharmacy).filter(
+                Pharmacy.id == pharmacy_uuid,
+                Pharmacy.tenant_id == current_tenant.id,
+                Pharmacy.is_active.is_(True),
+            ).first()
+            
+            if pharmacy:
+                if not can_user_access_pharmacy(current_user, pharmacy, db):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Vous n'avez pas accès à cette pharmacie",
+                    )
+                logger.debug("✅ Pharmacie active via header X-Pharmacy-ID: %s", pharmacy.id)
+                return pharmacy
+    
+    # 2. Vérifier l'active_pharmacy_id stocké dans l'utilisateur
+    active_pharmacy_id = getattr(current_user, "active_pharmacy_id", None)
+    if active_pharmacy_id:
+        pharmacy = db.query(Pharmacy).filter(
+            Pharmacy.id == active_pharmacy_id,
+            Pharmacy.tenant_id == current_tenant.id,
+            Pharmacy.is_active.is_(True),
+        ).first()
+        
+        if pharmacy:
+            if not can_user_access_pharmacy(current_user, pharmacy, db):
+                logger.warning("⚠️ Utilisateur %s n'a plus accès à sa pharmacie active %s",
+                              getattr(current_user, "email", None), active_pharmacy_id)
+                # Réinitialiser l'active_pharmacy_id
+                current_user.active_pharmacy_id = None
+                db.commit()
+            else:
+                logger.debug("✅ Pharmacie active via user.active_pharmacy_id: %s", pharmacy.id)
+                return pharmacy
+    
+    # 3. Vérifier le pharmacy_id du JWT
+    token = _get_token_from_request(request)
+    if token:
+        payload = _decode_token_without_verification(token)
+        pharmacy_uuid = _parse_uuid(payload.get("pharmacy_id"))
+        if pharmacy_uuid:
+            pharmacy = db.query(Pharmacy).filter(
+                Pharmacy.id == pharmacy_uuid,
+                Pharmacy.tenant_id == current_tenant.id,
+                Pharmacy.is_active.is_(True),
+            ).first()
+            
+            if pharmacy:
+                if not can_user_access_pharmacy(current_user, pharmacy, db):
+                    logger.warning("⚠️ Utilisateur %s n'a pas accès à pharmacy_id du JWT",
+                                  getattr(current_user, "email", None))
+                else:
+                    # Mettre à jour l'active_pharmacy_id de l'utilisateur
+                    current_user.active_pharmacy_id = pharmacy.id
+                    db.commit()
+                    logger.debug("✅ Pharmacie active via JWT pharmacy_id: %s", pharmacy.id)
+                    return pharmacy
+    
+    # 4. Pharmacie principale du tenant
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.tenant_id == current_tenant.id,
+        Pharmacy.is_active.is_(True),
+        Pharmacy.is_main.is_(True),
+    ).first()
+    
+    if pharmacy:
+        if can_user_access_pharmacy(current_user, pharmacy, db):
+            # Mettre à jour l'active_pharmacy_id de l'utilisateur
+            current_user.active_pharmacy_id = pharmacy.id
+            db.commit()
+            logger.debug("✅ Pharmacie active via is_main: %s", pharmacy.id)
+            return pharmacy
+    
+    # 5. Première pharmacie active du tenant
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.tenant_id == current_tenant.id,
+        Pharmacy.is_active.is_(True),
+    ).first()
+    
+    if pharmacy:
+        if can_user_access_pharmacy(current_user, pharmacy, db):
+            # Mettre à jour l'active_pharmacy_id de l'utilisateur
+            current_user.active_pharmacy_id = pharmacy.id
+            db.commit()
+            logger.debug("✅ Pharmacie active via first active: %s", pharmacy.id)
+            return pharmacy
+    
+    # Aucune pharmacie trouvée
+    logger.warning("⚠️ Aucune pharmacie active trouvée pour tenant %s, utilisateur %s",
+                   getattr(current_tenant, "id", None), getattr(current_user, "email", None))
+    
+    # Pour les admins, on retourne None (peut-être qu'ils n'ont pas encore de pharmacie)
+    if getattr(current_user, "role", None) in ADMIN_OVERRIDE_ROLES:
+        return None
+    
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={
+            "error": "no_active_pharmacy",
+            "message": "Aucune pharmacie active trouvée pour cet utilisateur",
+            "suggestion": "Créez une pharmacie ou contactez votre administrateur",
+        },
+    )
+
+
+def get_current_active_branch(
+    request: Request,
+    current_user: User = Depends(get_current_active_user),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_active_pharmacy),
+    db: Session = Depends(get_db),
+) -> Optional[Branch]:
+    """
+    Récupère la succursale active pour l'utilisateur connecté.
+    
+    Ordre de recherche :
+    1. Header X-Branch-ID
+    2. active_branch_id stocké dans l'utilisateur
+    3. branch_id du JWT
+    4. Succursale principale de la pharmacie active
+    5. Première succursale active de la pharmacie active
+    
+    Retourne l'entité Branch SQLAlchemy.
+    """
+    # Super admin : accès global ou via header
+    if _is_super_admin(current_user):
+        header_branch_id = request.headers.get("X-Branch-ID")
+        if header_branch_id:
+            branch_uuid = _parse_uuid(header_branch_id)
+            if branch_uuid:
+                branch = db.query(Branch).filter(
+                    Branch.id == branch_uuid,
+                    Branch.is_active.is_(True),
+                ).first()
+                if branch:
+                    return branch
+        return None
+    
+    # Vérifier que l'utilisateur a un tenant
+    if not current_tenant:
+        logger.warning("⚠️ Utilisateur sans tenant pour get_current_active_branch: %s",
+                       getattr(current_user, "email", None))
+        return None
+    
+    # Vérifier qu'on a une pharmacie active
+    if not current_pharmacy:
+        logger.debug("ℹ️ Aucune pharmacie active, impossible de déterminer la branche")
+        return None
+    
+    # 1. Vérifier le header X-Branch-ID
+    header_branch_id = request.headers.get("X-Branch-ID")
+    if header_branch_id:
+        branch_uuid = _parse_uuid(header_branch_id)
+        if branch_uuid:
+            branch = db.query(Branch).filter(
+                Branch.id == branch_uuid,
+                Branch.tenant_id == current_tenant.id,
+                Branch.parent_pharmacy_id == current_pharmacy.id,
+                Branch.is_active.is_(True),
+            ).first()
+            
+            if branch:
+                if not can_user_access_branch(current_user, branch, db):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Vous n'avez pas accès à cette succursale",
+                    )
+                logger.debug("✅ Branche active via header X-Branch-ID: %s", branch.id)
+                return branch
+    
+    # 2. Vérifier l'active_branch_id stocké dans l'utilisateur
+    active_branch_id = getattr(current_user, "active_branch_id", None)
+    if active_branch_id:
+        branch = db.query(Branch).filter(
+            Branch.id == active_branch_id,
+            Branch.tenant_id == current_tenant.id,
+            Branch.parent_pharmacy_id == current_pharmacy.id,
+            Branch.is_active.is_(True),
+        ).first()
+        
+        if branch:
+            if not can_user_access_branch(current_user, branch, db):
+                logger.warning("⚠️ Utilisateur %s n'a plus accès à sa branche active %s",
+                              getattr(current_user, "email", None), active_branch_id)
+                # Réinitialiser l'active_branch_id
+                current_user.active_branch_id = None
+                db.commit()
+            else:
+                logger.debug("✅ Branche active via user.active_branch_id: %s", branch.id)
+                return branch
+    
+    # 3. Vérifier le branch_id du JWT
+    token = _get_token_from_request(request)
+    if token:
+        payload = _decode_token_without_verification(token)
+        branch_uuid = _parse_uuid(payload.get("branch_id"))
+        if branch_uuid:
+            branch = db.query(Branch).filter(
+                Branch.id == branch_uuid,
+                Branch.tenant_id == current_tenant.id,
+                Branch.parent_pharmacy_id == current_pharmacy.id,
+                Branch.is_active.is_(True),
+            ).first()
+            
+            if branch:
+                if not can_user_access_branch(current_user, branch, db):
+                    logger.warning("⚠️ Utilisateur %s n'a pas accès à branch_id du JWT",
+                                  getattr(current_user, "email", None))
+                else:
+                    # Mettre à jour l'active_branch_id de l'utilisateur
+                    current_user.active_branch_id = branch.id
+                    db.commit()
+                    logger.debug("✅ Branche active via JWT branch_id: %s", branch.id)
+                    return branch
+    
+    # 4. Succursale principale de la pharmacie active
+    branch = db.query(Branch).filter(
+        Branch.tenant_id == current_tenant.id,
+        Branch.parent_pharmacy_id == current_pharmacy.id,
+        Branch.is_active.is_(True),
+        Branch.is_main_branch.is_(True),
+    ).first()
+    
+    if branch:
+        if can_user_access_branch(current_user, branch, db):
+            # Mettre à jour l'active_branch_id de l'utilisateur
+            current_user.active_branch_id = branch.id
+            db.commit()
+            logger.debug("✅ Branche active via is_main_branch: %s", branch.id)
+            return branch
+    
+    # 5. Première succursale active de la pharmacie active
+    branch = db.query(Branch).filter(
+        Branch.tenant_id == current_tenant.id,
+        Branch.parent_pharmacy_id == current_pharmacy.id,
+        Branch.is_active.is_(True),
+    ).first()
+    
+    if branch:
+        if can_user_access_branch(current_user, branch, db):
+            # Mettre à jour l'active_branch_id de l'utilisateur
+            current_user.active_branch_id = branch.id
+            db.commit()
+            logger.debug("✅ Branche active via first active: %s", branch.id)
+            return branch
+    
+    # Aucune branche trouvée - ce n'est pas une erreur, certaines pharmacies n'ont pas de branches
+    logger.debug("ℹ️ Aucune branche active trouvée pour pharmacie %s", current_pharmacy.id)
+    return None
+
+
+def get_current_active_pharmacy_dict(
+    pharmacy: Optional[Pharmacy] = Depends(get_current_active_pharmacy),
+    current_user: User = Depends(get_current_active_user),
+) -> Optional[Dict[str, Any]]:
+    """
+    Retourne la pharmacie active sous forme sérialisée (dictionnaire).
+    """
+    if _is_super_admin(current_user) and pharmacy is None:
+        return {
+            "id": None,
+            "name": "Accès super admin",
+            "is_global": True,
+            "role": current_user.role,
+        }
+    
+    if not pharmacy:
+        return None
+    
+    return {
+        "id": str(pharmacy.id),
+        "name": getattr(pharmacy, "name", None),
+        "license_number": getattr(pharmacy, "license_number", None),
+        "pharmacy_code": getattr(pharmacy, "pharmacy_code", None),
+        "address": getattr(pharmacy, "address", None),
+        "city": getattr(pharmacy, "city", None),
+        "country": getattr(pharmacy, "country", None),
+        "phone": getattr(pharmacy, "phone", None),
+        "email": getattr(pharmacy, "email", None),
+        "is_main": getattr(pharmacy, "is_main", False),
+        "is_active": getattr(pharmacy, "is_active", False),
+        "config": getattr(pharmacy, "config", {}) or {},
+    }
+
+
+def get_current_active_branch_dict(
+    branch: Optional[Branch] = Depends(get_current_active_branch),
+    current_user: User = Depends(get_current_active_user),
+) -> Optional[Dict[str, Any]]:
+    """
+    Retourne la succursale active sous forme sérialisée (dictionnaire).
+    """
+    if _is_super_admin(current_user) and branch is None:
+        return {
+            "id": None,
+            "name": "Accès super admin",
+            "is_global": True,
+            "role": current_user.role,
+        }
+    
+    if not branch:
+        return None
+    
+    return {
+        "id": str(branch.id),
+        "name": branch.name,
+        "code": branch.code,
+        "address": branch.address,
+        "city": branch.city,
+        "phone": branch.phone,
+        "email": branch.email,
+        "is_main_branch": branch.is_main_branch,
+        "is_active": branch.is_active,
+        "parent_pharmacy_id": str(branch.parent_pharmacy_id) if branch.parent_pharmacy_id else None,
+        "config": branch.config or {},
+    }
+
 
 # =============================================================================
 # 8. EXPORTS
@@ -1201,4 +1568,8 @@ __all__ = [
     "get_pagination_params",
     "get_date_range_params",
     "subscription_required",
+    "get_current_active_pharmacy",
+    "get_current_active_branch",
+    "get_current_active_pharmacy_dict",
+    "get_current_active_branch_dict",
 ]

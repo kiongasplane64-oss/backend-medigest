@@ -49,9 +49,37 @@ class User(Base):
     )
 
     # =========================
-    # Relations (Corrigées avec Overlaps)
+    # Session active (pharmacie et branche)
+    # =========================
+    active_pharmacy_id = Column(
+        UUID(as_uuid=True), 
+        ForeignKey("pharmacies.id", ondelete="SET NULL"),
+        nullable=True
+    )
+    active_branch_id = Column(
+        UUID(as_uuid=True), 
+        ForeignKey("branches.id", ondelete="SET NULL"),
+        nullable=True
+    )
+
+    # =========================
+    # Relations
     # =========================
     tenant = relationship("Tenant", back_populates="users", foreign_keys=[tenant_id])
+    
+    # Pharmacie active
+    active_pharmacy = relationship(
+        "Pharmacy",
+        foreign_keys=[active_pharmacy_id],
+        lazy="joined"
+    )
+    
+    # Branche active
+    active_branch = relationship(
+        "Branch",
+        foreign_keys=[active_branch_id],
+        lazy="joined"
+    )
     
     # Relation Many-to-Many directe vers les pharmacies
     pharmacies = relationship(
@@ -61,7 +89,7 @@ class User(Base):
         overlaps="pharmacy_associations,user_associations,user,pharmacy"
     )
 
-    # Relation vers la table d'association (pour les champs is_primary, can_manage)
+    # Relation vers la table d'association
     pharmacy_associations = relationship(
         "UserPharmacy",
         back_populates="user",
@@ -69,8 +97,7 @@ class User(Base):
         overlaps="pharmacies,users"
     )
 
-    # Relations inverses pour les modules tiers (Cost, Debt, etc.)
-    # Utilisation de overlaps pour corriger les erreurs de log
+    # Relations inverses
     tenants_created = relationship("Tenant", back_populates="creator", foreign_keys="[Tenant.created_by]", lazy="noload")
     
     costs_created = relationship("Cost", foreign_keys="Cost.created_by", back_populates="creator", lazy="noload")
@@ -83,9 +110,9 @@ class User(Base):
         foreign_keys="DebtPayment.processed_by", 
         back_populates="processor", 
         lazy="noload",
-        overlaps="payments_processed" # Correction SAWarning
+        overlaps="payments_processed"
     )
-    # Ajouter cette relation
+    
     subscription = relationship(
         "UserSubscription", 
         back_populates="user", 
@@ -105,17 +132,34 @@ class User(Base):
             if assoc.is_primary:
                 return assoc.pharmacy
         
-        # Fallback 1: Première pharmacie de la liste
         if self.pharmacies:
             return self.pharmacies[0]
             
         return None
 
-    def has_access_to_pharmacy(self, pharmacy_id: int) -> bool:
+    def set_active_pharmacy(self, pharmacy_id):
+        """Définit la pharmacie active pour l'utilisateur"""
+        # Vérifier que l'utilisateur a accès à cette pharmacie
+        if self.has_access_to_pharmacy(pharmacy_id):
+            self.active_pharmacy_id = pharmacy_id
+            return True
+        return False
+    
+    def set_active_branch(self, branch_id):
+        """Définit la branche active pour l'utilisateur"""
+        # Vérifier que la branche existe et appartient à la pharmacie active
+        if self.active_pharmacy_id:
+            from app.models.branch import Branch
+            # La vérification se fera via le service
+            self.active_branch_id = branch_id
+            return True
+        return False
+
+    def has_access_to_pharmacy(self, pharmacy_id) -> bool:
         """Vérifie si l'utilisateur est lié à une pharmacie spécifique"""
         return any(assoc.pharmacy_id == pharmacy_id for assoc in self.pharmacy_associations)
 
-    def can_manage_pharmacy(self, pharmacy_id: int) -> bool:
+    def can_manage_pharmacy(self, pharmacy_id) -> bool:
         """Vérifie si l'utilisateur a les droits de gestion ou est admin"""
         if self.role in ["admin", "super_admin"]:
             return True
@@ -138,6 +182,8 @@ class User(Base):
             "permissions": self.permissions or {},
             "date_creation": self.date_creation.isoformat() if self.date_creation else None,
             "last_login": self.last_login.isoformat() if self.last_login else None,
+            "active_pharmacy_id": str(self.active_pharmacy_id) if self.active_pharmacy_id else None,
+            "active_branch_id": str(self.active_branch_id) if self.active_branch_id else None,
         }
 
         if include_tenant and self.tenant:
@@ -150,7 +196,7 @@ class User(Base):
         if include_pharmacies:
             data["pharmacies"] = [
                 {
-                    "id": assoc.pharmacy.id,
+                    "id": str(assoc.pharmacy.id),
                     "name": assoc.pharmacy.name,
                     "is_primary": assoc.is_primary,
                     "can_manage": assoc.can_manage
@@ -172,7 +218,6 @@ class User(Base):
     def update_last_login(self):
         self.last_login = datetime.utcnow()
     
-    # Méthodes pour gérer l'abonnement
     def get_subscription_status(self):
         """Retourne le statut complet de l'abonnement"""
         if not self.subscription:
@@ -203,11 +248,7 @@ class User(Base):
         if not self.subscription or not self.subscription.is_active():
             return False
         
-        # Compter les pharmacies actuelles
-        from app.models.pharmacy import Pharmacy
-        # Note: Cette méthode nécessite une session DB, à utiliser avec précaution
-        # Idéalement, on passe par un service
-        return True  # Logique à implémenter dans un service
+        return True
 
     def can_add_user(self) -> bool:
         """Vérifie si l'admin peut ajouter un nouvel utilisateur"""
@@ -217,4 +258,4 @@ class User(Base):
         if not self.subscription or not self.subscription.is_active():
             return False
         
-        return True  # Logique à implémenter dans un service
+        return True

@@ -16,6 +16,18 @@ class UserSession(Base):
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
     
+    # Pharmacie et branche actives pendant la session
+    active_pharmacy_id = Column(
+        UUID(as_uuid=True), 
+        ForeignKey("pharmacies.id", ondelete="SET NULL"),
+        nullable=True
+    )
+    active_branch_id = Column(
+        UUID(as_uuid=True), 
+        ForeignKey("branches.id", ondelete="SET NULL"),
+        nullable=True
+    )
+    
     # Identifiants de session
     session_id = Column(String(255), unique=True, nullable=False)
     refresh_token = Column(Text, nullable=True)
@@ -46,6 +58,16 @@ class UserSession(Base):
     # Relations
     user = relationship("User", back_populates="sessions", foreign_keys=[user_id])
     tenant = relationship("Tenant", back_populates="sessions", foreign_keys=[tenant_id])
+    active_pharmacy = relationship(
+        "Pharmacy",
+        foreign_keys=[active_pharmacy_id],
+        lazy="joined"
+    )
+    active_branch = relationship(
+        "Branch",
+        foreign_keys=[active_branch_id],
+        lazy="joined"
+    )
     
     # Index
     __table_args__ = (
@@ -56,6 +78,8 @@ class UserSession(Base):
         Index("idx_user_sessions_expires_at", "expires_at"),
         Index("idx_user_sessions_platform", "platform"),
         Index("idx_user_sessions_last_activity", "last_activity"),
+        Index("idx_user_sessions_active_pharmacy", "active_pharmacy_id"),
+        Index("idx_user_sessions_active_branch", "active_branch_id"),
     )
     
     def __repr__(self) -> str:
@@ -74,3 +98,30 @@ class UserSession(Base):
     def update_activity(self) -> None:
         """Met à jour la dernière activité"""
         self.last_activity = datetime.utcnow()
+    
+    def set_active_context(self, pharmacy_id: uuid.UUID = None, branch_id: uuid.UUID = None) -> None:
+        """Définit la pharmacie et branche actives pour la session"""
+        if pharmacy_id:
+            self.active_pharmacy_id = pharmacy_id
+        if branch_id:
+            self.active_branch_id = branch_id
+        self.update_activity()
+    
+    def to_dict(self) -> dict:
+        """Convertit en dictionnaire"""
+        return {
+            "id": str(self.id),
+            "session_id": self.session_id,
+            "platform": self.platform,
+            "device_type": self.device_type,
+            "device_name": self.device_name,
+            "ip_address": self.ip_address,
+            "location_city": self.location_city,
+            "location_country": self.location_country,
+            "is_active": self.is_active,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "last_activity": self.last_activity.isoformat() if self.last_activity else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "active_pharmacy_id": str(self.active_pharmacy_id) if self.active_pharmacy_id else None,
+            "active_branch_id": str(self.active_branch_id) if self.active_branch_id else None,
+        }

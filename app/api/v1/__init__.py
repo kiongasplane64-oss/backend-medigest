@@ -4,7 +4,7 @@ Router principal de l'API v1
 """
 from fastapi import APIRouter
 
-from app.api.v1 import auth, users, tenants, superadmin, subscriptions
+from app.api.v1 import auth, users, tenants, superadmin, subscriptions, orders
 from .sales import router as sales_router
 from .clients import router as clients_router
 from app.api.v1.endpoints.stock import router as stock_router 
@@ -13,6 +13,8 @@ from app.api.v1 import sales, categories
 from app.api.routes import pharmacies
 from app.api.v1.sync import router as sync_router
 from app.api.v1.dashboard import router as dashboard_router
+from app.api.v1.endpoints.transfers import router as transfers_router
+
 
 api_router = APIRouter()
 
@@ -32,3 +34,5 @@ api_router.include_router(categories.router, prefix="/categories", tags=["Catego
 api_router.include_router(pharmacies.router, prefix="/pharmacies", tags=["Pharmacies"])
 api_router.include_router(sync_router, prefix="/sync", tags=["Synchronization"]) 
 api_router.include_router(dashboard_router, prefix="/dashboard",tags=["Dashboard"])
+api_router.include_router(orders.router, prefix="/orders", tags=["Orders"])
+api_router.include_router(transfers_router, prefix="/transfers", tags=["transfers"])

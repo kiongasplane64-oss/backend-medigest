@@ -1,20 +1,20 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Path
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, HTTPException, status, Path, Query
+from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 import json
 from uuid import UUID
 import pytz
-from zoneinfo import ZoneInfo  # Python 3.9+
-
+from sqlalchemy import func
 import os
 import shutil
 from fastapi import UploadFile, File
 
-from app.api.deps import get_current_user, get_db, get_current_tenant
+from app.api.deps import get_current_user, get_db, get_current_tenant, get_current_active_pharmacy
 from app.models.user import User
 from app.models.tenant import Tenant
 from app.models.pharmacy import Pharmacy
+from app.models.branch import Branch
 from app.schemas.pharmacy import (
     PharmacyCreate, 
     PharmacyUpdate, 
@@ -25,41 +25,15 @@ from app.schemas.pharmacy import (
     WorkingHoursConfig,
     AutomaticPricingConfig,
     BranchConfig,
-    ThemeConfig
+    ThemeConfig,
+    SalesConfig
 )
+from app.schemas.branch import BranchCreate, BranchUpdate, BranchResponse, BranchListResponse, BranchServiceStatus, BranchStatistics, BranchConfigUpdate, BranchWorkingHoursConfig
 from app.utils.pharmacy_utils import PharmacyValidator
+from app.schemas.branch import BranchWorkingHoursConfig
 
 router = APIRouter(prefix="/api/v1/pharmacies", tags=["pharmacies"])
 
-# Fuseaux horaires supportés
-SUPPORTED_TIMEZONES = {
-    "kinshasa": "Africa/Kinshasa",  # UTC+1 (pas d'heure d'été)
-    "lubumbashi": "Africa/Lubumbashi",  # UTC+2
-    "paris": "Europe/Paris",  # UTC+1/UTC+2 (avec heure d'été)
-    "rdc": "Africa/Kinshasa",  # Par défaut RDC
-    "congo": "Africa/Kinshasa"
-    
-}
-
-def get_pharmacy_timezone(pharmacy_config: dict) -> str:
-    """
-    Récupère le fuseau horaire configuré pour la pharmacie
-    Par défaut: Africa/Kinshasa (UTC+1)
-    """
-    # Vous pouvez ajouter un champ timezone dans la config si nécessaire
-    # Pour l'instant, on utilise Kinshasa par défaut
-    return "Africa/Kinshasa"
-
-def get_current_time_in_timezone(timezone_str: str = "Africa/Kinshasa") -> datetime:
-    """
-    Retourne l'heure actuelle dans le fuseau horaire spécifié
-    """
-    try:
-        tz = pytz.timezone(timezone_str)
-        return datetime.now(tz)
-    except:
-        # Fallback sur UTC si le fuseau n'est pas trouvé
-        return datetime.now(pytz.UTC)
 
 class PharmacyLimits:
     """Définit les limites de pharmacies selon le plan d'abonnement"""
@@ -99,10 +73,7 @@ class PharmacyLimits:
         tenant: Tenant, 
         check_active_only: bool = True
     ) -> dict:
-        """
-        Vérifie si le tenant peut créer une nouvelle pharmacie
-        """
-        # Compter les pharmacies actuelles
+        """Vérifie si le tenant peut créer une nouvelle pharmacie"""
         query = db.query(Pharmacy).filter(Pharmacy.tenant_id == tenant.id)
         
         if check_active_only:
@@ -110,7 +81,6 @@ class PharmacyLimits:
         
         current_count = query.count()
         
-        # Récupérer la limite selon le plan
         plan = tenant.current_plan or "essentiel"
         limits = PharmacyLimits.get_limits_for_plan(plan)
         max_allowed = limits["max_pharmacies"]
@@ -131,13 +101,19 @@ class PharmacyLimits:
         return result
     
     @staticmethod
-    def can_create_branch(pharmacy: Pharmacy, tenant: Tenant) -> dict:
-        """
-        Vérifie si une pharmacie peut créer une succursale
-        """
-        config = pharmacy.config or {}
-        branch_config = config.get("branchConfig", {})
-        current_branches = branch_config.get("currentBranches", 0)
+    def can_create_branch(pharmacy: Pharmacy, tenant: Tenant, db: Session = None) -> dict:
+        """Vérifie si une pharmacie peut créer une succursale"""
+        # Compter les branches existantes dans la base de données
+        if db:
+            current_branches = db.query(Branch).filter(
+                Branch.parent_pharmacy_id == pharmacy.id,
+                Branch.is_active == True
+            ).count()
+        else:
+            # Fallback sur la config
+            config = pharmacy.config or {}
+            branch_config = config.get("branchConfig", {})
+            current_branches = branch_config.get("currentBranches", 0)
         
         limits = PharmacyLimits.get_limits_for_plan(tenant.current_plan or "essentiel")
         max_branches = limits["max_branches_per_pharmacy"]
@@ -153,7 +129,8 @@ class PharmacyLimits:
         }
 
 
-# ROUTES STATIQUES EN PREMIER
+# ==================== PHARMACIES CRUD ====================
+
 @router.get("/", response_model=List[PharmacyResponse])
 def get_pharmacies(
     db: Session = Depends(get_db),
@@ -171,7 +148,6 @@ def get_pharmacies(
     
     pharmacies = query.offset(skip).limit(limit).all()
     
-    # Convertir explicitement les UUIDs en strings
     result = []
     for pharmacy in pharmacies:
         pharmacy_dict = {
@@ -220,6 +196,108 @@ def get_pharmacy_limits(
     }
 
 
+@router.get("/active", response_model=dict)
+def get_active_pharmacy(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """
+    Récupère la pharmacie active pour l'utilisateur connecté.
+    Si l'utilisateur a une pharmacie active en session, la retourne.
+    Sinon, retourne la première pharmacie active du tenant.
+    """
+    # Vérifier si l'utilisateur a une pharmacie active en session
+    if current_user.active_pharmacy_id:
+        pharmacy = db.query(Pharmacy).filter(
+            Pharmacy.id == current_user.active_pharmacy_id,
+            Pharmacy.tenant_id == current_tenant.id,
+            Pharmacy.is_active == True
+        ).first()
+        
+        if pharmacy:
+            return {
+                "id": str(pharmacy.id),
+                "name": pharmacy.name,
+                "license_number": pharmacy.license_number,
+                "config": pharmacy.config,
+                "branches_count": db.query(Branch).filter(
+                    Branch.parent_pharmacy_id == pharmacy.id,
+                    Branch.is_active == True
+                ).count(),
+                "is_active": pharmacy.is_active
+            }
+    
+    # Sinon, récupérer la première pharmacie active
+    first_pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.tenant_id == current_tenant.id,
+        Pharmacy.is_active == True
+    ).first()
+    
+    if first_pharmacy:
+        # Mettre à jour l'utilisateur avec cette pharmacie
+        current_user.active_pharmacy_id = first_pharmacy.id
+        db.commit()
+        
+        return {
+            "id": str(first_pharmacy.id),
+            "name": first_pharmacy.name,
+            "license_number": first_pharmacy.license_number,
+            "config": first_pharmacy.config,
+            "branches_count": db.query(Branch).filter(
+                Branch.parent_pharmacy_id == first_pharmacy.id,
+                Branch.is_active == True
+            ).count(),
+            "is_active": first_pharmacy.is_active
+        }
+    
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Aucune pharmacie active trouvée pour ce tenant"
+    )
+
+
+@router.post("/active/{pharmacy_id}", response_model=dict)
+def set_active_pharmacy(
+    pharmacy_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """
+    Définit la pharmacie active pour l'utilisateur connecté.
+    """
+    try:
+        UUID(pharmacy_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID de pharmacie invalide"
+        )
+    
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id,
+        Pharmacy.is_active == True
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée ou inactive"
+        )
+    
+    # Mettre à jour l'utilisateur
+    current_user.active_pharmacy_id = pharmacy.id
+    db.commit()
+    
+    return {
+        "id": str(pharmacy.id),
+        "name": pharmacy.name,
+        "message": "Pharmacie active mise à jour avec succès"
+    }
+
+
 @router.post("/", response_model=PharmacyResponse, status_code=status.HTTP_201_CREATED)
 def create_pharmacy(
     pharmacy_in: PharmacyCreate,
@@ -256,7 +334,7 @@ def create_pharmacy(
             detail="Ce numéro de licence est déjà utilisé"
         )
     
-    # Configuration par défaut avec heures en heure locale (Paris/RDC)
+    # Configuration par défaut complète
     default_config = {
         "pharmacyInfo": {
             "name": pharmacy_in.nom or pharmacy_in.name,
@@ -276,9 +354,9 @@ def create_pharmacy(
         "allowNegativeStock": False,
         "workingHours": {
             "enabled": True,
-            "startTime": "08:00",  # Heure locale (Paris/RDC)
-            "endTime": "20:00",     # Heure locale (Paris/RDC)
-            "overtimeEndTime": "22:00",  # Heure locale (Paris/RDC)
+            "startTime": "08:00",
+            "endTime": "20:00",
+            "overtimeEndTime": "22:00",
             "daysOff": {
                 "monday": True,
                 "tuesday": True,
@@ -288,7 +366,7 @@ def create_pharmacy(
                 "saturday": True,
                 "sunday": False
             },
-            "timezone": "Africa/Kinshasa"  # Fuseau horaire par défaut
+            "timezone": "Africa/Kinshasa"
         },
         "productReturnDays": 30,
         "marginConfig": {
@@ -305,8 +383,15 @@ def create_pharmacy(
         "initialCapital": 0,
         "branchConfig": {
             "maxBranches": limits_check["max_branches_per_pharmacy"],
-            "currentBranches": 0
+            "currentBranches": 0,
+            "branches": []
         },
+        # Champs pour la configuration de vente
+        "salesType": "both",
+        "calcul_auto_prix": True,
+        "marge_par_defaut": 25,
+        "taux_tva": 16,
+        "lock_stock_modification": False,
         "createdAt": datetime.utcnow().isoformat(),
         "updatedAt": datetime.utcnow().isoformat()
     }
@@ -346,7 +431,11 @@ def create_pharmacy(
     
     db.commit()
     
-    # Convertir explicitement les UUIDs en strings pour la réponse
+    # Définir comme pharmacie active si c'est la première
+    if limits_check["current_count"] == 0:
+        current_user.active_pharmacy_id = pharmacy.id
+        db.commit()
+    
     pharmacy_dict = {
         "id": str(pharmacy.id),
         "tenant_id": str(pharmacy.tenant_id),
@@ -370,743 +459,6 @@ def create_pharmacy(
     return pharmacy_dict
 
 
-# ROUTES DE CONFIGURATION
-@router.get("/{pharmacy_id}/config", response_model=PharmacyConfigResponse)
-def get_pharmacy_config(
-    pharmacy_id: str = Path(..., description="ID de la pharmacie (UUID)"),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-    current_tenant: Tenant = Depends(get_current_tenant)
-):
-    """Récupère la configuration complète d'une pharmacie"""
-    # Validation optionnelle de l'UUID
-    try:
-        UUID(pharmacy_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Format d'ID de pharmacie invalide"
-        )
-    
-    pharmacy = db.query(Pharmacy).filter(
-        Pharmacy.id == pharmacy_id,
-        Pharmacy.tenant_id == current_tenant.id
-    ).first()
-    
-    if not pharmacy:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Pharmacie non trouvée"
-        )
-    
-    return {
-        "pharmacy_id": pharmacy_id,
-        "config": pharmacy.config or {},
-        "updated_at": pharmacy.updated_at
-    }
-
-
-@router.patch("/{pharmacy_id}/config", response_model=PharmacyConfigResponse)
-def update_pharmacy_config(
-    pharmacy_id: str,
-    config_in: PharmacyConfigUpdate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-    current_tenant: Tenant = Depends(get_current_tenant)
-):
-    """Met à jour la configuration d'une pharmacie"""
-    # Validation de l'UUID
-    try:
-        UUID(pharmacy_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Format d'ID de pharmacie invalide"
-        )
-    
-    pharmacy = db.query(Pharmacy).filter(
-        Pharmacy.id == pharmacy_id,
-        Pharmacy.tenant_id == current_tenant.id
-    ).first()
-    
-    if not pharmacy:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Pharmacie non trouvée"
-        )
-    
-    # Récupérer la config actuelle ou initialiser
-    current_config = pharmacy.config or {}
-    
-    # Mettre à jour uniquement les champs fournis
-    update_data = config_in.dict(exclude_unset=True, exclude_none=True)
-    
-    # Fusion profonde des données
-    def deep_merge(original, updates):
-        for key, value in updates.items():
-            if isinstance(value, dict) and key in original and isinstance(original[key], dict):
-                deep_merge(original[key], value)
-            else:
-                original[key] = value
-        return original
-    
-    # Appliquer les mises à jour
-    updated_config = deep_merge(current_config.copy(), update_data)
-    
-    # Ajouter la date de mise à jour
-    updated_config["updatedAt"] = datetime.utcnow().isoformat()
-    
-    # Mettre à jour la pharmacie
-    pharmacy.config = updated_config
-    pharmacy.updated_at = datetime.utcnow()
-    
-    # Commit explicite
-    db.commit()
-    db.refresh(pharmacy)
-    
-    return {
-        "pharmacy_id": pharmacy_id,
-        "config": pharmacy.config,
-        "updated_at": pharmacy.updated_at
-    }
-
-@router.patch("/{pharmacy_id}/config/currencies")
-def update_currencies_config(
-    pharmacy_id: str,
-    currencies: List[CurrencyConfig],
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-    current_tenant: Tenant = Depends(get_current_tenant)
-):
-    """Met à jour la configuration des devises"""
-    # Validation optionnelle de l'UUID
-    try:
-        UUID(pharmacy_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Format d'ID de pharmacie invalide"
-        )
-    
-    pharmacy = db.query(Pharmacy).filter(
-        Pharmacy.id == pharmacy_id,
-        Pharmacy.tenant_id == current_tenant.id
-    ).first()
-    
-    if not pharmacy:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Pharmacie non trouvée"
-        )
-    
-    # VALIDATION DES TAUX DE CHANGE
-    for currency in currencies:
-        # Vérifier que le taux de change est valide
-        if currency.exchangeRate <= 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Le taux de change pour {currency.code} doit être supérieur à 0"
-            )
-        
-        # Pour USD, le taux doit être exactement 1 (devise de référence)
-        if currency.code == "USD" and currency.exchangeRate != 1:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Le taux de change pour USD doit être 1 (devise de référence)"
-            )
-    
-    # S'assurer qu'au moins une devise est active
-    if not any(c.isActive for c in currencies):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Au moins une devise doit être active"
-        )
-    
-    config = pharmacy.config or {}
-    config["currencies"] = [c.dict() for c in currencies]
-    config["updatedAt"] = datetime.utcnow().isoformat()
-    pharmacy.config = config
-    pharmacy.updated_at = datetime.utcnow()
-    
-    db.commit()
-    
-    return {"message": "Configuration des devises mise à jour", "currencies": currencies}
-
-
-@router.patch("/{pharmacy_id}/config/working-hours")
-def update_working_hours(
-    pharmacy_id: str,
-    working_hours: WorkingHoursConfig,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-    current_tenant: Tenant = Depends(get_current_tenant)
-):
-    """Met à jour les heures de service"""
-    # Validation optionnelle de l'UUID
-    try:
-        UUID(pharmacy_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Format d'ID de pharmacie invalide"
-        )
-    
-    pharmacy = db.query(Pharmacy).filter(
-        Pharmacy.id == pharmacy_id,
-        Pharmacy.tenant_id == current_tenant.id
-    ).first()
-    
-    if not pharmacy:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Pharmacie non trouvée"
-        )
-    
-    config = pharmacy.config or {}
-    config["workingHours"] = working_hours.dict()
-    config["updatedAt"] = datetime.utcnow().isoformat()
-    pharmacy.config = config
-    pharmacy.updated_at = datetime.utcnow()
-    
-    db.commit()
-    
-    return {"message": "Heures de service mises à jour", "working_hours": working_hours}
-
-
-@router.patch("/{pharmacy_id}/config/pricing")
-def update_pricing_config(
-    pharmacy_id: str,
-    pricing: AutomaticPricingConfig,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-    current_tenant: Tenant = Depends(get_current_tenant)
-):
-    """Met à jour la configuration des prix"""
-    # Validation optionnelle de l'UUID
-    try:
-        UUID(pharmacy_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Format d'ID de pharmacie invalide"
-        )
-    
-    pharmacy = db.query(Pharmacy).filter(
-        Pharmacy.id == pharmacy_id,
-        Pharmacy.tenant_id == current_tenant.id
-    ).first()
-    
-    if not pharmacy:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Pharmacie non trouvée"
-        )
-    
-    config = pharmacy.config or {}
-    config["automaticPricing"] = pricing.dict()
-    config["updatedAt"] = datetime.utcnow().isoformat()
-    pharmacy.config = config
-    pharmacy.updated_at = datetime.utcnow()
-    
-    db.commit()
-    
-    return {"message": "Configuration des prix mise à jour", "pricing": pricing}
-
-
-@router.patch("/{pharmacy_id}/config/theme")
-def update_theme(
-    pharmacy_id: str,
-    theme: ThemeConfig,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-    current_tenant: Tenant = Depends(get_current_tenant)
-):
-    """Met à jour le thème de l'application"""
-    # Validation optionnelle de l'UUID
-    try:
-        UUID(pharmacy_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Format d'ID de pharmacie invalide"
-        )
-    
-    pharmacy = db.query(Pharmacy).filter(
-        Pharmacy.id == pharmacy_id,
-        Pharmacy.tenant_id == current_tenant.id
-    ).first()
-    
-    if not pharmacy:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Pharmacie non trouvée"
-        )
-    
-    config = pharmacy.config or {}
-    config["theme"] = theme.theme
-    config["updatedAt"] = datetime.utcnow().isoformat()
-    pharmacy.config = config
-    pharmacy.updated_at = datetime.utcnow()
-    
-    db.commit()
-    
-    return {"message": "Thème mis à jour", "theme": theme.theme}
-
-
-@router.post("/{pharmacy_id}/branches", response_model=dict)
-def create_branch(
-    pharmacy_id: str,
-    branch_data: dict,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-    current_tenant: Tenant = Depends(get_current_tenant)
-):
-    """Crée une nouvelle succursale pour une pharmacie"""
-    # Validation optionnelle de l'UUID
-    try:
-        UUID(pharmacy_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Format d'ID de pharmacie invalide"
-        )
-    
-    pharmacy = db.query(Pharmacy).filter(
-        Pharmacy.id == pharmacy_id,
-        Pharmacy.tenant_id == current_tenant.id
-    ).first()
-    
-    if not pharmacy:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Pharmacie non trouvée"
-        )
-    
-    # Vérifier les limites de succursales
-    limits_check = PharmacyLimits.can_create_branch(pharmacy, current_tenant)
-    
-    if not limits_check["can_create"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=limits_check["reason"]
-        )
-    
-    config = pharmacy.config or {}
-    branch_config = config.get("branchConfig", {
-        "maxBranches": limits_check["max_branches_allowed"],
-        "currentBranches": 0,
-        "branches": []
-    })
-    
-    # Ajouter la nouvelle succursale
-    if "branches" not in branch_config:
-        branch_config["branches"] = []
-    
-    new_branch = {
-        "id": f"branch_{len(branch_config['branches']) + 1}",
-        "name": branch_data.get("name", f"Succursale {len(branch_config['branches']) + 1}"),
-        "address": branch_data.get("address", ""),
-        "phone": branch_data.get("phone", ""),
-        "email": branch_data.get("email", ""),
-        "manager": branch_data.get("manager", ""),
-        "created_at": datetime.utcnow().isoformat(),
-        "is_active": True
-    }
-    
-    branch_config["branches"].append(new_branch)
-    branch_config["currentBranches"] = len(branch_config["branches"])
-    branch_config["maxBranches"] = limits_check["max_branches_allowed"]
-    
-    config["branchConfig"] = branch_config
-    config["updatedAt"] = datetime.utcnow().isoformat()
-    pharmacy.config = config
-    pharmacy.updated_at = datetime.utcnow()
-    
-    db.commit()
-    
-    return {
-        "message": "Succursale créée avec succès",
-        "branch": new_branch,
-        "remaining": limits_check["remaining"] - 1,
-        "current_branches": branch_config["currentBranches"],
-        "max_allowed": limits_check["max_branches_allowed"]
-    }
-
-@router.get("/{pharmacy_id}/service-status")
-def check_service_status(
-    pharmacy_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-    current_tenant: Optional[Tenant] = Depends(get_current_tenant)
-):
-    """
-    Vérifie si la pharmacie est en service selon les heures configurées.
-    """
-    # Validation de l'UUID
-    try:
-        UUID(pharmacy_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Format d'ID de pharmacie invalide"
-        )
-    
-    # Récupérer la pharmacie - super admin peut voir toutes les pharmacies
-    pharmacy_query = db.query(Pharmacy).filter(Pharmacy.id == pharmacy_id)
-    
-    # Si l'utilisateur n'est pas super admin, filtrer par tenant
-    if current_user.role not in ["super_admin", "superadmin"]:
-        if not current_tenant:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Accès non autorisé"
-            )
-        pharmacy_query = pharmacy_query.filter(Pharmacy.tenant_id == current_tenant.id)
-    
-    pharmacy = pharmacy_query.first()
-    
-    if not pharmacy:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Pharmacie non trouvée"
-        )
-    
-    # Récupérer la configuration
-    config = pharmacy.config or {}
-    working_hours = config.get("workingHours", {})
-    
-    # Logging pour débogage
-    import logging
-    logger = logging.getLogger(__name__)
-    logger.info(f"=== VÉRIFICATION SERVICE PHARMACIE {pharmacy_id} ===")
-    logger.info(f"Configuration workingHours: {working_hours}")
-    
-    # Si les restrictions ne sont pas activées, toujours en service
-    if not working_hours.get("enabled", True):
-        logger.info("Restrictions désactivées -> SERVICE DISPONIBLE")
-        return {
-            "in_service": True,
-            "restrictions_enabled": False,
-            "message": "Service toujours disponible (pas de restriction horaire)",
-            "current_time_utc": datetime.now(pytz.UTC).isoformat(),
-        }
-    
-    # Récupérer le fuseau horaire de la pharmacie
-    timezone_str = working_hours.get("timezone", "Africa/Kinshasa")
-    
-    try:
-        tz = pytz.timezone(timezone_str)
-        now_local = datetime.now(tz)
-        now_utc = datetime.now(pytz.UTC)
-        logger.info(f"Heure locale ({timezone_str}): {now_local.strftime('%Y-%m-%d %H:%M:%S')}")
-        logger.info(f"Heure UTC: {now_utc.strftime('%Y-%m-%d %H:%M:%S')}")
-    except Exception as e:
-        logger.error(f"Erreur fuseau horaire: {e}, utilisation UTC")
-        tz = pytz.UTC
-        now_local = datetime.now(pytz.UTC)
-        now_utc = now_local
-        timezone_str = "UTC"
-    
-    # Heure actuelle en minutes depuis minuit
-    current_minutes = now_local.hour * 60 + now_local.minute
-    current_day = now_local.strftime("%A").lower()
-    
-    logger.info(f"Jour actuel: {current_day}")
-    logger.info(f"Heure actuelle: {now_local.hour:02d}:{now_local.minute:02d} ({current_minutes} minutes)")
-    
-    # Récupérer la configuration des jours de service
-    days_off = working_hours.get("daysOff", {})
-    logger.info(f"Configuration daysOff (True = OUVERT): {days_off}")
-    
-    # Si days_off est vide, utiliser les valeurs par défaut
-    if not days_off:
-        days_off = {
-            "monday": True,
-            "tuesday": True,
-            "wednesday": True,
-            "thursday": True,
-            "friday": True,
-            "saturday": True,
-            "sunday": False
-        }
-        logger.info(f"Utilisation des valeurs par défaut: {days_off}")
-    
-    # Vérifier si aujourd'hui est un jour OUVERT
-    is_open_today = days_off.get(current_day, False)
-    is_working_day = is_open_today
-    
-    logger.info(f"Aujourd'hui est ouvert? {is_open_today} -> Jour travaillé? {is_working_day}")
-    
-    # Récupérer les heures d'ouverture
-    start_time_str = working_hours.get("startTime", "08:00")
-    end_time_str = working_hours.get("endTime", "20:00")
-    
-    logger.info(f"Heures d'ouverture: {start_time_str} - {end_time_str}")
-    
-    try:
-        start_parts = start_time_str.split(":")
-        end_parts = end_time_str.split(":")
-        start_minutes = int(start_parts[0]) * 60 + int(start_parts[1])
-        end_minutes = int(end_parts[0]) * 60 + int(end_parts[1])
-    except (ValueError, IndexError) as e:
-        logger.error(f"Erreur format heure: {e}, utilisation valeurs par défaut")
-        start_minutes = 8 * 60  # 08:00
-        end_minutes = 20 * 60   # 20:00
-        start_time_str = "08:00"
-        end_time_str = "20:00"
-    
-    # Vérifier si l'heure actuelle est dans la plage d'ouverture
-    if end_minutes < start_minutes:
-        # Service qui passe minuit
-        if current_minutes >= start_minutes or current_minutes <= end_minutes:
-            is_within_hours = True
-            logger.info(f"Heure {current_minutes} dans plage nuit ({start_minutes}-{end_minutes})")
-        else:
-            is_within_hours = False
-            logger.info(f"Heure {current_minutes} hors plage nuit ({start_minutes}-{end_minutes})")
-    else:
-        # Cas normal
-        is_within_hours = start_minutes <= current_minutes <= end_minutes
-        logger.info(f"Heure {current_minutes} dans plage {start_minutes}-{end_minutes}? {is_within_hours}")
-    
-    # Déterminer si la pharmacie est en service
-    in_service = is_working_day and is_within_hours
-    logger.info(f"Résultat final - Jour ouvert: {is_working_day}, Dans heures: {is_within_hours} -> EN SERVICE? {in_service}")
-    
-    # Calculer le prochain service pour aider l'utilisateur
-    next_service_info = calculate_next_service_time(
-        current_day=current_day,
-        current_minutes=current_minutes,
-        working_hours=working_hours,
-        is_working_day=is_working_day,
-        start_minutes=start_minutes,
-        end_minutes=end_minutes,
-        days_off=days_off
-    )
-    
-    logger.info(f"Prochain service: {next_service_info}")
-    logger.info("========================================")
-    
-    # Construire la réponse
-    response = {
-        "in_service": in_service,
-        "restrictions_enabled": True,
-        "current_time_utc": now_utc.isoformat(),
-        "current_time_local": now_local.isoformat(),
-        "timezone": timezone_str,
-        "current_day": current_day,
-        "is_working_day": is_working_day,
-        "is_open_today": is_open_today,
-        "is_within_hours": is_within_hours,
-        "working_hours": {
-            "start": start_time_str,
-            "end": end_time_str,
-            "overtime": working_hours.get("overtimeEndTime")
-        },
-        "message": "✅ En service" if in_service else "❌ Hors service",
-    }
-    
-    if next_service_info:
-        response["next_service_time"] = next_service_info
-    
-    return response
-# ==================== FONCTIONS UTILITAIRES ====================
-
-def calculate_next_service_time(
-    current_day: str,
-    current_minutes: int,
-    working_hours: dict,
-    is_working_day: bool,
-    start_minutes: int,
-    end_minutes: int,
-    days_off: dict
-) -> str | None:
-    """
-    Calcule le prochain moment où la pharmacie sera en service.
-    
-    CORRECTION: days_off[day] = True signifie jour OUVERT
-    """
-    # Récupérer l'heure d'ouverture formatée pour l'affichage
-    start_time_str = working_hours.get("startTime", "08:00")
-    
-    # CAS 1: Jour ouvert mais avant l'ouverture
-    if is_working_day and current_minutes < start_minutes:
-        return f"{start_time_str} (aujourd'hui)"
-    
-    # CAS 2: Jour ouvert mais après la fermeture
-    if is_working_day and current_minutes > end_minutes:
-        return find_next_open_day(current_day, start_time_str, days_off)
-    
-    # CAS 3: Jour fermé
-    if not is_working_day:
-        return find_next_open_day(current_day, start_time_str, days_off)
-    
-    # CAS 4: Déjà en service (aucun message à retourner)
-    return None
-
-
-def find_next_open_day(current_day: str, start_time: str, days_off: dict) -> str:
-    """
-    Trouve le prochain jour OUVERT dans la semaine.
-    
-    CORRECTION: days_off[day] = True signifie jour OUVERT
-    
-    Args:
-        current_day: Jour actuel en anglais
-        start_time: Heure d'ouverture formatée (HH:MM)
-        days_off: Dictionnaire des jours ouverts (True = ouvert)
-    
-    Returns:
-        str: Description du prochain jour ouvert avec l'heure
-    """
-    # Ordre des jours de la semaine
-    days_order = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-    
-    # Traduction des jours en français pour l'affichage
-    day_names_fr = {
-        "monday": "lundi", 
-        "tuesday": "mardi", 
-        "wednesday": "mercredi",
-        "thursday": "jeudi", 
-        "friday": "vendredi", 
-        "saturday": "samedi",
-        "sunday": "dimanche"
-    }
-    
-    # Trouver l'index du jour actuel
-    try:
-        current_index = days_order.index(current_day)
-    except ValueError:
-        # Si le jour n'est pas reconnu, on part de lundi
-        current_index = 0
-    
-    # Parcourir les 7 prochains jours
-    for i in range(1, 8):  # i = 1 à 7
-        next_index = (current_index + i) % 7
-        next_day = days_order[next_index]
-        
-        # CORRECTION: Vérifier si ce jour est OUVERT
-        # Un jour est ouvert si days_off[next_day] = True
-        is_open = days_off.get(next_day, False)
-        
-        if is_open:
-            day_name_fr = day_names_fr.get(next_day, next_day)
-            
-            # Formatage du message selon le délai
-            if i == 1:
-                return f"{start_time} demain"
-            else:
-                return f"{start_time} {day_name_fr}"
-    
-    # Si aucun jour n'est trouvé (tous les jours sont fermés)
-    return "aucun jour d'ouverture configuré"
-
-# ==================== FIN DES FONCTIONS UTILITAIRES ====================
-
-# ROUTES CRUD STANDARD
-@router.delete("/{pharmacy_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_pharmacy(
-    pharmacy_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-    current_tenant: Tenant = Depends(get_current_tenant)
-):
-    """Désactive une pharmacie (soft delete)"""
-    # Validation optionnelle de l'UUID
-    try:
-        UUID(pharmacy_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Format d'ID de pharmacie invalide"
-        )
-    
-    pharmacy = db.query(Pharmacy).filter(
-        Pharmacy.id == pharmacy_id,
-        Pharmacy.tenant_id == current_tenant.id
-    ).first()
-    
-    if not pharmacy:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Pharmacie non trouvée"
-        )
-    
-    # Désactiver plutôt que supprimer
-    pharmacy.is_active = False
-    pharmacy.updated_at = datetime.utcnow()
-    
-    db.commit()
-
-
-@router.post("/{pharmacy_id}/reactivate", response_model=PharmacyResponse)
-def reactivate_pharmacy(
-    pharmacy_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-    current_tenant: Tenant = Depends(get_current_tenant)
-):
-    """Réactive une pharmacie désactivée"""
-    # Validation optionnelle de l'UUID
-    try:
-        UUID(pharmacy_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Format d'ID de pharmacie invalide"
-        )
-    
-    pharmacy = db.query(Pharmacy).filter(
-        Pharmacy.id == pharmacy_id,
-        Pharmacy.tenant_id == current_tenant.id
-    ).first()
-    
-    if not pharmacy:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Pharmacie non trouvée"
-        )
-    
-    # Vérifier les limites avant de réactiver
-    limits_check = PharmacyLimits.can_create_pharmacy(db, current_tenant)
-    if not limits_check["can_create"] and not pharmacy.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Impossible de réactiver: {limits_check['reason']}"
-        )
-    
-    # Réactiver la pharmacie
-    pharmacy.is_active = True
-    pharmacy.updated_at = datetime.utcnow()
-    
-    db.commit()
-    db.refresh(pharmacy)
-    
-    # Convertir explicitement les UUIDs en strings pour la réponse
-    pharmacy_dict = {
-        "id": str(pharmacy.id),
-        "tenant_id": str(pharmacy.tenant_id),
-        "nom": pharmacy.name,
-        "name": pharmacy.name,
-        "license_number": pharmacy.license_number,
-        "address": pharmacy.address,
-        "city": pharmacy.city,
-        "country": pharmacy.country,
-        "phone": pharmacy.phone,
-        "email": pharmacy.email,
-        "is_active": pharmacy.is_active,
-        "opening_hours": pharmacy.opening_hours,
-        "pharmacist_in_charge": pharmacy.pharmacist_in_charge,
-        "pharmacist_license": pharmacy.pharmacist_license,
-        "config": pharmacy.config,
-        "created_at": pharmacy.created_at,
-        "updated_at": pharmacy.updated_at
-    }
-    
-    return pharmacy_dict
-
-
-# ROUTES AVEC PARAMÈTRES TOUJOURS EN DERNIER
 @router.get("/{pharmacy_id}", response_model=PharmacyResponse)
 def get_pharmacy(
     pharmacy_id: str,
@@ -1115,7 +467,6 @@ def get_pharmacy(
     current_tenant: Tenant = Depends(get_current_tenant)
 ):
     """Récupère une pharmacie spécifique"""
-    # Validation optionnelle de l'UUID
     try:
         UUID(pharmacy_id)
     except ValueError:
@@ -1135,7 +486,6 @@ def get_pharmacy(
             detail="Pharmacie non trouvée"
         )
     
-    # Convertir explicitement les UUIDs en strings pour la réponse
     pharmacy_dict = {
         "id": str(pharmacy.id),
         "tenant_id": str(pharmacy.tenant_id),
@@ -1168,7 +518,6 @@ def update_pharmacy(
     current_tenant: Tenant = Depends(get_current_tenant)
 ):
     """Met à jour une pharmacie"""
-    # Validation optionnelle de l'UUID
     try:
         UUID(pharmacy_id)
     except ValueError:
@@ -1209,7 +558,6 @@ def update_pharmacy(
     db.commit()
     db.refresh(pharmacy)
     
-    # Convertir explicitement les UUIDs en strings pour la réponse
     pharmacy_dict = {
         "id": str(pharmacy.id),
         "tenant_id": str(pharmacy.tenant_id),
@@ -1233,16 +581,14 @@ def update_pharmacy(
     return pharmacy_dict
 
 
-@router.get("/{pharmacy_id}/online-users")
-def get_online_users(
+@router.delete("/{pharmacy_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_pharmacy(
     pharmacy_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
 ):
-    """
-    Récupère la liste des utilisateurs en ligne pour une pharmacie
-    """
-    # Validation optionnelle de l'UUID
+    """Désactive une pharmacie (soft delete)"""
     try:
         UUID(pharmacy_id)
     except ValueError:
@@ -1251,7 +597,926 @@ def get_online_users(
             detail="Format d'ID de pharmacie invalide"
         )
     
-    # Vérifier que la pharmacie appartient au tenant de l'utilisateur
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    pharmacy.is_active = False
+    pharmacy.updated_at = datetime.utcnow()
+    
+    # Si c'était la pharmacie active de l'utilisateur, la désactiver
+    if current_user.active_pharmacy_id == pharmacy.id:
+        current_user.active_pharmacy_id = None
+    
+    db.commit()
+
+
+@router.post("/{pharmacy_id}/reactivate", response_model=PharmacyResponse)
+def reactivate_pharmacy(
+    pharmacy_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """Réactive une pharmacie désactivée"""
+    try:
+        UUID(pharmacy_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID de pharmacie invalide"
+        )
+    
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    limits_check = PharmacyLimits.can_create_pharmacy(db, current_tenant)
+    if not limits_check["can_create"] and not pharmacy.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Impossible de réactiver: {limits_check['reason']}"
+        )
+    
+    pharmacy.is_active = True
+    pharmacy.updated_at = datetime.utcnow()
+    
+    db.commit()
+    db.refresh(pharmacy)
+    
+    pharmacy_dict = {
+        "id": str(pharmacy.id),
+        "tenant_id": str(pharmacy.tenant_id),
+        "nom": pharmacy.name,
+        "name": pharmacy.name,
+        "license_number": pharmacy.license_number,
+        "address": pharmacy.address,
+        "city": pharmacy.city,
+        "country": pharmacy.country,
+        "phone": pharmacy.phone,
+        "email": pharmacy.email,
+        "is_active": pharmacy.is_active,
+        "opening_hours": pharmacy.opening_hours,
+        "pharmacist_in_charge": pharmacy.pharmacist_in_charge,
+        "pharmacist_license": pharmacy.pharmacist_license,
+        "config": pharmacy.config,
+        "created_at": pharmacy.created_at,
+        "updated_at": pharmacy.updated_at
+    }
+    
+    return pharmacy_dict
+
+
+# ==================== PHARMACY CONFIGURATION ====================
+
+@router.get("/{pharmacy_id}/config", response_model=PharmacyConfigResponse)
+def get_pharmacy_config(
+    pharmacy_id: str = Path(..., description="ID de la pharmacie (UUID)"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """Récupère la configuration complète d'une pharmacie"""
+    try:
+        UUID(pharmacy_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID de pharmacie invalide"
+        )
+    
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    return {
+        "pharmacy_id": pharmacy_id,
+        "config": pharmacy.config or {},
+        "updated_at": pharmacy.updated_at
+    }
+
+
+@router.patch("/{pharmacy_id}/config", response_model=PharmacyConfigResponse)
+def update_pharmacy_config(
+    pharmacy_id: str,
+    config_in: PharmacyConfigUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """Met à jour la configuration d'une pharmacie"""
+    try:
+        UUID(pharmacy_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID de pharmacie invalide"
+        )
+    
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    current_config = pharmacy.config or {}
+    update_data = config_in.dict(exclude_unset=True, exclude_none=True)
+    
+    def deep_merge(original, updates):
+        for key, value in updates.items():
+            if isinstance(value, dict) and key in original and isinstance(original[key], dict):
+                deep_merge(original[key], value)
+            else:
+                original[key] = value
+        return original
+    
+    updated_config = deep_merge(current_config.copy(), update_data)
+    updated_config["updatedAt"] = datetime.utcnow().isoformat()
+    
+    pharmacy.config = updated_config
+    pharmacy.updated_at = datetime.utcnow()
+    
+    db.commit()
+    db.refresh(pharmacy)
+    
+    return {
+        "pharmacy_id": pharmacy_id,
+        "config": pharmacy.config,
+        "updated_at": pharmacy.updated_at
+    }
+
+
+@router.patch("/{pharmacy_id}/config/sales", response_model=dict)
+def update_sales_config(
+    pharmacy_id: str,
+    sales_config: SalesConfig,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """Met à jour la configuration de vente (salesType, calcul_auto_prix, etc.)"""
+    try:
+        UUID(pharmacy_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID de pharmacie invalide"
+        )
+    
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    config = pharmacy.config or {}
+    
+    # Mettre à jour les champs de configuration de vente
+    config["salesType"] = sales_config.salesType
+    config["calcul_auto_prix"] = sales_config.calcul_auto_prix
+    config["marge_par_defaut"] = sales_config.marge_par_defaut
+    config["taux_tva"] = sales_config.taux_tva
+    config["lock_stock_modification"] = sales_config.lock_stock_modification
+    config["updatedAt"] = datetime.utcnow().isoformat()
+    
+    pharmacy.config = config
+    pharmacy.updated_at = datetime.utcnow()
+    
+    db.commit()
+    
+    return {
+        "message": "Configuration de vente mise à jour",
+        "sales_config": {
+            "salesType": config["salesType"],
+            "calcul_auto_prix": config["calcul_auto_prix"],
+            "marge_par_defaut": config["marge_par_defaut"],
+            "taux_tva": config["taux_tva"],
+            "lock_stock_modification": config["lock_stock_modification"]
+        }
+    }
+
+
+@router.patch("/{pharmacy_id}/config/currencies")
+def update_currencies_config(
+    pharmacy_id: str,
+    currencies: List[CurrencyConfig],
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """Met à jour la configuration des devises"""
+    try:
+        UUID(pharmacy_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID de pharmacie invalide"
+        )
+    
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    for currency in currencies:
+        if currency.exchangeRate <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Le taux de change pour {currency.code} doit être supérieur à 0"
+            )
+        
+        if currency.code == "USD" and currency.exchangeRate != 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Le taux de change pour USD doit être 1 (devise de référence)"
+            )
+    
+    if not any(c.isActive for c in currencies):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Au moins une devise doit être active"
+        )
+    
+    config = pharmacy.config or {}
+    config["currencies"] = [c.dict() for c in currencies]
+    config["updatedAt"] = datetime.utcnow().isoformat()
+    pharmacy.config = config
+    pharmacy.updated_at = datetime.utcnow()
+    
+    db.commit()
+    
+    return {"message": "Configuration des devises mise à jour", "currencies": currencies}
+
+
+@router.patch("/{pharmacy_id}/config/working-hours")
+def update_working_hours(
+    pharmacy_id: str,
+    working_hours: WorkingHoursConfig,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """Met à jour les heures de service"""
+    try:
+        UUID(pharmacy_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID de pharmacie invalide"
+        )
+    
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    config = pharmacy.config or {}
+    config["workingHours"] = working_hours.dict()
+    config["updatedAt"] = datetime.utcnow().isoformat()
+    pharmacy.config = config
+    pharmacy.updated_at = datetime.utcnow()
+    
+    db.commit()
+    
+    return {"message": "Heures de service mises à jour", "working_hours": working_hours}
+
+
+@router.patch("/{pharmacy_id}/config/pricing")
+def update_pricing_config(
+    pharmacy_id: str,
+    pricing: AutomaticPricingConfig,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """Met à jour la configuration des prix"""
+    try:
+        UUID(pharmacy_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID de pharmacie invalide"
+        )
+    
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    config = pharmacy.config or {}
+    config["automaticPricing"] = pricing.dict()
+    config["updatedAt"] = datetime.utcnow().isoformat()
+    pharmacy.config = config
+    pharmacy.updated_at = datetime.utcnow()
+    
+    db.commit()
+    
+    return {"message": "Configuration des prix mise à jour", "pricing": pricing}
+
+
+@router.patch("/{pharmacy_id}/config/theme")
+def update_theme(
+    pharmacy_id: str,
+    theme: ThemeConfig,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """Met à jour le thème de l'application"""
+    try:
+        UUID(pharmacy_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID de pharmacie invalide"
+        )
+    
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    config = pharmacy.config or {}
+    config["theme"] = theme.theme
+    config["updatedAt"] = datetime.utcnow().isoformat()
+    pharmacy.config = config
+    pharmacy.updated_at = datetime.utcnow()
+    
+    db.commit()
+    
+    return {"message": "Thème mis à jour", "theme": theme.theme}
+
+
+# ==================== BRANCHES MANAGEMENT ====================
+
+@router.get("/{pharmacy_id}/branches", response_model=List[BranchResponse])
+def get_branches(
+    pharmacy_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant),
+    active_only: bool = True
+):
+    """Récupère toutes les branches d'une pharmacie"""
+    try:
+        UUID(pharmacy_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID de pharmacie invalide"
+        )
+    
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    query = db.query(Branch).filter(Branch.parent_pharmacy_id == pharmacy.id)
+    
+    if active_only:
+        query = query.filter(Branch.is_active == True)
+    
+    branches = query.order_by(Branch.is_main_branch.desc(), Branch.created_at.asc()).all()
+    
+    return branches
+
+
+@router.get("/{pharmacy_id}/branches/{branch_id}", response_model=BranchResponse)
+def get_branch(
+    pharmacy_id: str,
+    branch_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """Récupère une branche spécifique"""
+    try:
+        UUID(pharmacy_id)
+        UUID(branch_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID invalide"
+        )
+    
+    branch = db.query(Branch).filter(
+        Branch.id == branch_id,
+        Branch.parent_pharmacy_id == pharmacy_id,
+        Branch.tenant_id == current_tenant.id
+    ).first()
+    
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Branche non trouvée"
+        )
+    
+    return branch
+
+
+@router.post("/{pharmacy_id}/branches", response_model=BranchResponse, status_code=status.HTTP_201_CREATED)
+def create_branch(
+    pharmacy_id: str,
+    branch_in: BranchCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """Crée une nouvelle succursale pour une pharmacie"""
+    try:
+        UUID(pharmacy_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID de pharmacie invalide"
+        )
+    
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    # Vérifier les limites
+    limits_check = PharmacyLimits.can_create_branch(pharmacy, current_tenant, db)
+    
+    if not limits_check["can_create"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=limits_check["reason"]
+        )
+    
+    # Vérifier si c'est la première branche (devient branche principale)
+    existing_branches_count = db.query(Branch).filter(
+        Branch.parent_pharmacy_id == pharmacy.id,
+        Branch.is_active == True
+    ).count()
+    
+    is_main_branch = existing_branches_count == 0
+    
+    # Générer un code unique
+    code = branch_in.code or f"{pharmacy.name[:3].upper()}{existing_branches_count + 1:03d}"
+    
+    # Créer la branche
+    branch = Branch(
+        tenant_id=current_tenant.id,
+        parent_pharmacy_id=pharmacy.id,
+        name=branch_in.name,
+        code=code,
+        address=branch_in.address,
+        city=branch_in.city,
+        country=branch_in.country or pharmacy.country,
+        phone=branch_in.phone or pharmacy.phone,
+        email=branch_in.email or pharmacy.email,
+        latitude=branch_in.latitude,
+        longitude=branch_in.longitude,
+        manager_id=branch_in.manager_id,
+        manager_name=branch_in.manager_name,
+        opening_hours=branch_in.opening_hours,
+        config=branch_in.config or {},
+        is_active=True,
+        is_main_branch=is_main_branch,
+        created_by=current_user.id
+    )
+    
+    db.add(branch)
+    
+    # Mettre à jour la config de la pharmacie
+    config = pharmacy.config or {}
+    if "branchConfig" not in config:
+        config["branchConfig"] = {"maxBranches": limits_check["max_branches_allowed"], "currentBranches": 0, "branches": []}
+    
+    config["branchConfig"]["currentBranches"] = existing_branches_count + 1
+    config["branchConfig"]["maxBranches"] = limits_check["max_branches_allowed"]
+    
+    # Ajouter la branche dans la liste pour compatibilité
+    if "branches" not in config["branchConfig"]:
+        config["branchConfig"]["branches"] = []
+    
+    config["branchConfig"]["branches"].append({
+        "id": str(branch.id),
+        "name": branch.name,
+        "code": branch.code,
+        "address": branch.address,
+        "city": branch.city,
+        "phone": branch.phone,
+        "email": branch.email,
+        "is_main_branch": is_main_branch
+    })
+    
+    config["updatedAt"] = datetime.utcnow().isoformat()
+    pharmacy.config = config
+    pharmacy.updated_at = datetime.utcnow()
+    
+    db.commit()
+    db.refresh(branch)
+    
+    return branch
+
+
+@router.put("/{pharmacy_id}/branches/{branch_id}", response_model=BranchResponse)
+def update_branch(
+    pharmacy_id: str,
+    branch_id: str,
+    branch_in: BranchUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """Met à jour une succursale"""
+    try:
+        UUID(pharmacy_id)
+        UUID(branch_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID invalide"
+        )
+    
+    branch = db.query(Branch).filter(
+        Branch.id == branch_id,
+        Branch.parent_pharmacy_id == pharmacy_id,
+        Branch.tenant_id == current_tenant.id
+    ).first()
+    
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Branche non trouvée"
+        )
+    
+    update_data = branch_in.dict(exclude_unset=True, exclude_none=True)
+    
+    for field, value in update_data.items():
+        setattr(branch, field, value)
+    
+    branch.updated_at = datetime.utcnow()
+    
+    # Mettre à jour la config de la pharmacie
+    pharmacy = db.query(Pharmacy).filter(Pharmacy.id == pharmacy_id).first()
+    if pharmacy and pharmacy.config:
+        config = pharmacy.config
+        if "branchConfig" in config and "branches" in config["branchConfig"]:
+            for b in config["branchConfig"]["branches"]:
+                if b.get("id") == branch_id:
+                    b.update({
+                        "name": branch.name,
+                        "code": branch.code,
+                        "address": branch.address,
+                        "city": branch.city,
+                        "phone": branch.phone,
+                        "email": branch.email
+                    })
+                    break
+            config["updatedAt"] = datetime.utcnow().isoformat()
+            pharmacy.config = config
+            pharmacy.updated_at = datetime.utcnow()
+    
+    db.commit()
+    db.refresh(branch)
+    
+    return branch
+
+
+@router.delete("/{pharmacy_id}/branches/{branch_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_branch(
+    pharmacy_id: str,
+    branch_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """Désactive une succursale (soft delete)"""
+    try:
+        UUID(pharmacy_id)
+        UUID(branch_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID invalide"
+        )
+    
+    branch = db.query(Branch).filter(
+        Branch.id == branch_id,
+        Branch.parent_pharmacy_id == pharmacy_id,
+        Branch.tenant_id == current_tenant.id
+    ).first()
+    
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Branche non trouvée"
+        )
+    
+    # Ne pas supprimer la branche principale si c'est la seule
+    if branch.is_main_branch:
+        other_branches = db.query(Branch).filter(
+            Branch.parent_pharmacy_id == pharmacy_id,
+            Branch.id != branch_id,
+            Branch.is_active == True
+        ).count()
+        
+        if other_branches == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Impossible de supprimer la branche principale. Transférez d'abord les données vers une autre branche."
+            )
+    
+    branch.is_active = False
+    branch.updated_at = datetime.utcnow()
+    
+    # Mettre à jour la config de la pharmacie
+    pharmacy = db.query(Pharmacy).filter(Pharmacy.id == pharmacy_id).first()
+    if pharmacy and pharmacy.config:
+        config = pharmacy.config
+        if "branchConfig" in config:
+            if "currentBranches" in config["branchConfig"]:
+                config["branchConfig"]["currentBranches"] = max(0, config["branchConfig"]["currentBranches"] - 1)
+            if "branches" in config["branchConfig"]:
+                config["branchConfig"]["branches"] = [b for b in config["branchConfig"]["branches"] if b.get("id") != branch_id]
+            config["updatedAt"] = datetime.utcnow().isoformat()
+            pharmacy.config = config
+            pharmacy.updated_at = datetime.utcnow()
+    
+    db.commit()
+
+
+# ==================== SERVICE STATUS ====================
+
+@router.get("/{pharmacy_id}/service-status")
+def check_service_status(
+    pharmacy_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant)
+):
+    """Vérifie si la pharmacie est en service selon les heures configurées."""
+    try:
+        UUID(pharmacy_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID de pharmacie invalide"
+        )
+    
+    pharmacy_query = db.query(Pharmacy).filter(Pharmacy.id == pharmacy_id)
+    
+    if current_user.role not in ["super_admin", "superadmin"]:
+        if not current_tenant:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Accès non autorisé"
+            )
+        pharmacy_query = pharmacy_query.filter(Pharmacy.tenant_id == current_tenant.id)
+    
+    pharmacy = pharmacy_query.first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    config = pharmacy.config or {}
+    working_hours = config.get("workingHours", {})
+    
+    if not working_hours.get("enabled", True):
+        return {
+            "in_service": True,
+            "restrictions_enabled": False,
+            "message": "Service toujours disponible (pas de restriction horaire)",
+            "current_time_utc": datetime.now(pytz.UTC).isoformat(),
+        }
+    
+    timezone_str = working_hours.get("timezone", "Africa/Kinshasa")
+    
+    try:
+        tz = pytz.timezone(timezone_str)
+        now_local = datetime.now(tz)
+        now_utc = datetime.now(pytz.UTC)
+    except Exception:
+        tz = pytz.UTC
+        now_local = datetime.now(pytz.UTC)
+        now_utc = now_local
+        timezone_str = "UTC"
+    
+    current_minutes = now_local.hour * 60 + now_local.minute
+    current_day = now_local.strftime("%A").lower()
+    
+    days_off = working_hours.get("daysOff", {})
+    
+    if not days_off:
+        days_off = {
+            "monday": True,
+            "tuesday": True,
+            "wednesday": True,
+            "thursday": True,
+            "friday": True,
+            "saturday": True,
+            "sunday": False
+        }
+    
+    is_open_today = days_off.get(current_day, False)
+    is_working_day = is_open_today
+    
+    start_time_str = working_hours.get("startTime", "08:00")
+    end_time_str = working_hours.get("endTime", "20:00")
+    
+    try:
+        start_parts = start_time_str.split(":")
+        end_parts = end_time_str.split(":")
+        start_minutes = int(start_parts[0]) * 60 + int(start_parts[1])
+        end_minutes = int(end_parts[0]) * 60 + int(end_parts[1])
+    except (ValueError, IndexError):
+        start_minutes = 8 * 60
+        end_minutes = 20 * 60
+        start_time_str = "08:00"
+        end_time_str = "20:00"
+    
+    if end_minutes < start_minutes:
+        is_within_hours = current_minutes >= start_minutes or current_minutes <= end_minutes
+    else:
+        is_within_hours = start_minutes <= current_minutes <= end_minutes
+    
+    in_service = is_working_day and is_within_hours
+    
+    next_service_info = calculate_next_service_time(
+        current_day=current_day,
+        current_minutes=current_minutes,
+        working_hours=working_hours,
+        is_working_day=is_working_day,
+        start_minutes=start_minutes,
+        end_minutes=end_minutes,
+        days_off=days_off
+    )
+    
+    response = {
+        "in_service": in_service,
+        "restrictions_enabled": True,
+        "current_time_utc": now_utc.isoformat(),
+        "current_time_local": now_local.isoformat(),
+        "timezone": timezone_str,
+        "current_day": current_day,
+        "is_working_day": is_working_day,
+        "is_open_today": is_open_today,
+        "is_within_hours": is_within_hours,
+        "working_hours": {
+            "start": start_time_str,
+            "end": end_time_str,
+            "overtime": working_hours.get("overtimeEndTime")
+        },
+        "message": "✅ En service" if in_service else "❌ Hors service",
+    }
+    
+    if next_service_info:
+        response["next_service_time"] = next_service_info
+    
+    return response
+
+
+def calculate_next_service_time(
+    current_day: str,
+    current_minutes: int,
+    working_hours: dict,
+    is_working_day: bool,
+    start_minutes: int,
+    end_minutes: int,
+    days_off: dict
+) -> str | None:
+    """Calcule le prochain moment où la pharmacie sera en service."""
+    start_time_str = working_hours.get("startTime", "08:00")
+    
+    if is_working_day and current_minutes < start_minutes:
+        return f"{start_time_str} (aujourd'hui)"
+    
+    if is_working_day and current_minutes > end_minutes:
+        return find_next_open_day(current_day, start_time_str, days_off)
+    
+    if not is_working_day:
+        return find_next_open_day(current_day, start_time_str, days_off)
+    
+    return None
+
+
+def find_next_open_day(current_day: str, start_time: str, days_off: dict) -> str:
+    """Trouve le prochain jour OUVERT dans la semaine."""
+    days_order = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    
+    day_names_fr = {
+        "monday": "lundi", 
+        "tuesday": "mardi", 
+        "wednesday": "mercredi",
+        "thursday": "jeudi", 
+        "friday": "vendredi", 
+        "saturday": "samedi",
+        "sunday": "dimanche"
+    }
+    
+    try:
+        current_index = days_order.index(current_day)
+    except ValueError:
+        current_index = 0
+    
+    for i in range(1, 8):
+        next_index = (current_index + i) % 7
+        next_day = days_order[next_index]
+        
+        is_open = days_off.get(next_day, False)
+        
+        if is_open:
+            day_name_fr = day_names_fr.get(next_day, next_day)
+            
+            if i == 1:
+                return f"{start_time} demain"
+            else:
+                return f"{start_time} {day_name_fr}"
+    
+    return "aucun jour d'ouverture configuré"
+
+
+# ==================== ONLINE USERS ====================
+
+@router.get("/{pharmacy_id}/online-users")
+def get_online_users(
+    pharmacy_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Récupère la liste des utilisateurs en ligne pour une pharmacie"""
+    try:
+        UUID(pharmacy_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID de pharmacie invalide"
+        )
+    
     pharmacy = db.query(Pharmacy).filter(
         Pharmacy.id == pharmacy_id,
         Pharmacy.tenant_id == current_user.tenant_id
@@ -1263,10 +1528,8 @@ def get_online_users(
             detail="Pharmacie non trouvée"
         )
     
-    # Calculer le seuil d'inactivité (15 minutes)
     threshold = datetime.utcnow() - timedelta(minutes=15)
     
-    # Récupérer les utilisateurs avec dernière activité récente
     online_users = db.query(User).filter(
         User.tenant_id == current_user.tenant_id,
         User.pharmacy_id == pharmacy_id,
@@ -1276,7 +1539,6 @@ def get_online_users(
     
     result = []
     for user in online_users:
-        # Calculer la durée de connexion
         if user.last_login:
             login_duration = datetime.utcnow() - user.last_login
             duration_minutes = int(login_duration.total_seconds() / 60)
@@ -1302,6 +1564,9 @@ def get_online_users(
         "timestamp": datetime.utcnow().isoformat()
     }
 
+
+# ==================== LOGO UPLOAD ====================
+
 @router.post("/{pharmacy_id}/logo")
 async def upload_logo(
     pharmacy_id: str,
@@ -1324,11 +1589,9 @@ async def upload_logo(
     if not pharmacy:
         raise HTTPException(status_code=404, detail="Pharmacie non trouvée")
     
-    # Créer le dossier si nécessaire
     upload_dir = f"uploads/pharmacies/{pharmacy_id}"
     os.makedirs(upload_dir, exist_ok=True)
     
-    # Sauvegarder le fichier
     file_extension = file.filename.split(".")[-1]
     filename = f"logo.{file_extension}"
     file_path = f"{upload_dir}/{filename}"
@@ -1336,7 +1599,6 @@ async def upload_logo(
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     
-    # Mettre à jour la config
     config = pharmacy.config or {}
     config["pharmacyInfo"] = config.get("pharmacyInfo", {})
     config["pharmacyInfo"]["logoUrl"] = f"/uploads/pharmacies/{pharmacy_id}/{filename}"
@@ -1346,3 +1608,924 @@ async def upload_logo(
     db.commit()
     
     return {"logo_url": config["pharmacyInfo"]["logoUrl"]}
+
+# ==================== ADDITIONAL BRANCH ENDPOINTS ====================
+# À ajouter après les endpoints CRUD existants des branches
+
+@router.get("/{pharmacy_id}/branches/{branch_id}/statistics", response_model=BranchStatistics)
+def get_branch_statistics(
+    pharmacy_id: str,
+    branch_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant),
+    period: str = Query("month", description="Période: day, week, month, year")
+):
+    """
+    Récupère les statistiques d'une succursale
+    """
+    try:
+        UUID(pharmacy_id)
+        UUID(branch_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID invalide"
+        )
+    
+    # Vérifier que la pharmacie appartient au tenant
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    branch = db.query(Branch).filter(
+        Branch.id == branch_id,
+        Branch.parent_pharmacy_id == pharmacy_id,
+        Branch.tenant_id == current_tenant.id
+    ).first()
+    
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Branche non trouvée"
+        )
+    
+    # Calculer les dates en fonction de la période
+    now = datetime.utcnow()
+    if period == "day":
+        start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "week":
+        start_date = now - timedelta(days=now.weekday())
+        start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "month":
+        start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    else:  # year
+        start_date = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    
+    # Compter les produits
+    from app.models.product import Product
+    products_query = db.query(Product).filter(Product.branch_id == branch.id)
+    
+    products_total = products_query.count()
+    products_low_stock = products_query.filter(Product.quantity <= Product.low_stock_threshold).count()
+    products_out_of_stock = products_query.filter(Product.quantity == 0).count()
+    
+    # Produits expirant bientôt (dans 90 jours)
+    expiry_date = now + timedelta(days=90)
+    products_expiring_soon = products_query.filter(
+        Product.expiry_date <= expiry_date,
+        Product.expiry_date >= now
+    ).count()
+    
+    # Compter les ventes
+    from app.models.sale import Sale
+    sales_today = db.query(Sale).filter(
+        Sale.branch_id == branch.id,
+        Sale.created_at >= start_date
+    ).count()
+    
+    sales_today_amount = db.query(func.sum(Sale.total_amount)).filter(
+        Sale.branch_id == branch.id,
+        Sale.created_at >= start_date
+    ).scalar() or 0.0
+    
+    # Ventes de la semaine
+    week_start = now - timedelta(days=now.weekday())
+    week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
+    sales_this_week = db.query(Sale).filter(
+        Sale.branch_id == branch.id,
+        Sale.created_at >= week_start
+    ).count()
+    
+    sales_this_week_amount = db.query(func.sum(Sale.total_amount)).filter(
+        Sale.branch_id == branch.id,
+        Sale.created_at >= week_start
+    ).scalar() or 0.0
+    
+    # Ventes du mois
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    sales_this_month = db.query(Sale).filter(
+        Sale.branch_id == branch.id,
+        Sale.created_at >= month_start
+    ).count()
+    
+    sales_this_month_amount = db.query(func.sum(Sale.total_amount)).filter(
+        Sale.branch_id == branch.id,
+        Sale.created_at >= month_start
+    ).scalar() or 0.0
+    
+    # Compter les clients
+    from app.models.customer import Customer
+    customers_total = db.query(Customer).filter(
+        Customer.branch_id == branch.id
+    ).count()
+    
+    customers_active = db.query(Customer).filter(
+        Customer.branch_id == branch.id,
+        Customer.is_active == True
+    ).count()
+    
+    # Compter les employés
+    employees_count = db.query(User).filter(
+        User.branch_id == branch.id,
+        User.actif == True
+    ).count()
+    
+    # Dernière vente
+    last_sale = db.query(Sale).filter(
+        Sale.branch_id == branch.id
+    ).order_by(Sale.created_at.desc()).first()
+    
+    return BranchStatistics(
+        branch_id=branch.id,
+        branch_name=branch.name,
+        products_total=products_total,
+        products_low_stock=products_low_stock,
+        products_expiring_soon=products_expiring_soon,
+        products_out_of_stock=products_out_of_stock,
+        sales_today=sales_today,
+        sales_today_amount=float(sales_today_amount),
+        sales_this_week=sales_this_week,
+        sales_this_week_amount=float(sales_this_week_amount),
+        sales_this_month=sales_this_month,
+        sales_this_month_amount=float(sales_this_month_amount),
+        customers_total=customers_total,
+        customers_active=customers_active,
+        employees_count=employees_count,
+        last_sale_at=last_sale.created_at if last_sale else None
+    )
+
+
+@router.get("/{pharmacy_id}/branches/{branch_id}/service-status", response_model=BranchServiceStatus)
+def check_branch_service_status(
+    pharmacy_id: str,
+    branch_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant)
+):
+    """
+    Vérifie si la branche est en service selon ses heures configurées.
+    """
+    try:
+        UUID(pharmacy_id)
+        UUID(branch_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID invalide"
+        )
+    
+    # Vérifier la pharmacie
+    pharmacy_query = db.query(Pharmacy).filter(Pharmacy.id == pharmacy_id)
+    if current_user.role not in ["super_admin", "superadmin"]:
+        if not current_tenant:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Accès non autorisé"
+            )
+        pharmacy_query = pharmacy_query.filter(Pharmacy.tenant_id == current_tenant.id)
+    
+    pharmacy = pharmacy_query.first()
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    # Récupérer la branche
+    branch = db.query(Branch).filter(
+        Branch.id == branch_id,
+        Branch.parent_pharmacy_id == pharmacy_id,
+        Branch.is_active == True
+    ).first()
+    
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Branche non trouvée"
+        )
+    
+    # Récupérer la configuration de la branche
+    config = branch.config or {}
+    working_hours = config.get("workingHours", {})
+    
+    # Si pas de config spécifique, utiliser celle de la pharmacie
+    if not working_hours:
+        pharmacy_config = pharmacy.config or {}
+        working_hours = pharmacy_config.get("workingHours", {})
+    
+    if not working_hours.get("enabled", True):
+        return BranchServiceStatus(
+            branch_id=branch.id,
+            branch_name=branch.name,
+            in_service=True,
+            restrictions_enabled=False,
+            current_time_local=datetime.now(pytz.UTC).isoformat(),
+            timezone="UTC",
+            current_day=datetime.now(pytz.UTC).strftime("%A").lower(),
+            is_working_day=True,
+            is_within_hours=True,
+            working_hours={"start": "00:00", "end": "23:59"},
+            message="Service toujours disponible (pas de restriction horaire)"
+        )
+    
+    timezone_str = working_hours.get("timezone", "Africa/Kinshasa")
+    
+    try:
+        tz = pytz.timezone(timezone_str)
+        now_local = datetime.now(tz)
+    except Exception:
+        tz = pytz.UTC
+        now_local = datetime.now(pytz.UTC)
+        timezone_str = "UTC"
+    
+    current_minutes = now_local.hour * 60 + now_local.minute
+    current_day = now_local.strftime("%A").lower()
+    
+    days_off = working_hours.get("daysOff", {})
+    if not days_off:
+        days_off = {
+            "monday": True,
+            "tuesday": True,
+            "wednesday": True,
+            "thursday": True,
+            "friday": True,
+            "saturday": True,
+            "sunday": False
+        }
+    
+    is_working_day = days_off.get(current_day, False)
+    
+    start_time_str = working_hours.get("startTime", "08:00")
+    end_time_str = working_hours.get("endTime", "20:00")
+    
+    try:
+        start_parts = start_time_str.split(":")
+        end_parts = end_time_str.split(":")
+        start_minutes = int(start_parts[0]) * 60 + int(start_parts[1])
+        end_minutes = int(end_parts[0]) * 60 + int(end_parts[1])
+    except (ValueError, IndexError):
+        start_minutes = 8 * 60
+        end_minutes = 20 * 60
+        start_time_str = "08:00"
+        end_time_str = "20:00"
+    
+    if end_minutes < start_minutes:
+        is_within_hours = current_minutes >= start_minutes or current_minutes <= end_minutes
+    else:
+        is_within_hours = start_minutes <= current_minutes <= end_minutes
+    
+    in_service = is_working_day and is_within_hours
+    
+    # Calculer le prochain service
+    next_service_info = calculate_branch_next_service(
+        current_day=current_day,
+        current_minutes=current_minutes,
+        working_hours=working_hours,
+        is_working_day=is_working_day,
+        start_minutes=start_minutes,
+        end_minutes=end_minutes,
+        days_off=days_off
+    )
+    
+    return BranchServiceStatus(
+        branch_id=branch.id,
+        branch_name=branch.name,
+        in_service=in_service,
+        restrictions_enabled=True,
+        current_time_local=now_local.isoformat(),
+        timezone=timezone_str,
+        current_day=current_day,
+        is_working_day=is_working_day,
+        is_within_hours=is_within_hours,
+        working_hours={
+            "start": start_time_str,
+            "end": end_time_str,
+            "overtime": working_hours.get("overtimeEndTime")
+        },
+        message="✅ En service" if in_service else "❌ Hors service",
+        next_service_time=next_service_info
+    )
+
+
+def calculate_branch_next_service(
+    current_day: str,
+    current_minutes: int,
+    working_hours: dict,
+    is_working_day: bool,
+    start_minutes: int,
+    end_minutes: int,
+    days_off: dict
+) -> Optional[str]:
+    """Calcule le prochain moment où la branche sera en service."""
+    start_time_str = working_hours.get("startTime", "08:00")
+    
+    if is_working_day and current_minutes < start_minutes:
+        return f"{start_time_str} (aujourd'hui)"
+    
+    if is_working_day and current_minutes > end_minutes:
+        return find_next_open_branch_day(current_day, start_time_str, days_off)
+    
+    if not is_working_day:
+        return find_next_open_branch_day(current_day, start_time_str, days_off)
+    
+    return None
+
+
+def find_next_open_branch_day(current_day: str, start_time: str, days_off: dict) -> str:
+    """Trouve le prochain jour OUVERT dans la semaine pour une branche."""
+    days_order = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    
+    day_names_fr = {
+        "monday": "lundi", 
+        "tuesday": "mardi", 
+        "wednesday": "mercredi",
+        "thursday": "jeudi", 
+        "friday": "vendredi", 
+        "saturday": "samedi",
+        "sunday": "dimanche"
+    }
+    
+    try:
+        current_index = days_order.index(current_day)
+    except ValueError:
+        current_index = 0
+    
+    for i in range(1, 8):
+        next_index = (current_index + i) % 7
+        next_day = days_order[next_index]
+        
+        is_open = days_off.get(next_day, False)
+        
+        if is_open:
+            day_name_fr = day_names_fr.get(next_day, next_day)
+            if i == 1:
+                return f"{start_time} demain"
+            else:
+                return f"{start_time} {day_name_fr}"
+    
+    return "aucun jour d'ouverture configuré"
+
+
+@router.patch("/{pharmacy_id}/branches/{branch_id}/config", response_model=dict)
+def update_branch_config(
+    pharmacy_id: str,
+    branch_id: str,
+    config_update: BranchConfigUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """
+    Met à jour la configuration spécifique d'une branche
+    """
+    try:
+        UUID(pharmacy_id)
+        UUID(branch_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID invalide"
+        )
+    
+    # Vérifier la pharmacie
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    # Vérifier la branche
+    branch = db.query(Branch).filter(
+        Branch.id == branch_id,
+        Branch.parent_pharmacy_id == pharmacy_id,
+        Branch.tenant_id == current_tenant.id
+    ).first()
+    
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Branche non trouvée"
+        )
+    
+    # Récupérer la config actuelle
+    current_config = branch.config or {}
+    
+    # Mettre à jour les champs
+    update_data = config_update.dict(exclude_unset=True, exclude_none=True)
+    
+    for key, value in update_data.items():
+        if key == "workingHours" and value:
+            current_config["workingHours"] = {**current_config.get("workingHours", {}), **value.dict()}
+        else:
+            current_config[key] = value
+    
+    current_config["updatedAt"] = datetime.utcnow().isoformat()
+    
+    # Sauvegarder
+    branch.config = current_config
+    branch.updated_at = datetime.utcnow()
+    
+    db.commit()
+    
+    return {
+        "message": "Configuration de la branche mise à jour",
+        "branch_id": str(branch.id),
+        "config": branch.config
+    }
+
+
+@router.get("/{pharmacy_id}/branches/{branch_id}/config", response_model=dict)
+def get_branch_config(
+    pharmacy_id: str,
+    branch_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """
+    Récupère la configuration spécifique d'une branche
+    """
+    try:
+        UUID(pharmacy_id)
+        UUID(branch_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID invalide"
+        )
+    
+    branch = db.query(Branch).filter(
+        Branch.id == branch_id,
+        Branch.parent_pharmacy_id == pharmacy_id,
+        Branch.tenant_id == current_tenant.id
+    ).first()
+    
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Branche non trouvée"
+        )
+    
+    return {
+        "branch_id": str(branch.id),
+        "branch_name": branch.name,
+        "config": branch.config or {},
+        "updated_at": branch.updated_at
+    }
+
+
+@router.post("/{pharmacy_id}/branches/{branch_id}/set-main", response_model=BranchResponse)
+def set_main_branch(
+    pharmacy_id: str,
+    branch_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """
+    Définit une branche comme branche principale
+    """
+    try:
+        UUID(pharmacy_id)
+        UUID(branch_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID invalide"
+        )
+    
+    # Vérifier la pharmacie
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    # Vérifier la branche
+    branch = db.query(Branch).filter(
+        Branch.id == branch_id,
+        Branch.parent_pharmacy_id == pharmacy_id,
+        Branch.tenant_id == current_tenant.id
+    ).first()
+    
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Branche non trouvée"
+        )
+    
+    if not branch.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Impossible de définir une branche inactive comme principale"
+        )
+    
+    # Retirer le statut de principale des autres branches
+    db.query(Branch).filter(
+        Branch.parent_pharmacy_id == pharmacy_id,
+        Branch.tenant_id == current_tenant.id,
+        Branch.is_main_branch == True
+    ).update({"is_main_branch": False})
+    
+    # Définir cette branche comme principale
+    branch.is_main_branch = True
+    branch.updated_at = datetime.utcnow()
+    
+    # Mettre à jour la config de la pharmacie
+    config = pharmacy.config or {}
+    if "branchConfig" not in config:
+        config["branchConfig"] = {}
+    
+    config["branchConfig"]["main_branch_id"] = str(branch.id)
+    config["branchConfig"]["main_branch_name"] = branch.name
+    config["updatedAt"] = datetime.utcnow().isoformat()
+    pharmacy.config = config
+    pharmacy.updated_at = datetime.utcnow()
+    
+    db.commit()
+    db.refresh(branch)
+    
+    return branch
+
+
+@router.get("/{pharmacy_id}/branches/filter", response_model=BranchListResponse)
+def filter_branches(
+    pharmacy_id: str,
+    search: Optional[str] = Query(None, description="Recherche par nom, code, ville"),
+    city: Optional[str] = Query(None, description="Filtrer par ville"),
+    country: Optional[str] = Query(None, description="Filtrer par pays"),
+    is_active: Optional[bool] = Query(None, description="Filtrer par statut"),
+    is_main_branch: Optional[bool] = Query(None, description="Filtrer par branche principale"),
+    has_manager: Optional[bool] = Query(None, description="Avec responsable assigné"),
+    page: int = Query(1, ge=1, description="Page"),
+    size: int = Query(20, ge=1, le=100, description="Taille de page"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """
+    Filtre les branches avec pagination
+    """
+    try:
+        UUID(pharmacy_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID de pharmacie invalide"
+        )
+    
+    # Vérifier la pharmacie
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    # Construire la requête
+    query = db.query(Branch).filter(
+        Branch.parent_pharmacy_id == pharmacy.id,
+        Branch.tenant_id == current_tenant.id
+    )
+    
+    # Appliquer les filtres
+    if search:
+        query = query.filter(
+            Branch.name.ilike(f"%{search}%") |
+            Branch.code.ilike(f"%{search}%") |
+            Branch.city.ilike(f"%{search}%") |
+            Branch.address.ilike(f"%{search}%")
+        )
+    
+    if city:
+        query = query.filter(Branch.city == city)
+    
+    if country:
+        query = query.filter(Branch.country == country)
+    
+    if is_active is not None:
+        query = query.filter(Branch.is_active == is_active)
+    
+    if is_main_branch is not None:
+        query = query.filter(Branch.is_main_branch == is_main_branch)
+    
+    if has_manager is not None:
+        if has_manager:
+            query = query.filter(Branch.manager_id.isnot(None))
+        else:
+            query = query.filter(Branch.manager_id.is_(None))
+    
+    # Compter le total
+    total = query.count()
+    
+    # Pagination
+    offset = (page - 1) * size
+    branches = query.order_by(
+        Branch.is_main_branch.desc(),
+        Branch.created_at.desc()
+    ).offset(offset).limit(size).all()
+    
+    # Calculer le nombre de pages
+    pages = (total + size - 1) // size
+    
+    return BranchListResponse(
+        items=branches,
+        total=total,
+        page=page,
+        size=size,
+        pages=pages
+    )
+
+
+@router.get("/{pharmacy_id}/branches/export")
+def export_branches(
+    pharmacy_id: str,
+    format: str = Query("csv", description="Format d'export: csv, json"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """
+    Exporte la liste des branches au format CSV ou JSON
+    """
+    try:
+        UUID(pharmacy_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID de pharmacie invalide"
+        )
+    
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    branches = db.query(Branch).filter(
+        Branch.parent_pharmacy_id == pharmacy.id,
+        Branch.tenant_id == current_tenant.id
+    ).all()
+    
+    # Convertir en dictionnaires
+    data = []
+    for branch in branches:
+        data.append({
+            "id": str(branch.id),
+            "name": branch.name,
+            "code": branch.code,
+            "address": branch.address,
+            "city": branch.city,
+            "country": branch.country,
+            "phone": branch.phone,
+            "email": branch.email,
+            "manager_name": branch.manager_name,
+            "is_active": branch.is_active,
+            "is_main_branch": branch.is_main_branch,
+            "created_at": branch.created_at.isoformat() if branch.created_at else None
+        })
+    
+    if format == "json":
+        return data
+    
+    # Export CSV
+    import csv
+    from fastapi.responses import StreamingResponse
+    import io
+    
+    output = io.StringIO()
+    if data:
+        writer = csv.DictWriter(output, fieldnames=data[0].keys())
+        writer.writeheader()
+        writer.writerows(data)
+    else:
+        writer = csv.writer(output)
+        writer.writerow(["Aucune donnée"])
+    
+    response = StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv"
+    )
+    response.headers["Content-Disposition"] = f"attachment; filename=branches_{pharmacy.name}.csv"
+    
+    return response
+
+
+@router.post("/{pharmacy_id}/branches/{branch_id}/working-hours/override")
+def override_branch_working_hours(
+    pharmacy_id: str,
+    branch_id: str,
+    working_hours: BranchWorkingHoursConfig,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """
+    Remplace les horaires d'ouverture de la branche (override ceux de la pharmacie)
+    """
+    try:
+        UUID(pharmacy_id)
+        UUID(branch_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID invalide"
+        )
+    
+    branch = db.query(Branch).filter(
+        Branch.id == branch_id,
+        Branch.parent_pharmacy_id == pharmacy_id,
+        Branch.tenant_id == current_tenant.id
+    ).first()
+    
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Branche non trouvée"
+        )
+    
+    config = branch.config or {}
+    config["workingHours"] = working_hours.dict()
+    config["workingHoursOverridden"] = True
+    config["updatedAt"] = datetime.utcnow().isoformat()
+    
+    branch.config = config
+    branch.updated_at = datetime.utcnow()
+    
+    db.commit()
+    
+    return {
+        "message": "Horaires de la branche mis à jour",
+        "branch_id": str(branch.id),
+        "working_hours": working_hours.dict()
+    }
+
+
+@router.delete("/{pharmacy_id}/branches/{branch_id}/working-hours/override")
+def remove_branch_working_hours_override(
+    pharmacy_id: str,
+    branch_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """
+    Supprime l'override des horaires pour revenir aux horaires de la pharmacie
+    """
+    try:
+        UUID(pharmacy_id)
+        UUID(branch_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID invalide"
+        )
+    
+    branch = db.query(Branch).filter(
+        Branch.id == branch_id,
+        Branch.parent_pharmacy_id == pharmacy_id,
+        Branch.tenant_id == current_tenant.id
+    ).first()
+    
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Branche non trouvée"
+        )
+    
+    config = branch.config or {}
+    
+    # Supprimer les horaires spécifiques
+    if "workingHours" in config:
+        del config["workingHours"]
+    if "workingHoursOverridden" in config:
+        del config["workingHoursOverridden"]
+    
+    config["updatedAt"] = datetime.utcnow().isoformat()
+    
+    branch.config = config
+    branch.updated_at = datetime.utcnow()
+    
+    db.commit()
+    
+    return {
+        "message": "Override supprimé, la branche utilise maintenant les horaires de la pharmacie",
+        "branch_id": str(branch.id)
+    }
+
+
+@router.get("/{pharmacy_id}/branches/statistics/summary")
+def get_branches_summary(
+    pharmacy_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """
+    Récupère un résumé statistique de toutes les branches
+    """
+    try:
+        UUID(pharmacy_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID de pharmacie invalide"
+        )
+    
+    pharmacy = db.query(Pharmacy).filter(
+        Pharmacy.id == pharmacy_id,
+        Pharmacy.tenant_id == current_tenant.id
+    ).first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    branches = db.query(Branch).filter(
+        Branch.parent_pharmacy_id == pharmacy.id,
+        Branch.tenant_id == current_tenant.id,
+        Branch.is_active == True
+    ).all()
+    
+    from app.models.product import Product
+    from app.models.sale import Sale
+    from app.models.customer import Customer
+    from app.models.user import User
+    
+    total_products = 0
+    total_sales_today = 0
+    total_sales_today_amount = 0.0
+    total_customers = 0
+    total_employees = 0
+    
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    for branch in branches:
+        total_products += db.query(Product).filter(Product.branch_id == branch.id).count()
+        total_customers += db.query(Customer).filter(Customer.branch_id == branch.id).count()
+        total_employees += db.query(User).filter(User.branch_id == branch.id, User.actif == True).count()
+        
+        sales_today = db.query(func.sum(Sale.total_amount)).filter(
+            Sale.branch_id == branch.id,
+            Sale.created_at >= today_start
+        ).scalar() or 0.0
+        total_sales_today_amount += float(sales_today)
+        if sales_today > 0:
+            total_sales_today += 1
+    
+    return {
+        "pharmacy_id": str(pharmacy.id),
+        "pharmacy_name": pharmacy.name,
+        "branches_count": len(branches),
+        "total_products": total_products,
+        "total_customers": total_customers,
+        "total_employees": total_employees,
+        "sales_today_count": total_sales_today,
+        "sales_today_amount": total_sales_today_amount,
+        "branches": [
+            {
+                "id": str(b.id),
+                "name": b.name,
+                "city": b.city,
+                "is_main_branch": b.is_main_branch
+            }
+            for b in branches
+        ]
+    }
+
+@router.get("/me/active-pharmacy")
+def get_my_active_pharmacy(
+    active_pharmacy: Pharmacy = Depends(get_current_active_pharmacy),
+):
+    """Récupère la pharmacie active de l'utilisateur"""
+    return {"pharmacy_id": active_pharmacy.id, "name": active_pharmacy.name}

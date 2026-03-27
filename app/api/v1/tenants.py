@@ -31,7 +31,7 @@ class TenantRegisterRequest(BaseModel):
     confirm_password_admin: str = Field(..., min_length=8)
     nom_pharmacie: str = Field(..., min_length=2, max_length=100)
     ville: str = Field(..., min_length=2, max_length=50)
-    telephone: Optional[str] = None
+    telephone: Optional[str] = Field(None, min_length=9, max_length=20, description="Téléphone principal")
     adresse: Optional[str] = None
     nom_proprietaire: Optional[str] = None
     numero_agrement: Optional[str] = None
@@ -41,12 +41,22 @@ class TenantRegisterRequest(BaseModel):
         if 'password_admin' in values and v != values['password_admin']:
             raise ValueError('Les mots de passe ne correspondent pas')
         return v
+    
+    @validator('telephone')
+    def validate_phone(cls, v):
+        if v:
+            # Nettoyer le numéro (garder uniquement les chiffres)
+            cleaned = ''.join(filter(str.isdigit, v))
+            if len(cleaned) < 8:
+                raise ValueError('Le numéro de téléphone doit contenir au moins 8 chiffres')
+            return cleaned
+        return v
 
 class TenantUpdateRequest(BaseModel):
     """Schéma pour la mise à jour d'un tenant"""
     nom_pharmacie: Optional[str] = Field(None, min_length=2, max_length=100)
     ville: Optional[str] = Field(None, min_length=2, max_length=50)
-    telephone: Optional[str] = None
+    telephone: Optional[str] = Field(None, min_length=9, max_length=20, description="Téléphone principal")
     adresse: Optional[str] = None
     nom_proprietaire: Optional[str] = None
     numero_agrement: Optional[str] = None
@@ -108,7 +118,7 @@ def register_tenant(
             nom_pharmacie=data.nom_pharmacie,
             ville=data.ville,
             email_admin=data.email_admin.lower(),
-            telephone=data.telephone,
+            telephone_principal=data.telephone,
             adresse=data.adresse,
             nom_proprietaire=data.nom_proprietaire or data.nom_pharmacie,
             numero_agrement=data.numero_agrement,
@@ -202,7 +212,7 @@ def my_tenant(
             "nom_pharmacie": tenant.nom_pharmacie,
             "ville": tenant.ville,
             "email_admin": tenant.email_admin,
-            "telephone": tenant.telephone,
+            "telephone": tenant.telephone_principal,
             "adresse": tenant.adresse,
             "nom_proprietaire": tenant.nom_proprietaire,
             "numero_agrement": tenant.numero_agrement,
@@ -291,7 +301,19 @@ def get_tenant(
             detail="Tenant non trouvé"
         )
     
-    return tenant
+    return TenantResponse(
+        id=tenant.id,
+        nom_pharmacie=tenant.nom_pharmacie,
+        ville=tenant.ville,
+        email_admin=tenant.email_admin,
+        telephone=tenant.telephone_principal,  # ✅ CORRECTION
+        adresse=tenant.adresse,
+        nom_proprietaire=tenant.nom_proprietaire,
+        numero_agrement=tenant.numero_agrement,
+        status=tenant.status,
+        created_at=tenant.created_at,
+        updated_at=tenant.updated_at
+    )
 
 @router.put("/{tenant_id}", response_model=TenantResponse)
 def update_tenant(
@@ -341,7 +363,7 @@ def update_tenant(
             tenant.ville = tenant_data.ville
             
         if tenant_data.telephone is not None:
-            tenant.telephone = tenant_data.telephone
+            tenant.telephone_principal = tenant_data.telephone
             
         if tenant_data.adresse is not None:
             tenant.adresse = tenant_data.adresse

@@ -51,6 +51,7 @@ class Customer(Base):
     creator = relationship("User", foreign_keys=[created_by])
     sales = relationship("Sale", back_populates="customer")
     branch = relationship("Branch", back_populates="customers")
+    orders = relationship("Order", back_populates="customer", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<Customer {self.first_name} {self.last_name}>"

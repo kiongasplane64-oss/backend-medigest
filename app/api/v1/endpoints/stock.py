@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime, timedelta, date
 import logging
 from decimal import Decimal
-
+from fastapi import File, UploadFile 
 from app.db.session import get_db
 from app.models.product import Product, ProductStock
 from app.models.stock_movement import StockMovement, InventoryCount, InventoryCountItem
@@ -2462,3 +2462,748 @@ async def get_stock_valuation(
     except Exception as exc:
         logger.exception("Erreur calcul valeur stock")
         raise HTTPException(status_code=500, detail=f"Erreur calcul valeur stock: {exc}")
+
+# =======================
+# ROUTES POUR L'IMPORT
+# =======================
+
+@router.post("/import/preview", summary="Prévisualiser l'import de produits")
+async def preview_import_products(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Prépare un aperçu de l'import de produits depuis un fichier Excel/CSV.
+    Détecte les doublons et retourne un aperçu avant import.
+    """
+    try:
+        _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant", "pharmacien"])
+        
+        pharmacy = _ensure_pharmacy_in_tenant(current_tenant, current_pharmacy)
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        # Lire le contenu du fichier
+        contents = await file.read()
+        
+        # Déterminer le type de fichier
+        filename = file.filename or ""
+        file_ext = filename.split(".")[-1].lower() if "." in filename else ""
+        
+        import pandas as pd
+        import io
+        
+        df = None
+        if file_ext in ["xlsx", "xls"]:
+            df = pd.read_excel(io.BytesIO(contents))
+        elif file_ext == "csv":
+            df = pd.read_csv(io.BytesIO(contents))
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Format de fichier non supporté. Utilisez .xlsx, .xls ou .csv"
+            )
+        
+        if df.empty:
+            raise HTTPException(status_code=400, detail="Le fichier est vide")
+        
+        # Normaliser les noms de colonnes
+        column_mapping = {
+            'nom': 'name',
+            'name': 'name',
+            'produit': 'name',
+            'code': 'code',
+            'code-barres': 'barcode',
+            'barcode': 'barcode',
+            'quantite': 'quantity',
+            'quantité': 'quantity',
+            'qte': 'quantity',
+            'prix_achat': 'purchase_price',
+            'prix achat': 'purchase_price',
+            'prix_achat_ht': 'purchase_price',
+            'prix_vente': 'selling_price',
+            'prix vente': 'selling_price',
+            'prix_vente_ttc': 'selling_price',
+            'date_expiration': 'expiry_date',
+            'expiration': 'expiry_date',
+            'date peremption': 'expiry_date',
+            'categorie': 'category',
+            'catégorie': 'category',
+            'category': 'category',
+            'emplacement': 'location',
+            'location': 'location',
+            'fournisseur': 'supplier',
+            'supplier': 'supplier',
+            'lot': 'batch_number',
+            'batch': 'batch_number',
+            'numero_lot': 'batch_number'
+        }
+        
+        # Renommer les colonnes
+        df.columns = [column_mapping.get(col.lower().strip(), col.lower().strip()) for col in df.columns]
+        
+        # Colonnes requises
+        required_columns = ['name', 'quantity', 'purchase_price', 'selling_price']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        
+        if missing_columns:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Colonnes manquantes: {', '.join(missing_columns)}"
+            )
+        
+        # Traiter les données
+        products_preview = []
+        duplicates = []
+        new_products = []
+        
+        # Récupérer tous les produits existants pour la détection des doublons
+        existing_products = db.query(Product).filter(
+            Product.tenant_id == tenant_id,
+            Product.pharmacy_id == pharmacy.id,
+            Product.is_active == True
+        ).all()
+        
+        # Créer un index pour la recherche rapide
+        existing_by_code = {p.code: p for p in existing_products if p.code}
+        existing_by_barcode = {p.barcode: p for p in existing_products if p.barcode}
+        existing_by_name = {p.name.lower(): p for p in existing_products}
+        
+        for idx, row in df.iterrows():
+            try:
+                # Extraire les valeurs
+                name = str(row.get('name', '')).strip()
+                if not name:
+                    continue
+                
+                quantity = int(float(row.get('quantity', 0)))
+                purchase_price = float(row.get('purchase_price', 0))
+                selling_price = float(row.get('selling_price', 0))
+                code = str(row.get('code', '')).strip() if pd.notna(row.get('code')) else None
+                barcode = str(row.get('barcode', '')).strip() if pd.notna(row.get('barcode')) else None
+                expiry_date = row.get('expiry_date')
+                category = str(row.get('category', '')).strip() if pd.notna(row.get('category')) else None
+                location = str(row.get('location', '')).strip() if pd.notna(row.get('location')) else None
+                supplier = str(row.get('supplier', '')).strip() if pd.notna(row.get('supplier')) else None
+                batch_number = str(row.get('batch_number', '')).strip() if pd.notna(row.get('batch_number')) else None
+                
+                # Convertir la date d'expiration
+                expiry_date_obj = None
+                if expiry_date and pd.notna(expiry_date):
+                    try:
+                        if isinstance(expiry_date, str):
+                            expiry_date_obj = datetime.strptime(expiry_date, "%Y-%m-%d").date()
+                        else:
+                            expiry_date_obj = expiry_date.date() if hasattr(expiry_date, 'date') else expiry_date
+                    except:
+                        pass
+                
+                # Détecter les doublons
+                existing_product = None
+                if code and code in existing_by_code:
+                    existing_product = existing_by_code[code]
+                elif barcode and barcode in existing_by_barcode:
+                    existing_product = existing_by_barcode[barcode]
+                elif name.lower() in existing_by_name:
+                    existing_product = existing_by_name[name.lower()]
+                
+                product_data = {
+                    "name": name,
+                    "code": code,
+                    "barcode": barcode,
+                    "quantity": quantity,
+                    "purchase_price": purchase_price,
+                    "selling_price": selling_price,
+                    "expiry_date": expiry_date_obj.isoformat() if expiry_date_obj else None,
+                    "category": category,
+                    "location": location,
+                    "supplier": supplier,
+                    "batch_number": batch_number,
+                    "existing_product": existing_product.to_dict() if existing_product else None,
+                    "action": None
+                }
+                
+                products_preview.append(product_data)
+                
+                if existing_product:
+                    duplicates.append(product_data)
+                else:
+                    new_products.append(product_data)
+                    
+            except Exception as e:
+                logger.warning(f"Erreur traitement ligne {idx}: {e}")
+                continue
+        
+        return {
+            "products": products_preview,
+            "duplicates": duplicates,
+            "new_products": new_products,
+            "total_rows": len(df),
+            "valid_rows": len(products_preview),
+            "skipped_rows": len(df) - len(products_preview),
+            "columns_used": list(df.columns)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Erreur preview import")
+        raise HTTPException(status_code=500, detail=f"Erreur preview import: {exc}")
+
+
+@router.post("/import", summary="Importer des produits")
+async def import_products(
+    file: UploadFile = File(...),
+    mode: str = Query("add", description="Mode d'import: add, update, replace"),
+    duplicate_actions: Optional[str] = Query(None, description="Actions pour les doublons (JSON)"),
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
+    current_branch: Optional[Branch] = Depends(get_current_branch_entity),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Importe des produits depuis un fichier Excel/CSV.
+    
+    Modes supportés:
+    - add: Ignore les doublons, n'ajoute que les nouveaux
+    - update: Met à jour les produits existants
+    - replace: Remplace complètement les produits existants (désactive les anciens)
+    """
+    try:
+        _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant", "pharmacien"])
+        
+        pharmacy = _ensure_pharmacy_in_tenant(current_tenant, current_pharmacy)
+        tenant_id = current_tenant.id if current_tenant else None
+        branch_id = current_branch.id if current_branch else None
+        
+        # Lire le contenu du fichier
+        contents = await file.read()
+        
+        # Déterminer le type de fichier
+        filename = file.filename or ""
+        file_ext = filename.split(".")[-1].lower() if "." in filename else ""
+        
+        import pandas as pd
+        import io
+        import json
+        
+        df = None
+        if file_ext in ["xlsx", "xls"]:
+            df = pd.read_excel(io.BytesIO(contents))
+        elif file_ext == "csv":
+            df = pd.read_csv(io.BytesIO(contents))
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Format de fichier non supporté. Utilisez .xlsx, .xls ou .csv"
+            )
+        
+        if df.empty:
+            raise HTTPException(status_code=400, detail="Le fichier est vide")
+        
+        # Normaliser les noms de colonnes (comme dans preview)
+        column_mapping = {
+            'nom': 'name', 'name': 'name', 'produit': 'name',
+            'code': 'code', 'code-barres': 'barcode', 'barcode': 'barcode',
+            'quantite': 'quantity', 'quantité': 'quantity', 'qte': 'quantity',
+            'prix_achat': 'purchase_price', 'prix achat': 'purchase_price',
+            'prix_vente': 'selling_price', 'prix vente': 'selling_price',
+            'date_expiration': 'expiry_date', 'expiration': 'expiry_date',
+            'categorie': 'category', 'catégorie': 'category', 'category': 'category',
+            'emplacement': 'location', 'location': 'location',
+            'fournisseur': 'supplier', 'supplier': 'supplier',
+            'lot': 'batch_number', 'batch': 'batch_number', 'numero_lot': 'batch_number'
+        }
+        
+        df.columns = [column_mapping.get(col.lower().strip(), col.lower().strip()) for col in df.columns]
+        
+        # Vérifier les colonnes requises
+        required_columns = ['name', 'quantity', 'purchase_price', 'selling_price']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        
+        if missing_columns:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Colonnes manquantes: {', '.join(missing_columns)}"
+            )
+        
+        # Parse duplicate actions
+        duplicate_actions_dict = {}
+        if duplicate_actions:
+            try:
+                duplicate_actions_dict = json.loads(duplicate_actions)
+            except:
+                pass
+        
+        # Mode replace: désactiver tous les produits existants
+        if mode == "replace":
+            db.query(Product).filter(
+                Product.tenant_id == tenant_id,
+                Product.pharmacy_id == pharmacy.id,
+                Product.is_active == True
+            ).update({"is_active": False, "deleted_at": datetime.utcnow()})
+            db.flush()
+        
+        # Récupérer les produits existants pour le mode update
+        existing_products = {}
+        if mode in ["update", "add"]:
+            products_list = db.query(Product).filter(
+                Product.tenant_id == tenant_id,
+                Product.pharmacy_id == pharmacy.id,
+                Product.is_active == True
+            ).all()
+            
+            for p in products_list:
+                if p.code:
+                    existing_products[p.code] = p
+                if p.barcode:
+                    existing_products[p.barcode] = p
+                existing_products[p.name.lower()] = p
+        
+        # Traiter les données
+        created_count = 0
+        updated_count = 0
+        skipped_count = 0
+        
+        # Configuration des prix
+        calcul_auto_prix = bool(_tenant_get_config(current_tenant, "calcul_auto_prix", True))
+        marge_par_defaut = _to_float(_tenant_get_config(current_tenant, "marge_par_defaut", 30.0), 30.0)
+        taux_tva = _to_float(_tenant_get_config(current_tenant, "taux_tva", 0.0), 0.0)
+        
+        for idx, row in df.iterrows():
+            try:
+                name = str(row.get('name', '')).strip()
+                if not name:
+                    skipped_count += 1
+                    continue
+                
+                quantity = int(float(row.get('quantity', 0)))
+                purchase_price = float(row.get('purchase_price', 0))
+                selling_price = float(row.get('selling_price', 0))
+                code = str(row.get('code', '')).strip() if pd.notna(row.get('code')) else None
+                barcode = str(row.get('barcode', '')).strip() if pd.notna(row.get('barcode')) else None
+                expiry_date = row.get('expiry_date')
+                category = str(row.get('category', '')).strip() if pd.notna(row.get('category')) else None
+                location = str(row.get('location', '')).strip() if pd.notna(row.get('location')) else None
+                supplier = str(row.get('supplier', '')).strip() if pd.notna(row.get('supplier')) else None
+                batch_number = str(row.get('batch_number', '')).strip() if pd.notna(row.get('batch_number')) else None
+                
+                # Convertir la date d'expiration
+                expiry_date_obj = None
+                if expiry_date and pd.notna(expiry_date):
+                    try:
+                        if isinstance(expiry_date, str):
+                            expiry_date_obj = datetime.strptime(expiry_date, "%Y-%m-%d").date()
+                        else:
+                            expiry_date_obj = expiry_date.date() if hasattr(expiry_date, 'date') else expiry_date
+                    except:
+                        pass
+                
+                # Chercher le produit existant
+                existing = None
+                key = None
+                
+                # Vérifier par code
+                if code and code in existing_products:
+                    existing = existing_products[code]
+                    key = code
+                # Vérifier par code-barres
+                elif barcode and barcode in existing_products:
+                    existing = existing_products[barcode]
+                    key = barcode
+                # Vérifier par nom
+                elif name.lower() in existing_products:
+                    existing = existing_products[name.lower()]
+                    key = name.lower()
+                
+                if existing:
+                    # Produit existant
+                    action = duplicate_actions_dict.get(str(idx), duplicate_actions_dict.get(key, "update"))
+                    
+                    if action == "skip":
+                        skipped_count += 1
+                        continue
+                    elif action == "update":
+                        # Mettre à jour le produit existant
+                        old_quantity = existing.quantity
+                        existing.purchase_price = purchase_price
+                        existing.selling_price = selling_price
+                        existing.quantity = quantity
+                        existing.available_quantity = max(0, quantity - (existing.reserved_quantity or 0))
+                        
+                        if expiry_date_obj:
+                            existing.expiry_date = expiry_date_obj
+                        if category:
+                            existing.category = category
+                        if location:
+                            existing.location = location
+                        if supplier:
+                            existing.supplier = supplier
+                        if batch_number:
+                            existing.batch_number = batch_number
+                        
+                        existing.refresh_statuses()
+                        
+                        # Créer un mouvement de stock
+                        if quantity != old_quantity:
+                            movement = StockMovement(
+                                tenant_id=tenant_id,
+                                product_id=existing.id,
+                                pharmacy_id=pharmacy.id,
+                                branch_id=branch_id,
+                                quantity_before=old_quantity,
+                                quantity_after=quantity,
+                                quantity_change=quantity - old_quantity,
+                                movement_type="import",
+                                reason=f"Import via fichier ({mode})",
+                                created_by=current_user.id
+                            )
+                            db.add(movement)
+                        
+                        updated_count += 1
+                        
+                    elif action == "merge_quantity":
+                        # Fusionner les quantités
+                        old_quantity = existing.quantity
+                        new_quantity = old_quantity + quantity
+                        existing.quantity = new_quantity
+                        existing.available_quantity = max(0, new_quantity - (existing.reserved_quantity or 0))
+                        
+                        if purchase_price:
+                            existing.purchase_price = purchase_price
+                        if selling_price:
+                            existing.selling_price = selling_price
+                        
+                        existing.refresh_statuses()
+                        
+                        movement = StockMovement(
+                            tenant_id=tenant_id,
+                            product_id=existing.id,
+                            pharmacy_id=pharmacy.id,
+                            branch_id=branch_id,
+                            quantity_before=old_quantity,
+                            quantity_after=new_quantity,
+                            quantity_change=quantity,
+                            movement_type="import",
+                            reason=f"Fusion import (ajout de {quantity})",
+                            created_by=current_user.id
+                        )
+                        db.add(movement)
+                        
+                        updated_count += 1
+                    else:
+                        # keep_both: créer un nouveau produit
+                        existing = None
+                else:
+                    existing = None
+                
+                if not existing:
+                    # Créer un nouveau produit
+                    product = Product(
+                        tenant_id=tenant_id,
+                        pharmacy_id=pharmacy.id,
+                        branch_id=branch_id,
+                        name=name,
+                        code=code,
+                        barcode=barcode,
+                        purchase_price=purchase_price,
+                        selling_price=selling_price,
+                        quantity=quantity,
+                        available_quantity=quantity,
+                        reserved_quantity=0,
+                        expiry_date=expiry_date_obj,
+                        category=category,
+                        location=location,
+                        supplier=supplier,
+                        batch_number=batch_number,
+                        is_active=True
+                    )
+                    
+                    # Calcul automatique des prix si nécessaire
+                    if calcul_auto_prix and purchase_price > 0:
+                        _safe_calculate_prices(product, marge_par_defaut, taux_tva)
+                    
+                    product.refresh_statuses()
+                    
+                    db.add(product)
+                    db.flush()
+                    
+                    # Créer un mouvement de stock initial
+                    if quantity > 0:
+                        movement = StockMovement(
+                            tenant_id=tenant_id,
+                            product_id=product.id,
+                            pharmacy_id=pharmacy.id,
+                            branch_id=branch_id,
+                            quantity_before=0,
+                            quantity_after=quantity,
+                            quantity_change=quantity,
+                            movement_type="import",
+                            reason="Import via fichier",
+                            created_by=current_user.id
+                        )
+                        db.add(movement)
+                    
+                    created_count += 1
+                    
+                    # Ajouter à la cache pour les lignes suivantes
+                    if code:
+                        existing_products[code] = product
+                    if barcode:
+                        existing_products[barcode] = product
+                    existing_products[name.lower()] = product
+                
+            except Exception as e:
+                logger.error(f"Erreur ligne {idx}: {e}")
+                skipped_count += 1
+                continue
+        
+        db.commit()
+        
+        logger.info(
+            f"Import terminé: {created_count} créés, {updated_count} mis à jour, {skipped_count} ignorés"
+        )
+        
+        return {
+            "success": True,
+            "message": f"Import terminé: {created_count} créés, {updated_count} mis à jour, {skipped_count} ignorés",
+            "created": created_count,
+            "updated": updated_count,
+            "skipped": skipped_count,
+            "total_processed": created_count + updated_count + skipped_count,
+            "mode": mode
+        }
+        
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Erreur import produits")
+        raise HTTPException(status_code=500, detail=f"Erreur import produits: {exc}")
+
+
+@router.get("/import/template", summary="Télécharger le template d'import")
+async def download_import_template(
+    format: str = Query("excel", description="Format du template: excel, csv"),
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Télécharge le template d'import des produits au format Excel ou CSV.
+    """
+    try:
+        _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant", "pharmacien"])
+        
+        import pandas as pd
+        import io
+        
+        # Définir les colonnes du template
+        columns = [
+            "name", "code", "barcode", "quantity", "purchase_price",
+            "selling_price", "expiry_date", "category", "location",
+            "supplier", "batch_number"
+        ]
+        
+        # Lignes d'exemple
+        example_data = [
+            ["Paracétamol 500mg", "PARA001", "1234567890123", 100, 2.5, 5.0, "2025-12-31", "Médicaments", "A1", "PharmaDistrib", "LOT001"],
+            ["Vitamine C 1000mg", "VITC001", "1234567890124", 50, 3.0, 6.0, "2025-10-15", "Compléments", "B2", "VitaLab", "LOT002"],
+            ["Pansements", "PAN001", "1234567890125", 200, 1.2, 2.5, "2026-01-01", "Matériel médical", "C3", "MediCare", "LOT003"],
+        ]
+        
+        df = pd.DataFrame(example_data, columns=columns)
+        
+        # Ajouter une ligne de description
+        description = pd.DataFrame([[
+            "Nom du produit", "Code unique", "Code-barres EAN13", "Quantité en stock",
+            "Prix d'achat HT", "Prix de vente TTC", "YYYY-MM-DD", "Catégorie",
+            "Emplacement", "Fournisseur", "Numéro de lot"
+        ]], columns=columns)
+        
+        df = pd.concat([description, df], ignore_index=True)
+        
+        if format.lower() == "csv":
+            output = io.StringIO()
+            df.to_csv(output, index=False)
+            content = output.getvalue()
+            media_type = "text/csv"
+            filename = "import_template.csv"
+        else:
+            output = io.BytesIO()
+            df.to_excel(output, index=False, engine="openpyxl")
+            content = output.getvalue()
+            media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            filename = "import_template.xlsx"
+        
+        from fastapi.responses import Response
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Erreur génération template")
+        raise HTTPException(status_code=500, detail=f"Erreur génération template: {exc}")
+
+
+@router.get("/export", summary="Exporter le stock")
+async def export_stock(
+    format: str = Query("excel", description="Format d'export: excel, csv, json"),
+    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
+    category_id: Optional[UUID] = Query(None, description="Filtrer par catégorie"),
+    category: Optional[str] = Query(None, description="Filtrer par nom de catégorie (legacy)"),
+    search: Optional[str] = Query(None, description="Recherche textuelle"),
+    stock_status: Optional[str] = Query(None, description="Filtrer par statut de stock"),
+    expiry_status: Optional[str] = Query(None, description="Filtrer par statut d'expiration"),
+    include_sales_stats: bool = Query(False, description="Inclure les statistiques de ventes"),
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Exporte le stock dans le format spécifié (Excel, CSV, JSON).
+    """
+    try:
+        _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant", "pharmacien", "vendeur"])
+        
+        pharmacy = _ensure_pharmacy_in_tenant(current_tenant, current_pharmacy)
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        # Construire la requête
+        query = db.query(Product).filter(
+            Product.tenant_id == tenant_id,
+            Product.pharmacy_id == pharmacy.id,
+            Product.is_active == True
+        )
+        
+        if pharmacy_id:
+            query = query.filter(Product.pharmacy_id == pharmacy_id)
+        
+        if category_id:
+            query = query.filter(Product.category_id == category_id)
+        elif category:
+            query = query.filter(Product.category == category)
+        
+        if search:
+            query = query.filter(
+                or_(
+                    Product.name.ilike(f"%{search}%"),
+                    Product.code.ilike(f"%{search}%"),
+                    Product.barcode.ilike(f"%{search}%")
+                )
+            )
+        
+        if stock_status:
+            query = query.filter(Product.stock_status == stock_status)
+        
+        if expiry_status:
+            query = query.filter(Product.expiry_status == expiry_status)
+        
+        products = query.order_by(Product.name).all()
+        
+        # Préparer les données
+        data = []
+        for product in products:
+            product_data = {
+                "ID": str(product.id),
+                "Nom": product.name,
+                "Code": product.code or "",
+                "Code-barres": product.barcode or "",
+                "Quantité": product.quantity or 0,
+                "Prix d'achat": float(product.purchase_price or 0),
+                "Prix de vente": float(product.selling_price or 0),
+                "Valeur d'achat": float(product.purchase_value or 0),
+                "Valeur de vente": float(product.selling_value or 0),
+                "Marge totale": float(product.total_margin or 0),
+                "Date d'expiration": product.expiry_date.isoformat() if product.expiry_date else "",
+                "Catégorie": product.category or "",
+                "Emplacement": product.location or "",
+                "Fournisseur": product.supplier or "",
+                "Numéro de lot": product.batch_number or "",
+                "Statut stock": product.stock_status or "normal",
+                "Statut expiration": product.expiry_status or "normal",
+                "Seuil d'alerte": product.alert_threshold or 0,
+                "Stock minimum": product.minimum_stock or 0,
+                "Unité": product.unit or "unité",
+                "TVA": f"{product.tva_rate}%" if product.has_tva else "0%",
+                "Type": product.product_type or "medicament",
+                "Nom commercial": product.commercial_name or "",
+                "Forme galénique": product.galenic_form or "",
+                "Dosage": product.dosage or "",
+                "Principe actif": product.active_ingredient or "",
+                "Créé le": product.created_at.isoformat() if product.created_at else "",
+                "Dernière modification": product.updated_at.isoformat() if product.updated_at else ""
+            }
+            
+            if include_sales_stats:
+                # Calculer les statistiques de ventes
+                thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+                sales_stats = db.query(
+                    func.coalesce(func.sum(SaleItem.quantity), 0).label("total_sold"),
+                    func.coalesce(func.sum(SaleItem.total), 0).label("total_revenue"),
+                    func.count(distinct(Sale.id)).label("sale_count")
+                ).join(Sale).filter(
+                    SaleItem.product_id == product.id,
+                    SaleItem.tenant_id == tenant_id,
+                    Sale.status == "completed",
+                    Sale.created_at >= thirty_days_ago
+                ).first()
+                
+                product_data["Ventes 30j (quantité)"] = int(sales_stats.total_sold or 0)
+                product_data["Ventes 30j (CA)"] = float(sales_stats.total_revenue or 0)
+                product_data["Ventes 30j (nombre)"] = int(sales_stats.sale_count or 0)
+                
+                # Rotation du stock
+                if product.quantity and product.quantity > 0:
+                    turnover_rate = (sales_stats.total_sold or 0) / product.quantity
+                    product_data["Taux de rotation"] = round(turnover_rate, 2)
+                else:
+                    product_data["Taux de rotation"] = 0
+            
+            data.append(product_data)
+        
+        # Exporter selon le format
+        import pandas as pd
+        import io
+        import json
+        
+        df = pd.DataFrame(data)
+        
+        if format.lower() == "csv":
+            output = io.StringIO()
+            df.to_csv(output, index=False, encoding='utf-8-sig')
+            content = output.getvalue()
+            media_type = "text/csv"
+            filename = f"stock_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        elif format.lower() == "json":
+            content = json.dumps(data, indent=2, default=str)
+            media_type = "application/json"
+            filename = f"stock_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        else:
+            output = io.BytesIO()
+            df.to_excel(output, index=False, engine="openpyxl")
+            content = output.getvalue()
+            media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            filename = f"stock_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        
+        from fastapi.responses import Response
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Erreur export stock")
+        raise HTTPException(status_code=500, detail=f"Erreur export stock: {exc}")

@@ -93,6 +93,393 @@ def get_read_only_restrictions() -> Dict[str, Any]:
         "message": "Mode lecture seule : vous pouvez consulter les données mais pas les modifier.",
     }
 
+@router.get("/billing-history", response_model=Dict[str, Any])
+async def get_billing_history(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+    limit: int = Query(50, ge=1, le=500, description="Nombre maximum de transactions à retourner"),
+    offset: int = Query(0, ge=0, description="Nombre de transactions à sauter (pagination)"),
+    start_date: Optional[str] = Query(None, description="Date de début au format ISO (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Date de fin au format ISO (YYYY-MM-DD)"),
+) -> Dict[str, Any]:
+    """
+    Historique des factures et transactions de l'utilisateur connecté.
+    Retourne l'historique des paiements, upgrades, et factures.
+    """
+    logger.info("Récupération de l'historique des factures pour %s", current_user.email)
+
+    try:
+        # Importer les modèles nécessaires
+        from app.models.subscription import Subscription, SubscriptionTransaction, Invoice
+        
+        # Construire la requête de base
+        transactions_query = db.query(SubscriptionTransaction).join(
+            Subscription, SubscriptionTransaction.subscription_id == Subscription.id
+        ).filter(
+            Subscription.user_id == current_user.id
+        )
+        
+        invoices_query = db.query(Invoice).join(
+            Subscription, Invoice.subscription_id == Subscription.id
+        ).filter(
+            Subscription.user_id == current_user.id
+        )
+        
+        # Appliquer les filtres de date
+        if start_date:
+            start_dt = datetime.fromisoformat(start_date)
+            transactions_query = transactions_query.filter(
+                SubscriptionTransaction.created_at >= start_dt
+            )
+            invoices_query = invoices_query.filter(
+                Invoice.created_at >= start_dt
+            )
+        
+        if end_date:
+            end_dt = datetime.fromisoformat(end_date)
+            transactions_query = transactions_query.filter(
+                SubscriptionTransaction.created_at <= end_dt
+            )
+            invoices_query = invoices_query.filter(
+                Invoice.created_at <= end_dt
+            )
+        
+        # Récupérer les transactions
+        transactions = transactions_query.order_by(
+            SubscriptionTransaction.created_at.desc()
+        ).offset(offset).limit(limit).all()
+        
+        # Récupérer les factures
+        invoices = invoices_query.order_by(
+            Invoice.created_at.desc()
+        ).offset(offset).limit(limit).all()
+        
+        # Récupérer l'historique des changements de plan
+        subscription_history = db.query(Subscription).filter(
+            Subscription.user_id == current_user.id
+        ).order_by(Subscription.created_at.desc()).all()
+        
+        # Construire la réponse
+        billing_items: List[Dict[str, Any]] = []
+        
+        # Ajouter les transactions
+        for transaction in transactions:
+            billing_items.append({
+                "id": str(transaction.id),
+                "type": "transaction",
+                "transaction_type": getattr(transaction, "transaction_type", "payment"),
+                "amount": float(transaction.amount) if transaction.amount else 0,
+                "currency": getattr(transaction, "currency", "USD"),
+                "status": transaction.status,
+                "payment_method": getattr(transaction, "payment_method", None),
+                "payment_id": getattr(transaction, "payment_id", None),
+                "description": getattr(transaction, "description", None),
+                "created_at": transaction.created_at.isoformat() if transaction.created_at else None,
+                "subscription_id": str(transaction.subscription_id) if transaction.subscription_id else None,
+            })
+        
+        # Ajouter les factures
+        for invoice in invoices:
+            billing_items.append({
+                "id": str(invoice.id),
+                "type": "invoice",
+                "invoice_number": getattr(invoice, "invoice_number", f"INV-{invoice.id}"),
+                "amount": float(invoice.amount) if invoice.amount else 0,
+                "currency": getattr(invoice, "currency", "USD"),
+                "status": invoice.status,
+                "pdf_url": getattr(invoice, "pdf_url", None),
+                "due_date": invoice.due_date.isoformat() if getattr(invoice, "due_date", None) else None,
+                "created_at": invoice.created_at.isoformat() if invoice.created_at else None,
+                "subscription_id": str(invoice.subscription_id) if invoice.subscription_id else None,
+            })
+        
+        # Ajouter l'historique des changements de plan (upgrades/downgrades)
+        for sub in subscription_history:
+            if sub.created_at:  # Ne pas inclure la subscription actuelle si elle a été créée par upgrade
+                billing_items.append({
+                    "id": f"plan_change_{sub.id}",
+                    "type": "plan_change",
+                    "previous_plan": getattr(sub, "previous_plan", None),
+                    "new_plan": sub.plan_type,
+                    "billing_cycle": sub.billing_cycle,
+                    "amount": float(sub.price or 0),
+                    "currency": getattr(sub, "currency", "USD"),
+                    "created_at": sub.created_at.isoformat() if sub.created_at else None,
+                    "description": f"Changement de plan vers {sub.plan_name}",
+                })
+        
+        # Trier tous les items par date décroissante
+        billing_items.sort(
+            key=lambda x: x.get("created_at", ""),
+            reverse=True
+        )
+        
+        # Calculer les statistiques
+        total_spent = sum(
+            item.get("amount", 0) 
+            for item in billing_items 
+            if item.get("type") in ["transaction", "invoice"] 
+            and item.get("status") in ["completed", "paid", "success"]
+        )
+        
+        last_payment = None
+        for item in billing_items:
+            if item.get("type") in ["transaction", "invoice"] and item.get("status") in ["completed", "paid", "success"]:
+                last_payment = item
+                break
+        
+        # Vérifier s'il y a des factures impayées
+        unpaid_invoices = [
+            item for item in billing_items 
+            if item.get("type") == "invoice" 
+            and item.get("status") in ["pending", "overdue"]
+        ]
+        
+        return {
+            "success": True,
+            "user": {
+                "id": str(current_user.id),
+                "email": current_user.email,
+                "tenant_id": to_str_uuid(current_user.tenant_id),
+            },
+            "billing_history": billing_items[:limit],  # Limiter le nombre d'items retournés
+            "summary": {
+                "total_items": len(billing_items),
+                "total_transactions": len([i for i in billing_items if i.get("type") == "transaction"]),
+                "total_invoices": len([i for i in billing_items if i.get("type") == "invoice"]),
+                "total_plan_changes": len([i for i in billing_items if i.get("type") == "plan_change"]),
+                "total_spent": round(total_spent, 2),
+                "last_payment": last_payment,
+                "has_unpaid_invoices": len(unpaid_invoices) > 0,
+                "unpaid_invoices_count": len(unpaid_invoices),
+            },
+            "pagination": {
+                "limit": limit,
+                "offset": offset,
+                "has_more": len(billing_items) > limit,
+            },
+            "filters_applied": {
+                "start_date": start_date,
+                "end_date": end_date,
+            },
+            "timestamp": utc_now_iso(),
+        }
+        
+    except Exception as exc:
+        logger.error("Erreur lors de la récupération de l'historique des factures: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "billing_history_fetch_failed",
+                "message": "Erreur lors de la récupération de l'historique des factures.",
+            },
+        )
+
+@router.get("/billing-history/invoice/{invoice_id}", response_model=Dict[str, Any])
+async def get_invoice_details(
+    invoice_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Récupère les détails d'une facture spécifique.
+    """
+    logger.info("Récupération des détails de la facture %s pour %s", invoice_id, current_user.email)
+    
+    try:
+        from app.models.subscription import Invoice, Subscription
+        
+        invoice_uuid = UUID(invoice_id)
+        
+        invoice = db.query(Invoice).join(
+            Subscription, Invoice.subscription_id == Subscription.id
+        ).filter(
+            Invoice.id == invoice_uuid,
+            Subscription.user_id == current_user.id
+        ).first()
+        
+        if not invoice:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": "invoice_not_found",
+                    "message": "Facture non trouvée ou accès non autorisé.",
+                },
+            )
+        
+        # Récupérer les items de la facture s'ils existent
+        invoice_items = []
+        if hasattr(invoice, "items") and invoice.items:
+            for item in invoice.items:
+                invoice_items.append({
+                    "description": getattr(item, "description", ""),
+                    "quantity": getattr(item, "quantity", 1),
+                    "unit_price": float(getattr(item, "unit_price", 0)),
+                    "amount": float(getattr(item, "amount", 0)),
+                })
+        
+        return {
+            "success": True,
+            "invoice": {
+                "id": str(invoice.id),
+                "invoice_number": getattr(invoice, "invoice_number", f"INV-{invoice.id}"),
+                "amount": float(invoice.amount or 0),
+                "currency": getattr(invoice, "currency", "USD"),
+                "status": invoice.status,
+                "pdf_url": getattr(invoice, "pdf_url", None),
+                "created_at": invoice.created_at.isoformat() if invoice.created_at else None,
+                "due_date": invoice.due_date.isoformat() if getattr(invoice, "due_date", None) else None,
+                "paid_at": invoice.paid_at.isoformat() if getattr(invoice, "paid_at", None) else None,
+                "subscription_id": str(invoice.subscription_id),
+                "items": invoice_items,
+                "billing_address": getattr(invoice, "billing_address", None),
+                "tax_amount": float(getattr(invoice, "tax_amount", 0)) if getattr(invoice, "tax_amount", None) else 0,
+                "subtotal": float(getattr(invoice, "subtotal", 0)) if getattr(invoice, "subtotal", None) else invoice.amount,
+            },
+            "timestamp": utc_now_iso(),
+        }
+        
+    except HTTPException:
+        raise
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "invalid_uuid",
+                "message": "Format d'ID de facture invalide.",
+            },
+        )
+    except Exception as exc:
+        logger.error("Erreur lors de la récupération des détails de la facture: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "invoice_details_fetch_failed",
+                "message": "Erreur lors de la récupération des détails de la facture.",
+            },
+        )
+
+@router.get("/billing-history/export", response_model=Dict[str, Any])
+async def export_billing_history(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+    format: str = Query("csv", pattern="^(csv|json)$", description="Format d'export (csv ou json)"),
+    start_date: Optional[str] = Query(None, description="Date de début au format ISO (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="Date de fin au format ISO (YYYY-MM-DD)"),
+) -> Dict[str, Any]:
+    """
+    Exporte l'historique des factures dans différents formats.
+    """
+    logger.info("Export de l'historique des factures pour %s au format %s", current_user.email, format)
+    
+    try:
+        from app.models.subscription import Subscription, SubscriptionTransaction, Invoice
+        
+        # Récupérer toutes les transactions et factures sans limitation de pagination
+        transactions_query = db.query(SubscriptionTransaction).join(
+            Subscription, SubscriptionTransaction.subscription_id == Subscription.id
+        ).filter(
+            Subscription.user_id == current_user.id
+        )
+        
+        invoices_query = db.query(Invoice).join(
+            Subscription, Invoice.subscription_id == Subscription.id
+        ).filter(
+            Subscription.user_id == current_user.id
+        )
+        
+        # Appliquer les filtres de date
+        if start_date:
+            start_dt = datetime.fromisoformat(start_date)
+            transactions_query = transactions_query.filter(
+                SubscriptionTransaction.created_at >= start_dt
+            )
+            invoices_query = invoices_query.filter(
+                Invoice.created_at >= start_dt
+            )
+        
+        if end_date:
+            end_dt = datetime.fromisoformat(end_date)
+            transactions_query = transactions_query.filter(
+                SubscriptionTransaction.created_at <= end_dt
+            )
+            invoices_query = invoices_query.filter(
+                Invoice.created_at <= end_dt
+            )
+        
+        transactions = transactions_query.order_by(
+            SubscriptionTransaction.created_at.desc()
+        ).all()
+        
+        invoices = invoices_query.order_by(
+            Invoice.created_at.desc()
+        ).all()
+        
+        # Construire les données pour l'export
+        export_data = []
+        
+        for transaction in transactions:
+            export_data.append({
+                "id": str(transaction.id),
+                "type": "transaction",
+                "transaction_type": getattr(transaction, "transaction_type", "payment"),
+                "amount": float(transaction.amount) if transaction.amount else 0,
+                "currency": getattr(transaction, "currency", "USD"),
+                "status": transaction.status,
+                "payment_method": getattr(transaction, "payment_method", None),
+                "description": getattr(transaction, "description", None),
+                "date": transaction.created_at.isoformat() if transaction.created_at else None,
+            })
+        
+        for invoice in invoices:
+            export_data.append({
+                "id": str(invoice.id),
+                "type": "invoice",
+                "invoice_number": getattr(invoice, "invoice_number", f"INV-{invoice.id}"),
+                "amount": float(invoice.amount) if invoice.amount else 0,
+                "currency": getattr(invoice, "currency", "USD"),
+                "status": invoice.status,
+                "due_date": invoice.due_date.isoformat() if getattr(invoice, "due_date", None) else None,
+                "date": invoice.created_at.isoformat() if invoice.created_at else None,
+            })
+        
+        # Trier par date décroissante
+        export_data.sort(key=lambda x: x.get("date", ""), reverse=True)
+        
+        # Calculer les statistiques pour l'export
+        total_amount = sum(item.get("amount", 0) for item in export_data if item.get("status") in ["completed", "paid", "success"])
+        
+        return {
+            "success": True,
+            "user": {
+                "id": str(current_user.id),
+                "email": current_user.email,
+            },
+            "export": {
+                "format": format,
+                "total_records": len(export_data),
+                "total_amount": round(total_amount, 2),
+                "currency": "USD",
+                "date_range": {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                },
+                "data": export_data,
+                "exported_at": utc_now_iso(),
+            },
+            "download_url": f"/api/v1/subscriptions/billing-history/export/download?format={format}" if format == "csv" else None,
+        }
+        
+    except Exception as exc:
+        logger.error("Erreur lors de l'export de l'historique des factures: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "export_failed",
+                "message": "Erreur lors de l'export de l'historique des factures.",
+            },
+        )
+
 
 def build_plan_payload(plan_key: str, config: Dict[str, Any]) -> Dict[str, Any]:
     return {

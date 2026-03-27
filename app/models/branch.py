@@ -81,7 +81,7 @@ class Branch(Base):
     products = relationship("Product", back_populates="branch")
     sales = relationship("Sale", back_populates="branch")
     customers = relationship("Customer", back_populates="branch")
-    
+    capitals = relationship("Capital", back_populates="branch")
     # =========================
     # Méthodes
     # =========================

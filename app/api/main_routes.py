@@ -305,7 +305,7 @@ def get_pending_incoming_transfers(
 def get_sales_trends(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    period: str = Query("week", regex="^(day|week|month|year)$")
+    period: str = Query("week", pattern="^(day|week|month|year)$")
 ):
     """
     Retourne les tendances des ventes

@@ -392,12 +392,13 @@ def decode_token_safely(token: str) -> dict:
             detail="Token invalide ou expiré"
         )
 
-# =========================
-# ENDPOINTS D'AUTHENTIFICATION
-# =========================
+# Dans auth.py, modifier la fonction register_tenant
+
 @router.post("/tenants/register", status_code=201)
 def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
     """Inscription d'un nouveau tenant (pharmacie) avec création automatique de l'abonnement d'essai"""
+    
+    # ... (garder toutes les vérifications préliminaires inchangées jusqu'à la création du tenant)
     
     # =========================
     # 1. VÉRIFICATIONS PRÉLIMINAIRES
@@ -508,9 +509,9 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
             
             # Type et statut
             type_pharmacie=data.type_pharmacie,
-            status="trial",
+            status="active",  # Changé: directement actif sans vérification SMS
             
-            # Plan et limites (seront mises à jour après activation)
+            # Plan et limites
             max_users=limits["max_users"],
             max_products=limits["max_products"],
             current_plan=plan,
@@ -539,13 +540,7 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         )
 
     # =========================
-    # 5. GÉNÉRATION DU CODE DE VÉRIFICATION
-    # =========================
-    
-    otp = generate_otp()
-
-    # =========================
-    # 6. CRÉATION DE L'UTILISATEUR ADMIN
+    # 5. CRÉATION DE L'UTILISATEUR ADMIN (SANS CODE OTP)
     # =========================
     
     try:
@@ -556,10 +551,10 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
             email=data.email.lower(),
             password_hash=hashed_password,
             role="admin",
-            actif=False,  # Sera activé après vérification SMS
+            actif=True,  # Changé: directement actif sans vérification SMS
             telephone=data.telephone,
-            sms_code=otp,
-            sms_expires_at=datetime.utcnow() + timedelta(minutes=OTP_EXPIRATION_MIN),
+            sms_code=None,  # Pas de code OTP
+            sms_expires_at=None,
             login_attempts=0,
             sms_verify_attempts=0,
         )
@@ -579,7 +574,7 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         )
 
     # =========================
-    # 7. CRÉATION DE LA PHARMACIE PRINCIPALE
+    # 6. CRÉATION DE LA PHARMACIE PRINCIPALE
     # =========================
     
     try:
@@ -626,7 +621,7 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         )
 
     # =========================
-    # 8. ASSOCIATION ADMIN-PHARMACIE
+    # 7. ASSOCIATION ADMIN-PHARMACIE
     # =========================
     
     try:
@@ -649,8 +644,9 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
                 "suggestion": "Contactez le support technique"
             }
         )
+    
     # =========================
-    # 9. CRÉATION DE L'ABONNEMENT D'ESSAI POUR L'ADMIN
+    # 8. CRÉATION DE L'ABONNEMENT D'ESSAI
     # =========================
 
     from app.services.subscription_service import create_trial_subscription
@@ -714,8 +710,9 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
                 "suggestion": "Contactez le support technique"
             }
         )
+    
     # =========================
-    # 10. VALIDATION FINALE DE LA TRANSACTION
+    # 9. VALIDATION FINALE DE LA TRANSACTION
     # =========================
     
     try:
@@ -735,41 +732,12 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         )
 
     # =========================
-    # 11. ENVOI DU SMS DE CONFIRMATION
-    # =========================
-    
-    sms_sent = False
-    whatsapp_sent = False
-    
-    try:
-        formatted_phone = format_phone_for_twilio(data.telephone)
-        logger.info(f"Envoi SMS à {formatted_phone} - Plan: {plan}")
-        
-        # Utiliser send_sms_with_fallback pour meilleure fiabilité
-        result = send_sms_with_fallback(
-            formatted_phone, 
-            f"Bienvenue sur Medigest ! Votre code de confirmation est : {otp}"
-        )
-        
-        sms_sent = result.get('success', False)
-        method = result.get('method', 'none')
-        
-        if sms_sent:
-            logger.info(f"SMS envoyé via {method} avec succès")
-        else:
-            logger.error(f"Échec envoi SMS: {result.get('error')}")
-            
-    except Exception as e:
-        logger.error(f"Erreur envoi SMS: {e}")
-        # On continue même si le SMS échoue - l'utilisateur pourra demander un renvoi
-
-    # =========================
-    # 12. RÉPONSE AU CLIENT
+    # 10. RÉPONSE AU CLIENT (SANS ENVOI DE SMS IMMÉDIAT)
     # =========================
     
     response = {
         "status": "success",
-        "message": "Pharmacie créée avec succès. Un code de confirmation a été envoyé par SMS.",
+        "message": "Pharmacie créée avec succès. Vous pouvez maintenant vous connecter.",
         "data": {
             # Identifiants principaux
             "tenant_id": str(tenant.id),
@@ -777,13 +745,8 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
             "tenant_code": tenant_code,
             "pharmacy_id": str(pharmacy.id),
             
-            # Informations SMS
-            "sms_sent": sms_sent,
-            "whatsapp_sent": whatsapp_sent,
-            "verification_code": otp if not sms_sent else None,  # Pour développement
-            
             # Plan et abonnement
-            "plan": "trial",  # On force "trial" car c'est un essai
+            "plan": "trial",
             "plan_name": "Essai gratuit",
             "trial_end_date": trial_subscription.end_date.isoformat(),
             "trial_days": 14,
@@ -811,46 +774,30 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         
         # Instructions pour l'utilisateur
         "next_steps": {
-            "verify_phone": {
-                "message": "Vérifiez votre téléphone avec le code reçu",
-                "action": "POST /api/v1/auth/verify-sms",
+            "login": {
+                "message": "Connectez-vous pour accéder à votre compte",
+                "action": "POST /api/v1/auth/login",
                 "required_data": {
                     "email": data.email,
-                    "code": "123456"
+                    "password": "votre_mot_de_passe"
                 }
             },
-            "activate_account": {
-                "message": "Après vérification, votre compte sera automatiquement activé",
-                "action": "Le code est valable 5 minutes"
-            },
-            "resend_code": {
-                "message": "Si vous n'avez pas reçu le code",
-                "action": "POST /api/v1/auth/resend-verification-code",
-                "required_data": {
-                    "email": data.email,
-                    "method": "sms"
-                }
+            "welcome_sms": {
+                "message": "Un SMS de bienvenue sera envoyé lors de votre première connexion",
+                "note": "Le SMS sera envoyé automatiquement après votre première connexion réussie"
             },
             "trial_info": f"Vous bénéficiez de 14 jours d'essai gratuit jusqu'au {trial_subscription.end_date.strftime('%d/%m/%Y')}",
-            "dashboard_access": "Une fois activé, accédez à votre tableau de bord via /dashboard"
+            "dashboard_access": "Connectez-vous pour accéder à votre tableau de bord"
         },
         
         # Recommandations
         "recommendations": [
             "Sauvegardez vos identifiants dans un endroit sécurisé",
-            "Activez votre compte avec le code SMS reçu",
-            "Complétez le profil de votre pharmacie après activation",
+            "Connectez-vous pour accéder à votre tableau de bord",
+            "Complétez le profil de votre pharmacie après connexion",
             "Explorez les fonctionnalités pendant votre période d'essai"
         ]
     }
-    
-    # Si le SMS n'a pas été envoyé, proposer des alternatives
-    if not sms_sent:
-        response["data"]["sms_failed"] = True
-        response["next_steps"]["alternative_methods"] = {
-            "whatsapp": "POST /api/v1/auth/resend-verification-code (method=whatsapp)",
-            "email": "POST /api/v1/auth/resend-verification-code (method=email)"
-        }
     
     return response
 
@@ -1475,52 +1422,27 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
             detail="Identifiants invalides"
         )
 
-    # Vérification activation compte
-    if not user.actif:
-        has_pending_code = bool(user.sms_code and user.sms_expires_at)
-        code_expired = bool(user.sms_expires_at and user.sms_expires_at < datetime.utcnow())
-
-        if not has_pending_code or code_expired:
-            new_code = generate_otp()
-            user.sms_code = new_code
-            user.sms_expires_at = datetime.utcnow() + timedelta(minutes=OTP_EXPIRATION_MIN)
-
-            sms_sent = False
-            try:
-                formatted_phone = format_phone_for_twilio(user.telephone)
-                send_sms(formatted_phone, f"Code de vérification: {new_code}")
-                sms_sent = True
-                logger.info(f"Nouveau code SMS envoyé à {email}")
-            except Exception as e:
-                logger.error(f"Erreur envoi SMS à {email}: {e}")
-
-            db.commit()
-
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail={
-                    "error": "account_not_activated",
-                    "message": "Compte non activé. Un code de vérification a été envoyé.",
-                    "requires_verification": True,
-                    "verification_required": True,
-                    "email": email,
-                    "sms_sent": sms_sent
-                }
+    # Vérifier si c'est la première connexion (pour envoyer le SMS de bienvenue)
+    is_first_login = user.last_login is None
+    
+    # Si c'est la première connexion, envoyer un SMS de bienvenue
+    if is_first_login:
+        try:
+            formatted_phone = format_phone_for_twilio(user.telephone)
+            welcome_message = (
+                f"Bienvenue sur MEDIGEST ! 🎉\n\n"
+                f"Votre compte a été créé avec succès.\n"
+                f"Vous pouvez maintenant accéder à votre tableau de bord.\n\n"
+                f"Email: {user.email}\n"
+                f"Si vous avez des questions, contactez notre support."
             )
+            send_sms_with_fallback(formatted_phone, welcome_message)
+            logger.info(f"SMS de bienvenue envoyé à {email}")
+        except Exception as e:
+            logger.error(f"Erreur envoi SMS de bienvenue à {email}: {e}")
+            # On continue même si le SMS échoue
 
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "error": "account_not_activated",
-                "message": "Compte non activé. Entrez le code de vérification reçu par SMS.",
-                "requires_verification": True,
-                "verification_required": True,
-                "email": email,
-                "has_pending_code": True
-            }
-        )
-
-    # Variables de contexte
+    # Variables de contexte (inchangé)
     tenant = None
     tenant_data = None
     pharmacies = []
@@ -1584,6 +1506,7 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
     response_data = {
         **token_pair,
         "subscription_active": subscription_active,
+        "is_first_login": is_first_login,  # Ajout pour informer le frontend
         "user": {
             "id": str(user.id),
             "email": user.email,
