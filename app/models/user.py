@@ -112,13 +112,17 @@ class User(Base):
         lazy="noload",
         overlaps="payments_processed"
     )
+
     
-    subscription = relationship(
-        "UserSubscription", 
-        back_populates="user", 
+    subscription = relationship("Subscription", back_populates="user", uselist=False)
+    tenant_subscription = relationship(
+        "Subscription", 
+        back_populates="user",
         uselist=False,
-        cascade="all, delete-orphan"
+        foreign_keys="[Subscription.user_id]"
     )
+
+    user_subscription = relationship("UserSubscription", back_populates="user", uselist=False)
 
     # =========================
     # Méthodes utilitaires

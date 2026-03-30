@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 import re
 import secrets
 import string
-
+import inspect
 from app.models.user import User
 from app.db.session import get_db
 from app.core.config import settings
@@ -219,6 +219,8 @@ async def get_current_superuser(current_user: User = Depends(get_current_user)) 
         )
     return current_user
 
+# app/core/security.py (section corrigée pour require_permission)
+
 # ===========================================
 # PERMISSIONS ET RÔLES
 # ===========================================
@@ -253,17 +255,24 @@ def has_permission(user_role: str, permission: str) -> bool:
     
     return False
 
+
 def require_permission(permission_code: str):
-    """Décorateur pour vérifier les permissions"""
+    """
+    Décorateur pour vérifier les permissions
+    Supporte les fonctions synchrones ET asynchrones
+    """
     def decorator(func: Callable) -> Callable:
         @wraps(func)
-        async def wrapper(*args, **kwargs):
-            # Trouver l'utilisateur dans les arguments
-            current_user = None
-            for arg in kwargs.values():
-                if isinstance(arg, User):
-                    current_user = arg
-                    break
+        async def async_wrapper(*args, **kwargs):
+            # Récupérer l'utilisateur depuis les kwargs (paramètres nommés)
+            current_user = kwargs.get('current_user')
+            
+            # Si pas trouvé dans kwargs, chercher dans les args (paramètres positionnels)
+            if not current_user:
+                for arg in args:
+                    if isinstance(arg, User):
+                        current_user = arg
+                        break
             
             if not current_user:
                 raise HTTPException(
@@ -278,22 +287,63 @@ def require_permission(permission_code: str):
                     detail=f"Permission '{permission_code}' requise. Rôle: {current_user.role}"
                 )
             
+            # Exécuter la fonction originale (asynchrone)
             return await func(*args, **kwargs)
         
-        return wrapper
+        @wraps(func)
+        def sync_wrapper(*args, **kwargs):
+            # Récupérer l'utilisateur depuis les kwargs (paramètres nommés)
+            current_user = kwargs.get('current_user')
+            
+            # Si pas trouvé dans kwargs, chercher dans les args (paramètres positionnels)
+            if not current_user:
+                for arg in args:
+                    if isinstance(arg, User):
+                        current_user = arg
+                        break
+            
+            if not current_user:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Utilisateur non authentifié"
+                )
+            
+            # Vérifier la permission
+            if not has_permission(current_user.role, permission_code):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Permission '{permission_code}' requise. Rôle: {current_user.role}"
+                )
+            
+            # Exécuter la fonction originale (synchrone)
+            return func(*args, **kwargs)
+        
+        # Déterminer si la fonction est asynchrone ou synchrone
+        if inspect.iscoroutinefunction(func):
+            return async_wrapper
+        else:
+            return sync_wrapper
+    
     return decorator
 
+
 def require_role(allowed_roles: List[str]):
-    """Décorateur pour vérifier le rôle"""
+    """
+    Décorateur pour vérifier le rôle
+    Supporte les fonctions synchrones ET asynchrones
+    """
     def decorator(func: Callable) -> Callable:
         @wraps(func)
-        async def wrapper(*args, **kwargs):
-            # Trouver l'utilisateur dans les arguments
-            current_user = None
-            for arg in kwargs.values():
-                if isinstance(arg, User):
-                    current_user = arg
-                    break
+        async def async_wrapper(*args, **kwargs):
+            # Récupérer l'utilisateur depuis les kwargs (paramètres nommés)
+            current_user = kwargs.get('current_user')
+            
+            # Si pas trouvé dans kwargs, chercher dans les args (paramètres positionnels)
+            if not current_user:
+                for arg in args:
+                    if isinstance(arg, User):
+                        current_user = arg
+                        break
             
             if not current_user:
                 raise HTTPException(
@@ -308,11 +358,44 @@ def require_role(allowed_roles: List[str]):
                     detail=f"Rôles autorisés: {allowed_roles}. Votre rôle: {current_user.role}"
                 )
             
+            # Exécuter la fonction originale (asynchrone)
             return await func(*args, **kwargs)
         
-        return wrapper
+        @wraps(func)
+        def sync_wrapper(*args, **kwargs):
+            # Récupérer l'utilisateur depuis les kwargs (paramètres nommés)
+            current_user = kwargs.get('current_user')
+            
+            # Si pas trouvé dans kwargs, chercher dans les args (paramètres positionnels)
+            if not current_user:
+                for arg in args:
+                    if isinstance(arg, User):
+                        current_user = arg
+                        break
+            
+            if not current_user:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Utilisateur non authentifié"
+                )
+            
+            # Vérifier le rôle
+            if current_user.role not in allowed_roles:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Rôles autorisés: {allowed_roles}. Votre rôle: {current_user.role}"
+                )
+            
+            # Exécuter la fonction originale (synchrone)
+            return func(*args, **kwargs)
+        
+        # Déterminer si la fonction est asynchrone ou synchrone
+        if inspect.iscoroutinefunction(func):
+            return async_wrapper
+        else:
+            return sync_wrapper
+    
     return decorator
-
 # ===========================================
 # VALIDATION
 # ===========================================

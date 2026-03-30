@@ -49,7 +49,7 @@ class UserSubscription(Base):
     config = Column(JSON, nullable=True, default=dict)
     
     # Relations
-    user = relationship("User", back_populates="subscription")
+    user = relationship("User", back_populates="user_subscription")
     tenant = relationship("Tenant")
     payment = relationship("Payment")
     

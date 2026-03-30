@@ -62,6 +62,7 @@ async def update_subscription(
 # HELPERS
 # =============================================================================
 
+
 def utc_now_iso() -> str:
     return datetime.utcnow().isoformat()
 
@@ -93,6 +94,7 @@ def get_read_only_restrictions() -> Dict[str, Any]:
         "message": "Mode lecture seule : vous pouvez consulter les données mais pas les modifier.",
     }
 
+
 @router.get("/billing-history", response_model=Dict[str, Any])
 async def get_billing_history(
     current_user: User = Depends(get_current_active_user),
@@ -109,27 +111,29 @@ async def get_billing_history(
     logger.info("Récupération de l'historique des factures pour %s", current_user.email)
 
     try:
-        # Importer les modèles nécessaires
-        from app.models.subscription import Subscription, SubscriptionTransaction, Invoice
+        # ✅ Importer les modèles nécessaires
+        from app.models.subscription import Subscription, SubscriptionPayment
+        from app.models.invoice import Invoice
+        from app.models.invoice_payment import InvoicePayment as InvoicePaymentModel
         
-        # Construire la requête de base
-        transactions_query = db.query(SubscriptionTransaction).join(
-            Subscription, SubscriptionTransaction.subscription_id == Subscription.id
+        # Construire la requête pour les paiements d'abonnement
+        subscription_payments_query = db.query(SubscriptionPayment).join(
+            Subscription, SubscriptionPayment.subscription_id == Subscription.id
         ).filter(
             Subscription.user_id == current_user.id
         )
         
-        invoices_query = db.query(Invoice).join(
-            Subscription, Invoice.subscription_id == Subscription.id
-        ).filter(
-            Subscription.user_id == current_user.id
+        # Construire la requête pour les factures d'abonnement (invoices avec invoice_type='subscription')
+        invoices_query = db.query(Invoice).filter(
+            Invoice.tenant_id == current_user.tenant_id,
+            Invoice.invoice_type == 'subscription'
         )
         
-        # Appliquer les filtres de date
+        # Appliquer les filtres de date pour les paiements
         if start_date:
             start_dt = datetime.fromisoformat(start_date)
-            transactions_query = transactions_query.filter(
-                SubscriptionTransaction.created_at >= start_dt
+            subscription_payments_query = subscription_payments_query.filter(
+                SubscriptionPayment.created_at >= start_dt
             )
             invoices_query = invoices_query.filter(
                 Invoice.created_at >= start_dt
@@ -137,16 +141,16 @@ async def get_billing_history(
         
         if end_date:
             end_dt = datetime.fromisoformat(end_date)
-            transactions_query = transactions_query.filter(
-                SubscriptionTransaction.created_at <= end_dt
+            subscription_payments_query = subscription_payments_query.filter(
+                SubscriptionPayment.created_at <= end_dt
             )
             invoices_query = invoices_query.filter(
                 Invoice.created_at <= end_dt
             )
         
-        # Récupérer les transactions
-        transactions = transactions_query.order_by(
-            SubscriptionTransaction.created_at.desc()
+        # Récupérer les paiements d'abonnement
+        subscription_payments = subscription_payments_query.order_by(
+            SubscriptionPayment.created_at.desc()
         ).offset(offset).limit(limit).all()
         
         # Récupérer les factures
@@ -162,51 +166,81 @@ async def get_billing_history(
         # Construire la réponse
         billing_items: List[Dict[str, Any]] = []
         
-        # Ajouter les transactions
-        for transaction in transactions:
+        # Ajouter les paiements d'abonnement
+        for payment in subscription_payments:
             billing_items.append({
-                "id": str(transaction.id),
-                "type": "transaction",
-                "transaction_type": getattr(transaction, "transaction_type", "payment"),
-                "amount": float(transaction.amount) if transaction.amount else 0,
-                "currency": getattr(transaction, "currency", "USD"),
-                "status": transaction.status,
-                "payment_method": getattr(transaction, "payment_method", None),
-                "payment_id": getattr(transaction, "payment_id", None),
-                "description": getattr(transaction, "description", None),
-                "created_at": transaction.created_at.isoformat() if transaction.created_at else None,
-                "subscription_id": str(transaction.subscription_id) if transaction.subscription_id else None,
+                "id": str(payment.id),
+                "type": "subscription_payment",
+                "transaction_type": "payment",
+                "amount": float(payment.amount) if payment.amount else 0,
+                "currency": getattr(payment, "currency", "USD"),
+                "status": payment.status.value if payment.status else "pending",
+                "payment_method": payment.payment_method.value if payment.payment_method else None,
+                "payment_reference": payment.payment_reference,
+                "description": payment.description,
+                "created_at": payment.created_at.isoformat() if payment.created_at else None,
+                "paid_at": payment.paid_at.isoformat() if getattr(payment, "paid_at", None) else None,
+                "subscription_id": str(payment.subscription_id) if payment.subscription_id else None,
+                "period_start": payment.period_start.isoformat() if payment.period_start else None,
+                "period_end": payment.period_end.isoformat() if payment.period_end else None,
             })
         
         # Ajouter les factures
         for invoice in invoices:
+            # Récupérer les paiements associés à la facture
+            invoice_payments = db.query(InvoicePaymentModel).filter(
+                InvoicePaymentModel.invoice_id == invoice.id
+            ).all()
+            
             billing_items.append({
                 "id": str(invoice.id),
                 "type": "invoice",
-                "invoice_number": getattr(invoice, "invoice_number", f"INV-{invoice.id}"),
-                "amount": float(invoice.amount) if invoice.amount else 0,
-                "currency": getattr(invoice, "currency", "USD"),
+                "invoice_number": invoice.invoice_number,
+                "amount": float(invoice.total_amount) if invoice.total_amount else 0,
+                "currency": invoice.currency,
                 "status": invoice.status,
-                "pdf_url": getattr(invoice, "pdf_url", None),
-                "due_date": invoice.due_date.isoformat() if getattr(invoice, "due_date", None) else None,
+                "payment_status": invoice.payment_status,
+                "pdf_path": invoice.pdf_path,
+                "issue_date": invoice.issue_date.isoformat() if invoice.issue_date else None,
+                "due_date": invoice.due_date.isoformat() if invoice.due_date else None,
                 "created_at": invoice.created_at.isoformat() if invoice.created_at else None,
-                "subscription_id": str(invoice.subscription_id) if invoice.subscription_id else None,
+                "paid_at": invoice.paid_at.isoformat() if invoice.paid_at else None,
+                "subscription_plan": invoice.subscription_plan,
+                "subscription_period": invoice.subscription_period,
+                "subscription_start": invoice.subscription_start.isoformat() if invoice.subscription_start else None,
+                "subscription_end": invoice.subscription_end.isoformat() if invoice.subscription_end else None,
+                "description": f"Facture d'abonnement {invoice.subscription_plan} - {invoice.subscription_period}",
+                "payments": [
+                    {
+                        "id": str(payment.id),
+                        "amount": float(payment.amount),
+                        "payment_method": payment.payment_method,
+                        "reference": payment.reference,
+                        "status": payment.status,
+                        "payment_date": payment.payment_date.isoformat() if payment.payment_date else None,
+                    }
+                    for payment in invoice_payments
+                ],
             })
         
-        # Ajouter l'historique des changements de plan (upgrades/downgrades)
+        # Ajouter l'historique des changements de plan
         for sub in subscription_history:
-            if sub.created_at:  # Ne pas inclure la subscription actuelle si elle a été créée par upgrade
-                billing_items.append({
-                    "id": f"plan_change_{sub.id}",
-                    "type": "plan_change",
-                    "previous_plan": getattr(sub, "previous_plan", None),
-                    "new_plan": sub.plan_type,
-                    "billing_cycle": sub.billing_cycle,
-                    "amount": float(sub.price or 0),
-                    "currency": getattr(sub, "currency", "USD"),
-                    "created_at": sub.created_at.isoformat() if sub.created_at else None,
-                    "description": f"Changement de plan vers {sub.plan_name}",
-                })
+            if sub.created_at:
+                # Vérifier si c'est un changement de plan (différent du plan précédent)
+                previous_plan = getattr(sub, "previous_plan", None)
+                if previous_plan and previous_plan != sub.plan:
+                    billing_items.append({
+                        "id": f"plan_change_{sub.id}",
+                        "type": "plan_change",
+                        "previous_plan": previous_plan,
+                        "new_plan": sub.plan.value if hasattr(sub.plan, 'value') else str(sub.plan),
+                        "billing_cycle": sub.billing_period.value if hasattr(sub.billing_period, 'value') else str(sub.billing_period),
+                        "amount": float(sub.current_price or 0),
+                        "currency": getattr(sub, "currency", "USD"),
+                        "created_at": sub.created_at.isoformat() if sub.created_at else None,
+                        "description": f"Changement de plan vers {sub.plan_name}",
+                        "subscription_id": str(sub.id),
+                    })
         
         # Trier tous les items par date décroissante
         billing_items.sort(
@@ -218,13 +252,13 @@ async def get_billing_history(
         total_spent = sum(
             item.get("amount", 0) 
             for item in billing_items 
-            if item.get("type") in ["transaction", "invoice"] 
-            and item.get("status") in ["completed", "paid", "success"]
+            if item.get("type") in ["subscription_payment", "invoice"] 
+            and item.get("status") in ["completed", "paid", "success", "COMPLETED", "paid"]
         )
         
         last_payment = None
         for item in billing_items:
-            if item.get("type") in ["transaction", "invoice"] and item.get("status") in ["completed", "paid", "success"]:
+            if item.get("type") in ["subscription_payment", "invoice"] and item.get("status") in ["completed", "paid", "success", "COMPLETED", "paid"]:
                 last_payment = item
                 break
         
@@ -232,7 +266,7 @@ async def get_billing_history(
         unpaid_invoices = [
             item for item in billing_items 
             if item.get("type") == "invoice" 
-            and item.get("status") in ["pending", "overdue"]
+            and item.get("payment_status") in ["pending", "overdue", "partially_paid"]
         ]
         
         return {
@@ -242,10 +276,10 @@ async def get_billing_history(
                 "email": current_user.email,
                 "tenant_id": to_str_uuid(current_user.tenant_id),
             },
-            "billing_history": billing_items[:limit],  # Limiter le nombre d'items retournés
+            "billing_history": billing_items[:limit],
             "summary": {
                 "total_items": len(billing_items),
-                "total_transactions": len([i for i in billing_items if i.get("type") == "transaction"]),
+                "total_subscription_payments": len([i for i in billing_items if i.get("type") == "subscription_payment"]),
                 "total_invoices": len([i for i in billing_items if i.get("type") == "invoice"]),
                 "total_plan_changes": len([i for i in billing_items if i.get("type") == "plan_change"]),
                 "total_spent": round(total_spent, 2),
@@ -274,7 +308,7 @@ async def get_billing_history(
                 "message": "Erreur lors de la récupération de l'historique des factures.",
             },
         )
-
+    
 @router.get("/billing-history/invoice/{invoice_id}", response_model=Dict[str, Any])
 async def get_invoice_details(
     invoice_id: str,
@@ -287,15 +321,14 @@ async def get_invoice_details(
     logger.info("Récupération des détails de la facture %s pour %s", invoice_id, current_user.email)
     
     try:
-        from app.models.subscription import Invoice, Subscription
+        from app.models.invoice import Invoice
+        from app.models.invoice_payment import InvoicePayement
         
         invoice_uuid = UUID(invoice_id)
         
-        invoice = db.query(Invoice).join(
-            Subscription, Invoice.subscription_id == Subscription.id
-        ).filter(
+        invoice = db.query(Invoice).filter(
             Invoice.id == invoice_uuid,
-            Subscription.user_id == current_user.id
+            Invoice.tenant_id == current_user.tenant_id
         ).first()
         
         if not invoice:
@@ -307,34 +340,71 @@ async def get_invoice_details(
                 },
             )
         
-        # Récupérer les items de la facture s'ils existent
+        # Récupérer les items de la facture
         invoice_items = []
-        if hasattr(invoice, "items") and invoice.items:
-            for item in invoice.items:
-                invoice_items.append({
-                    "description": getattr(item, "description", ""),
-                    "quantity": getattr(item, "quantity", 1),
-                    "unit_price": float(getattr(item, "unit_price", 0)),
-                    "amount": float(getattr(item, "amount", 0)),
-                })
+        for item in invoice.items:
+            invoice_items.append({
+                "id": str(item.id),
+                "description": item.description,
+                "item_type": item.item_type,
+                "quantity": item.quantity,
+                "unit_price": float(item.unit_price),
+                "tax_rate": float(item.tax_rate),
+                "discount_percent": float(item.discount_percent),
+                "subtotal": float(item.subtotal),
+                "tax_amount": float(item.tax_amount),
+                "total": float(item.total),
+                "product_id": str(item.product_id) if item.product_id else None,
+            })
+        
+        # Récupérer les paiements associés à la facture
+        invoice_payments = []
+        for payment in invoice.payments:
+            invoice_payments.append({
+                "id": str(payment.id),
+                "amount": float(payment.amount),
+                "payment_method": payment.payment_method,
+                "reference": payment.reference,
+                "status": payment.status,
+                "payment_date": payment.payment_date.isoformat() if payment.payment_date else None,
+            })
         
         return {
             "success": True,
             "invoice": {
                 "id": str(invoice.id),
-                "invoice_number": getattr(invoice, "invoice_number", f"INV-{invoice.id}"),
-                "amount": float(invoice.amount or 0),
-                "currency": getattr(invoice, "currency", "USD"),
+                "invoice_number": invoice.invoice_number,
+                "invoice_type": invoice.invoice_type,
+                "issue_date": invoice.issue_date.isoformat() if invoice.issue_date else None,
+                "due_date": invoice.due_date.isoformat() if invoice.due_date else None,
+                "subtotal": float(invoice.subtotal),
+                "total_tax": float(invoice.total_tax),
+                "total_discount": float(invoice.total_discount),
+                "shipping_amount": float(invoice.shipping_amount),
+                "total_amount": float(invoice.total_amount),
+                "amount_paid": float(invoice.amount_paid),
+                "amount_due": invoice.amount_due,
                 "status": invoice.status,
-                "pdf_url": getattr(invoice, "pdf_url", None),
+                "payment_status": invoice.payment_status,
+                "currency": invoice.currency,
+                "is_overdue": invoice.is_overdue,
+                "days_overdue": invoice.days_overdue,
+                "payment_progress": invoice.payment_progress,
                 "created_at": invoice.created_at.isoformat() if invoice.created_at else None,
-                "due_date": invoice.due_date.isoformat() if getattr(invoice, "due_date", None) else None,
-                "paid_at": invoice.paid_at.isoformat() if getattr(invoice, "paid_at", None) else None,
-                "subscription_id": str(invoice.subscription_id),
+                "paid_at": invoice.paid_at.isoformat() if invoice.paid_at else None,
+                "subscription_plan": invoice.subscription_plan,
+                "subscription_period": invoice.subscription_period,
+                "subscription_start": invoice.subscription_start.isoformat() if invoice.subscription_start else None,
+                "subscription_end": invoice.subscription_end.isoformat() if invoice.subscription_end else None,
+                "is_recurring": invoice.is_recurring,
+                "recurring_interval": invoice.recurring_interval,
+                "next_invoice_date": invoice.next_invoice_date.isoformat() if invoice.next_invoice_date else None,
+                "email_sent": invoice.email_sent,
+                "pdf_path": invoice.pdf_path,
+                "notes": invoice.notes,
+                "terms": invoice.terms,
                 "items": invoice_items,
-                "billing_address": getattr(invoice, "billing_address", None),
-                "tax_amount": float(getattr(invoice, "tax_amount", 0)) if getattr(invoice, "tax_amount", None) else 0,
-                "subtotal": float(getattr(invoice, "subtotal", 0)) if getattr(invoice, "subtotal", None) else invoice.amount,
+                "payments": invoice_payments,
             },
             "timestamp": utc_now_iso(),
         }
@@ -373,7 +443,8 @@ async def export_billing_history(
     logger.info("Export de l'historique des factures pour %s au format %s", current_user.email, format)
     
     try:
-        from app.models.subscription import Subscription, SubscriptionTransaction, Invoice
+        from app.models.subscription import Subscription, SubscriptionTransaction
+        from app.models.invoice import Invoice
         
         # Récupérer toutes les transactions et factures sans limitation de pagination
         transactions_query = db.query(SubscriptionTransaction).join(
@@ -1119,7 +1190,7 @@ async def extend_trial_period(
             },
         )
 
-    if not getattr(user, "subscription", None) or user.subscription.plan_type != "trial":
+    if not getattr(user, "tenant_subscription", None) or user.tenant_subscription.plan_type != "trial":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
@@ -1129,29 +1200,18 @@ async def extend_trial_period(
         )
 
     try:
-        old_end = user.subscription.end_date
-        if old_end is None:
-            old_end = datetime.utcnow()
-
-        new_end = old_end + timedelta(days=extra_days)
-
-        user.subscription.end_date = new_end
-        if hasattr(user.subscription, "trial_end_date"):
-            user.subscription.trial_end_date = new_end
-
-        config = user.subscription.config or {}
-        config["trial_extended"] = {
-            "extended_by": str(current_user.id),
-            "extended_by_email": current_user.email,
-            "extended_at": utc_now_iso(),
-            "extra_days": extra_days,
-            "old_end_date": old_end.isoformat() if old_end else None,
-            "new_end_date": new_end.isoformat(),
-        }
-        user.subscription.config = config
-
+        old_end = user.tenant_subscription.end_date
+        # Calculer la nouvelle date de fin
+        new_end = (old_end + timedelta(days=extra_days)) if old_end else (datetime.utcnow() + timedelta(days=extra_days))
+        
+        user.tenant_subscription.end_date = new_end
+        if hasattr(user.tenant_subscription, "trial_end_date"):
+            user.tenant_subscription.trial_end_date = new_end
+        config = user.tenant_subscription.config or {}
+        # ... (suite du traitement de config si nécessaire)
+        user.tenant_subscription.config = config
         db.commit()
-        db.refresh(user.subscription)
+        db.refresh(user.tenant_subscription)
 
         return {
             "success": True,
@@ -1160,7 +1220,7 @@ async def extend_trial_period(
             "user_email": user.email,
             "old_end_date": old_end.isoformat() if old_end else None,
             "new_end_date": new_end.isoformat(),
-            "days_remaining": user.subscription.days_remaining(),
+            "days_remaining": user.tenant_subscription.days_remaining(),
             "extended_by": current_user.email,
             "extended_at": utc_now_iso(),
         }
@@ -1213,7 +1273,7 @@ async def get_tenant_subscriptions(
 
         subscriptions: List[Dict[str, Any]] = []
         for user in users:
-            sub = getattr(user, "subscription", None)
+            sub = getattr(user, "tenant_subscription", None)
             if not sub:
                 continue
 

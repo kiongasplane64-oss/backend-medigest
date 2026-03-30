@@ -63,6 +63,7 @@ class Subscription(Base):
     # Identifiants
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True) 
     subscription_code = Column(String(50), unique=True, nullable=False, index=True)
     
     # Informations de l'abonnement
@@ -106,6 +107,16 @@ class Subscription(Base):
     
     # Relations
     tenant = relationship("Tenant", back_populates="subscriptions")
+    user = relationship(
+        "User", 
+        back_populates="tenant_subscription",  
+        foreign_keys=[user_id]
+    )
+    creator = relationship(
+        "User", 
+        foreign_keys=[created_by],
+        lazy="noload"
+    )
     subscription_payments = relationship("SubscriptionPayment", back_populates="subscription", cascade="all, delete-orphan")
     
     def __init__(self, **kwargs):

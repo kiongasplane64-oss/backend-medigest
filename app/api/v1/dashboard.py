@@ -6,7 +6,7 @@ Version complète 2026 - Communication 100% cohérente avec le frontend
 
 from fastapi import APIRouter, Depends, Query, HTTPException, status
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import func, and_, extract, desc, or_
+from sqlalchemy import func, and_, extract, desc, or_, case
 from datetime import datetime, timedelta, date
 from typing import Optional, List, Dict, Any
 import secrets
@@ -15,6 +15,7 @@ import logging
 
 from app.db.session import get_db
 from app.models.user import User
+from app.models.client import Client
 from app.models.sale import Sale, SaleItem
 from app.models.cost import Cost
 from app.models.product import Product, ProductStock
@@ -53,8 +54,8 @@ def _format_currency(value: float) -> str:
     return f"{value:,.2f} FC"
 
 
-def _get_tenant_id(current_user: User, pharmacy_id: Optional[int] = None) -> int:
-    """Détermine le tenant_id à utiliser"""
+def _get_tenant_id(current_user: User, pharmacy_id: Optional[uuid.UUID] = None) -> uuid.UUID:
+    """Détermine le tenant_id à utiliser (UUID)"""
     if pharmacy_id and current_user.role in ['admin', 'super_admin']:
         return pharmacy_id
     return current_user.tenant_id
@@ -62,10 +63,10 @@ def _get_tenant_id(current_user: User, pharmacy_id: Optional[int] = None) -> int
 
 def _get_pharmacy_id(
     current_pharmacy: Optional[Pharmacy],
-    pharmacy_id_param: Optional[int] = None,
+    pharmacy_id_param: Optional[uuid.UUID] = None,
     current_user: Optional[User] = None
-) -> Optional[int]:
-    """Détermine l'ID de la pharmacie à utiliser"""
+) -> Optional[uuid.UUID]:
+    """Détermine l'ID de la pharmacie à utiliser (UUID)"""
     if pharmacy_id_param and current_user and current_user.role in ['admin', 'super_admin']:
         return pharmacy_id_param
     return current_pharmacy.id if current_pharmacy else None
@@ -82,7 +83,7 @@ def get_dashboard_stats(
     current_user: User = Depends(get_current_user),
     current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
-    pharmacy_id: Optional[int] = Query(None, description="ID de la pharmacie pour les admins"),
+    pharmacy_id: Optional[uuid.UUID] = Query(None, description="ID de la pharmacie (UUID) pour les admins"),
     start_date: Optional[date] = Query(None, description="Date de début pour les filtres"),
     end_date: Optional[date] = Query(None, description="Date de fin pour les filtres")
 ):
@@ -100,41 +101,37 @@ def get_dashboard_stats(
     last_month = today - timedelta(days=30)
     last_week = today - timedelta(days=7)
     
-    # Appliquer les filtres de dates si fournis
-    sales_start_date = start_date if start_date else first_day_month
-    sales_end_date = end_date if end_date else today
-    
     # === VENTES ===
     # Ventes du jour
-    daily_sales = db.query(func.sum(Sale.total_price)).filter(
+    daily_sales = db.query(func.sum(Sale.total_amount)).filter(
         Sale.tenant_id == tenant_id,
         func.date(Sale.created_at) == today,
         Sale.status == "completed"
     ).scalar() or 0
     
     # Ventes d'hier
-    yesterday_sales = db.query(func.sum(Sale.total_price)).filter(
+    yesterday_sales = db.query(func.sum(Sale.total_amount)).filter(
         Sale.tenant_id == tenant_id,
         func.date(Sale.created_at) == yesterday,
         Sale.status == "completed"
     ).scalar() or 0
     
     # Ventes du mois
-    monthly_sales = db.query(func.sum(Sale.total_price)).filter(
+    monthly_sales = db.query(func.sum(Sale.total_amount)).filter(
         Sale.tenant_id == tenant_id,
         Sale.created_at >= first_day_month,
         Sale.status == "completed"
     ).scalar() or 0
     
     # Ventes des 30 derniers jours
-    last_30_days_sales = db.query(func.sum(Sale.total_price)).filter(
+    last_30_days_sales = db.query(func.sum(Sale.total_amount)).filter(
         Sale.tenant_id == tenant_id,
         Sale.created_at >= last_month,
         Sale.status == "completed"
     ).scalar() or 0
     
     # Ventes de la semaine
-    weekly_sales = db.query(func.sum(Sale.total_price)).filter(
+    weekly_sales = db.query(func.sum(Sale.total_amount)).filter(
         Sale.tenant_id == tenant_id,
         Sale.created_at >= last_week,
         Sale.status == "completed"
@@ -237,31 +234,33 @@ def get_dashboard_stats(
     profit_margin = (net_profit / monthly_sales * 100) if monthly_sales > 0 else 0
     
     # === DETTES ===
-    # Dettes du mois
-    monthly_debts = db.query(func.sum(Debt.amount)).filter(
+    # Dettes du mois (montant initial des nouvelles dettes)
+    monthly_debts = db.query(func.sum(Debt.initial_amount)).filter(
         Debt.tenant_id == tenant_id,
         Debt.created_at >= first_day_month,
-        Debt.status == "pending"
+        Debt.status.in_(["pending", "partially_paid", "overdue", "defaulted"])
     ).scalar() or 0
     
-    # Dettes totales
-    total_debts = db.query(func.sum(Debt.amount)).filter(
+    # Dettes totales (montant restant à payer)
+    total_debts = db.query(func.sum(Debt.remaining_amount)).filter(
         Debt.tenant_id == tenant_id,
-        Debt.status == "pending"
+        Debt.status.in_(["pending", "partially_paid", "overdue", "defaulted"])
     ).scalar() or 0
     
-    # Dettes impayées (en retard)
-    unpaid_debts = db.query(func.sum(Debt.amount)).filter(
+    # Dettes impayées (en retard) - montant restant des dettes en retard
+    unpaid_debts = db.query(func.sum(Debt.remaining_amount)).filter(
         Debt.tenant_id == tenant_id,
-        Debt.status == "pending",
-        Debt.due_date < today
+        Debt.status.in_(["overdue", "defaulted"])
     ).scalar() or 0
     
     # Taux de recouvrement
-    total_invoiced = db.query(func.sum(Debt.amount)).filter(
+    total_invoiced = db.query(func.sum(Debt.initial_amount)).filter(
         Debt.tenant_id == tenant_id
     ).scalar() or 0
-    recovery_rate = ((total_invoiced - total_debts) / total_invoiced * 100) if total_invoiced > 0 else 0
+    total_paid = db.query(func.sum(Debt.paid_amount)).filter(
+        Debt.tenant_id == tenant_id
+    ).scalar() or 0
+    recovery_rate = (total_paid / total_invoiced * 100) if total_invoiced > 0 else 0
     
     # === ACHATS ===
     # Achats du mois
@@ -281,7 +280,7 @@ def get_dashboard_stats(
     # Nombre de fournisseurs
     suppliers_count = db.query(func.count(Supplier.id)).filter(
         Supplier.tenant_id == tenant_id,
-        Supplier.is_active == True
+        Supplier.status == "active"  # ou Supplier.status.in_(["active"]) pour plus de précision
     ).scalar() or 0
     
     # === UTILISATEURS ===
@@ -351,7 +350,7 @@ def get_dashboard_stats(
         day = today - timedelta(days=i)
         day_result = db.query(
             func.count(Sale.id).label("count"),
-            func.sum(Sale.total_price).label("amount")
+            func.sum(Sale.total_amount).label("amount")
         ).filter(
             Sale.tenant_id == tenant_id,
             func.date(Sale.created_at) == day,
@@ -367,7 +366,7 @@ def get_dashboard_stats(
     # === DERNIÈRES TRANSACTIONS ===
     recent_transactions = db.query(
         Sale.reference,
-        Sale.total_price,
+        Sale.total_amount,
         Sale.created_at,
         Sale.payment_method
     ).filter(
@@ -378,7 +377,7 @@ def get_dashboard_stats(
     recent_transactions_list = [
         {
             "reference": t.reference,
-            "amount": float(t.total_price),
+            "amount": float(t.total_amount),
             "date": t.created_at.isoformat(),
             "payment_method": t.payment_method
         }
@@ -406,22 +405,26 @@ def get_dashboard_stats(
     
     # === LISTE DES DETTES ===
     debt_list = db.query(
-        Debt.customer_name,
-        Debt.amount,
-        Debt.due_date
+        Debt.client_id,
+        Debt.initial_amount,
+        Debt.remaining_amount,
+        Debt.due_date,
+        Debt.status
+    ).join(
+        Client, Client.id == Debt.client_id
     ).filter(
         Debt.tenant_id == tenant_id,
-        Debt.status == "pending"
+        Debt.status.in_(["pending", "partially_paid", "overdue", "defaulted"])
     ).order_by(desc(Debt.created_at)).limit(10).all()
     
-    debt_list_result = [
-        {
-            "customer_name": d.customer_name,
-            "amount": float(d.amount),
+    debt_list_result = []
+    for d in debt_list:
+        client = db.query(Client).filter(Client.id == d.client_id).first()
+        debt_list_result.append({
+            "customer_name": client.name if client else "Client inconnu",
+            "amount": float(d.remaining_amount),
             "due_date": d.due_date.isoformat()
-        }
-        for d in debt_list
-    ]
+        })
     
     # === DÉPENSES PAR CATÉGORIE ===
     expense_categories = db.query(
@@ -581,8 +584,16 @@ def get_inventory_alerts(
     if pharmacy_id_effective:
         query = query.join(Product).filter(Product.pharmacy_id == pharmacy_id_effective)
     
+    # Utiliser case() pour le tri par sévérité
+    severity_order = case(
+        (InventoryAlert.severity == 'high', 3),
+        (InventoryAlert.severity == 'medium', 2),
+        (InventoryAlert.severity == 'low', 1),
+        else_=0
+    )
+    
     alerts = query.order_by(
-        desc(InventoryAlert.severity_priority),
+        desc(severity_order),
         InventoryAlert.created_at.desc()
     ).limit(limit).all()
     
@@ -593,7 +604,7 @@ def get_inventory_alerts(
             "id": str(alert.id),
             "type": alert.alert_type,
             "severity": alert.severity,
-            "severity_priority": alert.severity_priority,
+            "severity_priority": 3 if alert.severity == 'high' else 2 if alert.severity == 'medium' else 1,
             "message": alert.message,
             "product_id": str(alert.product_id),
             "product_name": product.name if product else None,
@@ -615,7 +626,7 @@ def get_inventory_alerts(
 @router.post("/alerts/{alert_id}/resolve")
 @require_permission("inventory:update")
 def resolve_inventory_alert(
-    alert_id: uuid.UUID,
+    alert_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     current_tenant: Optional[Tenant] = Depends(get_current_tenant)
@@ -687,7 +698,7 @@ def get_sales_history(
     query = db.query(
         func.date(Sale.created_at).label("date"),
         func.count(Sale.id).label("count"),
-        func.sum(Sale.total_price).label("amount"),
+        func.sum(Sale.total_amount).label("amount"),
         func.count(func.distinct(Sale.id)).label("transaction_count")
     ).filter(
         Sale.tenant_id == tenant_id,
@@ -731,30 +742,22 @@ def get_sales_trends(
     today = date.today()
     
     if period == "day":
-        # Ventes par heure aujourd'hui
         start_date = datetime.combine(today, datetime.min.time())
         group_by = extract('hour', Sale.created_at)
-        label_format = "{hour}h"
     elif period == "week":
-        # Ventes par jour cette semaine
         start_date = today - timedelta(days=today.weekday())
         group_by = func.date(Sale.created_at)
-        label_format = "%Y-%m-%d"
     elif period == "month":
-        # Ventes par jour ce mois
         start_date = today.replace(day=1)
         group_by = func.date(Sale.created_at)
-        label_format = "%Y-%m-%d"
     else:  # year
-        # Ventes par mois cette année
         start_date = today.replace(month=1, day=1)
         group_by = extract('month', Sale.created_at)
-        label_format = "{month}"
     
     query = db.query(
         group_by.label('period'),
         func.count(Sale.id).label('count'),
-        func.sum(Sale.total_price).label('amount')
+        func.sum(Sale.total_amount).label('amount')
     ).filter(
         Sale.tenant_id == tenant_id,
         Sale.created_at >= start_date,
@@ -1002,8 +1005,8 @@ def get_sales_by_user(
         User.email.label("user_email"),
         User.role.label("user_role"),
         func.count(Sale.id).label("sales_count"),
-        func.sum(Sale.total_price).label("total_amount"),
-        func.avg(Sale.total_price).label("average_basket"),
+        func.sum(Sale.total_amount).label("total_amount"),
+        func.avg(Sale.total_amount).label("average_basket"),
         func.sum(SaleItem.quantity).label("items_sold")
     ).join(
         User, User.id == Sale.created_by
@@ -1083,7 +1086,7 @@ def get_daily_profit(
     sales_query = db.query(
         Sale.id,
         Sale.reference,
-        Sale.total_price,
+        Sale.total_amount,
         Sale.payment_method,
         Sale.created_at,
         Sale.created_by
@@ -1117,22 +1120,22 @@ def get_daily_profit(
         ).all()
         
         sale_cost = sum(item.quantity * (item.purchase_price or 0) for item in items)
-        sale_profit = sale.total_price - sale_cost
+        sale_profit = sale.total_amount - sale_cost
         
         total_cost += sale_cost
         
         sale_details.append({
             "sale_id": str(sale.id),
             "reference": sale.reference,
-            "total_amount": float(sale.total_price),
+            "total_amount": float(sale.total_amount),
             "cost_amount": float(sale_cost),
             "profit": float(sale_profit),
-            "profit_margin": (sale_profit / sale.total_price * 100) if sale.total_price > 0 else 0,
+            "profit_margin": (sale_profit / sale.total_amount * 100) if sale.total_amount > 0 else 0,
             "payment_method": sale.payment_method,
             "created_at": sale.created_at.isoformat() if sale.created_at else None
         })
     
-    total_sales = sum(s.total_price for s in sales_data)
+    total_sales = sum(s.total_amount for s in sales_data)
     total_profit = total_sales - total_cost
     
     # Coûts opérationnels du jour
@@ -1190,7 +1193,7 @@ def get_performance_indicators(
     # Ventes sur la période
     sales_query = db.query(
         func.count(Sale.id).label("count"),
-        func.sum(Sale.total_price).label("total"),
+        func.sum(Sale.total_amount).label("total"),
         func.sum(SaleItem.quantity).label("items")
     ).join(SaleItem).filter(
         Sale.tenant_id == tenant_id,
@@ -1233,7 +1236,7 @@ def get_performance_indicators(
     conversion_rate = (unique_customers / sales_count * 100) if sales_count > 0 else 0
     
     # Satisfaction client (basé sur les retours - à implémenter)
-    customer_satisfaction = 85.5  # Valeur par défaut
+    customer_satisfaction = 85.5
     
     # Productivité employé
     active_employees = db.query(func.count(User.id)).filter(
@@ -1279,7 +1282,7 @@ def refresh_dashboard_cache(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     current_tenant: Optional[Tenant] = Depends(get_current_tenant),
-    pharmacy_id: Optional[int] = Query(None, description="ID de la pharmacie pour les admins")
+    pharmacy_id: Optional[uuid.UUID] = Query(None, description="ID de la pharmacie (UUID) pour les admins")
 ):
     """
     Rafraîchit le cache du dashboard
@@ -1287,9 +1290,6 @@ def refresh_dashboard_cache(
     """
     tenant_id = current_tenant.id if current_tenant else current_user.tenant_id
     pharmacy_id_effective = _get_pharmacy_id(None, pharmacy_id, current_user)
-    
-    # Ici on pourrait implémenter une logique de cache (Redis, etc.)
-    # Pour l'instant, on retourne simplement un succès
     
     logger.info(f"Cache dashboard rafraîchi pour tenant {tenant_id}, pharmacy {pharmacy_id_effective}")
     
@@ -1383,13 +1383,9 @@ def register_user_session(
     """
     tenant_id = current_tenant.id if current_tenant else current_user.tenant_id
     
-    # Générer un ID de session unique
     session_id = f"{current_user.id}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{secrets.token_hex(4)}"
-    
-    # Expiration dans 30 jours
     expires_at = datetime.utcnow() + timedelta(days=30)
     
-    # Créer la session
     session = UserSession(
         id=uuid.uuid4(),
         user_id=current_user.id,
@@ -1482,7 +1478,6 @@ def get_session_sales(
     Récupère toutes les ventes réalisées lors d'une session spécifique
     Permission requise: dashboard:read
     """
-    # Vérifier que la session appartient à l'utilisateur
     session = db.query(UserSession).filter(
         UserSession.session_id == session_id,
         UserSession.user_id == current_user.id
@@ -1494,7 +1489,6 @@ def get_session_sales(
             detail="Session non trouvée"
         )
     
-    # Construire la requête des ventes
     query = db.query(Sale).filter(
         Sale.created_by == current_user.id,
         Sale.created_at >= session.created_at,
@@ -1521,7 +1515,7 @@ def get_session_sales(
             {
                 "id": str(s.id),
                 "reference": s.reference,
-                "total_amount": float(s.total_price),
+                "total_amount": float(s.total_amount),
                 "payment_method": s.payment_method,
                 "created_at": s.created_at.isoformat(),
                 "items_count": len(s.items) if hasattr(s, 'items') else 0
@@ -1530,8 +1524,8 @@ def get_session_sales(
         ],
         "summary": {
             "total_sales": len(sales),
-            "total_amount": sum(float(s.total_price) for s in sales),
-            "average_basket": sum(float(s.total_price) for s in sales) / len(sales) if sales else 0
+            "total_amount": sum(float(s.total_amount) for s in sales),
+            "average_basket": sum(float(s.total_amount) for s in sales) / len(sales) if sales else 0
         }
     }
 

@@ -20,3 +20,9 @@ class InventoryAlert(Base):
     is_resolved = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     resolved_at = Column(DateTime(timezone=True), nullable=True)
+    
+    @property
+    def severity_priority(self) -> int:
+        """Retourne la priorité numérique pour le tri"""
+        priorities = {"high": 3, "medium": 2, "low": 1}
+        return priorities.get(self.severity, 0)

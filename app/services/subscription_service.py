@@ -405,7 +405,7 @@ def renew_subscription(
     if not user:
         raise ValueError(f"Utilisateur {user_id} non trouvé")
 
-    if not user.subscription:
+    if not user.user_subscription:
         raise ValueError("L'utilisateur n'a pas d'abonnement à renouveler")
 
     subscription = user.subscription
@@ -460,7 +460,7 @@ def change_subscription_plan(
 
     plan_config = get_plan_config(new_plan)
     
-    if not user.subscription:
+    if not user.user_subscription:
         # Créer un nouvel abonnement
         return create_user_subscription(
             db=db,
@@ -469,7 +469,7 @@ def change_subscription_plan(
             plan_type=new_plan
         )
 
-    subscription = user.subscription
+    subscription = user.user_subscription
     now = datetime.utcnow()
     
     # Mettre à jour le plan
@@ -627,7 +627,7 @@ def check_tenant_limits(db: Session, tenant_id: str) -> Dict[str, Any]:
 
     if admin and admin.subscription:
         # Utiliser l'abonnement de l'admin (UserSubscription)
-        subscription = admin.subscription
+        subscription = admin.user_subscription
         plan_type = subscription.plan_type
         plan_config = get_plan_config(plan_type)
     else:
@@ -690,10 +690,10 @@ def can_user_access_feature(user: User, feature: str) -> bool:
     """
     Vérifie si un utilisateur peut accéder à une fonctionnalité.
     """
-    if not user.subscription:
+    if not user.user_subscription:
         return False
 
-    plan_config = get_plan_config(user.subscription.plan_type)
+    plan_config = get_plan_config(user.user_subscription.plan_type)
     features = plan_config.get("features", [])
     
     # Vérifier si la fonctionnalité est dans la liste
@@ -925,8 +925,8 @@ def get_user_subscription_usage(db: Session, user_id: str) -> Dict[str, Any]:
     ).count()
 
     # Récupérer les limites du plan de l'utilisateur
-    if user.subscription:
-        plan_config = get_plan_config(user.subscription.plan_type)
+    if user.user_subscription:
+        plan_config = get_plan_config(user.user_subscription.plan_type)
         max_products = plan_config.get("max_products", 100)
         max_users = plan_config.get("max_users_per_tenant", 1)
         max_pharmacies = plan_config.get("max_pharmacies", 1)

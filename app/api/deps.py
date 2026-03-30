@@ -426,7 +426,7 @@ async def require_active_subscription(
             detail=error_detail,
         )
 
-    current_user.subscription_info = sub_status
+    current_user.user_subscription_info = sub_status
     return current_user
 
 
