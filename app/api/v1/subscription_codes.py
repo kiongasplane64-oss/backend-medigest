@@ -561,7 +561,7 @@ async def get_subscription_code_details(
 @router.post("/admin/manual-activate/{target_id}")
 async def manual_activate(
     target_id: UUID,
-    activation_type: str = Query(..., regex="^(tenant|user)$", description="Type: tenant ou user"),
+    activation_type: str = Query(..., pattern="^(tenant|user)$", description="Type: tenant ou user"),
     plan_type: str = Query(..., description="Type de plan"),
     duration_days: int = Query(30, ge=1, le=3650, description="Durée en jours"),
     db: Session = Depends(get_db),

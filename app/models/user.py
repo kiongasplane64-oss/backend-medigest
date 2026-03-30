@@ -113,8 +113,6 @@ class User(Base):
         overlaps="payments_processed"
     )
 
-    
-    subscription = relationship("Subscription", back_populates="user", uselist=False)
     tenant_subscription = relationship(
         "Subscription", 
         back_populates="user",
