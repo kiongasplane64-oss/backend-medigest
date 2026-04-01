@@ -1,6 +1,6 @@
-# app/api/v1/users.py - Version complète corrigée
+# app/api/v1/users.py - Version complète corrigée avec gestion des associations user_pharmacy
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, Body
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional, Dict, Any
 import logging
 import traceback
@@ -10,6 +10,8 @@ from uuid import UUID
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from app.db.session import get_db
 from app.models.user import User
+from app.models.user_pharmacy import UserPharmacy
+from app.models.pharmacy import Pharmacy
 from app.schemas.user import UserCreate, UserUpdate, UserResponse, UserListSchema
 from app.core.security import hash_password, verify_password
 from app.api.v1.auth import get_current_user
@@ -60,11 +62,13 @@ class UserCreateRequest(BaseModel):
     role: str = Field(..., pattern="^(admin|pharmacien|vendeur|caissier|gestionnaire|comptable|preparateur|stockiste)$")
     telephone: Optional[str] = Field(None, max_length=20)
     adresse: Optional[str] = None
+    pharmacy_id: Optional[str] = None  # ID de la pharmacie à associer
+    branch_id: Optional[str] = None     # ID de la branche à associer
     is_active: Optional[bool] = True
     permissions: Optional[Dict[str, bool]] = None
     
     class Config:
-        populate_by_name = True  # Permet d'utiliser 'full_name' dans la requête
+        populate_by_name = True
         from_attributes = True
     
     @field_validator('full_name')
@@ -80,7 +84,6 @@ class UserCreateRequest(BaseModel):
     def validate_telephone(cls, v: Optional[str]) -> Optional[str]:
         """Valide le format du téléphone"""
         if v:
-            # Supprime les espaces et vérifie les caractères valides
             cleaned = v.replace(' ', '').replace('-', '')
             if not cleaned.replace('+', '').isdigit():
                 raise ValueError('Le numéro de téléphone doit contenir uniquement des chiffres et éventuellement +')
@@ -96,6 +99,8 @@ class UserUpdateRequest(BaseModel):
     telephone: Optional[str] = None
     adresse: Optional[str] = None
     actif: Optional[bool] = None
+    active_pharmacy_id: Optional[str] = None  # Pour changer la pharmacie active
+    active_branch_id: Optional[str] = None     # Pour changer la branche active
     
     class Config:
         from_attributes = True
@@ -261,7 +266,9 @@ def get_all_online_users(
             "role": user.role,
             "last_login": user.last_login.isoformat() if user.last_login else None,
             "login_duration": f"{duration_minutes} min",
-            "status": status
+            "status": status,
+            "active_pharmacy_id": str(user.active_pharmacy_id) if user.active_pharmacy_id else None,
+            "active_branch_id": str(user.active_branch_id) if user.active_branch_id else None
         })
     
     return {
@@ -282,7 +289,7 @@ def get_my_profile(
     """
     tenant = db.query(Tenant).filter(Tenant.id == current_user.tenant_id).first()
     
-    profile = current_user.to_dict(include_tenant=False)
+    profile = current_user.to_dict(include_tenant=False, include_pharmacies=True)
     if tenant:
         profile["pharmacie"] = {
             "id": str(tenant.id),
@@ -363,7 +370,7 @@ def change_my_password(
 # ENDPOINTS GÉNÉRAUX
 # =========================
 
-@router.get("/", status_code=status.HTTP_200_OK, response_model=List[UserListSchema])
+@router.get("/", status_code=status.HTTP_200_OK)
 def list_users(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -408,7 +415,7 @@ def list_users(
     # Format de réponse
     result = []
     for user in users:
-        user_dict = user.to_dict(include_tenant=False)
+        user_dict = user.to_dict(include_tenant=False, include_pharmacies=True)
         # Ajouter des informations supplémentaires
         user_dict["can_edit"] = (
             current_user.id != user.id and
@@ -429,6 +436,7 @@ def create_user(
     """
     Crée un utilisateur pour le tenant de l'admin connecté.
     Accepte 'full_name' du frontend et le convertit en 'nom_complet'.
+    Optionnellement associe l'utilisateur à une pharmacie.
     """
     # Vérifier les permissions
     if current_user.role not in ["admin", "super_admin"]:
@@ -491,12 +499,25 @@ def create_user(
             detail=f"Rôle non autorisé. Rôles autorisés: {', '.join(allowed_roles)}"
         )
 
+    # Si une pharmacie est fournie, vérifier qu'elle existe et appartient au tenant
+    pharmacy = None
+    if user_data.pharmacy_id:
+        pharmacy = db.query(Pharmacy).filter(
+            Pharmacy.id == user_data.pharmacy_id,
+            Pharmacy.tenant_id == current_user.tenant_id
+        ).first()
+        
+        if not pharmacy:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Pharmacie non trouvée"
+            )
+
     try:
-        # Création de l'utilisateur - Conversion full_name -> nom_complet
-        # Note: Les champs pharmacy_id et branch_id ne sont pas dans le modèle User
+        # Création de l'utilisateur
         new_user = User(
             tenant_id=current_user.tenant_id,
-            nom_complet=user_data.full_name,  # Conversion ici
+            nom_complet=user_data.full_name,
             email=user_data.email.lower().strip(),
             password_hash=hash_password(user_data.password),
             role=user_data.role,
@@ -507,6 +528,25 @@ def create_user(
         )
         
         db.add(new_user)
+        db.flush()  # Pour obtenir l'ID du nouvel utilisateur
+        
+        # Associer l'utilisateur à la pharmacie si fournie
+        if pharmacy:
+            user_pharmacy = UserPharmacy(
+                user_id=new_user.id,
+                pharmacy_id=pharmacy.id,
+                is_primary=True,  # Par défaut, c'est la pharmacie principale
+                can_manage=(user_data.role in ["admin", "gestionnaire"])
+            )
+            db.add(user_pharmacy)
+            
+            # Définir la pharmacie active
+            new_user.active_pharmacy_id = pharmacy.id
+            
+            # Si une branche est fournie, la définir comme active
+            if user_data.branch_id:
+                new_user.active_branch_id = user_data.branch_id
+        
         db.commit()
         db.refresh(new_user)
 
@@ -535,6 +575,8 @@ def create_user(
                 "telephone": new_user.telephone,
                 "actif": new_user.actif,
                 "date_creation": new_user.date_creation.isoformat() if new_user.date_creation else None,
+                "active_pharmacy_id": str(new_user.active_pharmacy_id) if new_user.active_pharmacy_id else None,
+                "active_branch_id": str(new_user.active_branch_id) if new_user.active_branch_id else None,
                 "pharmacie": pharmacie_nom
             },
             "instructions": f"L'utilisateur peut se connecter à votre pharmacie '{pharmacie_nom}' avec son email et mot de passe"
@@ -553,7 +595,7 @@ def create_user(
 # ENDPOINTS PAR USER_ID
 # =========================
 
-@router.get("/{user_id}", status_code=status.HTTP_200_OK, response_model=UserListSchema)
+@router.get("/{user_id}", status_code=status.HTTP_200_OK)
 def get_user(
     user_id: str,
     db: Session = Depends(get_db),
@@ -592,7 +634,7 @@ def get_user(
             detail="Utilisateur introuvable"
         )
 
-    return user.to_dict(include_tenant=False)
+    return user.to_dict(include_tenant=False, include_pharmacies=True)
 
 
 @router.put("/{user_id}", status_code=status.HTTP_200_OK)
@@ -665,6 +707,15 @@ def update_user(
                 detail=f"Rôle non autorisé. Rôles autorisés: {', '.join(allowed_roles)}"
             )
 
+    # Vérifier la pharmacie active si elle est modifiée
+    if user_data.active_pharmacy_id:
+        # Vérifier que l'utilisateur a accès à cette pharmacie
+        if not user.has_access_to_pharmacy(user_data.active_pharmacy_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="L'utilisateur n'a pas accès à cette pharmacie"
+            )
+
     try:
         # Mise à jour des champs
         if user_data.nom_complet is not None:
@@ -689,6 +740,12 @@ def update_user(
             
         if user_data.password is not None:
             user.password_hash = hash_password(user_data.password)
+            
+        if user_data.active_pharmacy_id is not None:
+            user.active_pharmacy_id = user_data.active_pharmacy_id
+            
+        if user_data.active_branch_id is not None:
+            user.active_branch_id = user_data.active_branch_id
 
         db.commit()
         db.refresh(user)
@@ -706,7 +763,7 @@ def update_user(
 
         return {
             "message": "Utilisateur mis à jour avec succès",
-            "user": user.to_dict(include_tenant=False)
+            "user": user.to_dict(include_tenant=False, include_pharmacies=True)
         }
 
     except Exception as e:
@@ -781,7 +838,7 @@ def toggle_user(
 
         return {
             "message": f"Utilisateur {status_text} avec succès",
-            "user": user.to_dict(include_tenant=False)
+            "user": user.to_dict(include_tenant=False, include_pharmacies=True)
         }
 
     except Exception as e:
@@ -886,7 +943,7 @@ def get_all_users(
         )
     
     users = db.query(User).order_by(User.date_creation.desc()).offset((page-1)*limit).limit(limit).all()
-    return [user.to_dict(include_tenant=True) for user in users]
+    return [user.to_dict(include_tenant=True, include_pharmacies=True) for user in users]
 
 
 # =========================

@@ -372,6 +372,7 @@ class PharmacyConfigUpdate(BaseModel):
     primaryCurrency: Optional[str] = None
     taxRate: Optional[float] = Field(None, ge=0, le=100)
     lowStockThreshold: Optional[int] = Field(None, ge=0)
+    currencyMode: Optional[str] = Field(None, description="Mode de devise: cdf_only, usd_only, both")
     expiryWarningDays: Optional[int] = Field(None, ge=0)
     allowNegativeStock: Optional[bool] = None
     workingHours: Optional[WorkingHoursConfig] = None

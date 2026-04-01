@@ -3161,3 +3161,112 @@ async def download_import_template(
         raise HTTPException(status_code=500, detail=f"Erreur génération template: {exc}")
 
 
+@router.delete("/{product_id}", status_code=status.HTTP_200_OK)
+async def delete_product(
+    product_id: UUID,
+    request: Request,
+    deletion_reason: Optional[str] = Query(None, description="Raison de la suppression"),
+    permanent: bool = Query(False, description="Suppression définitive (skip trash)"),
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity)
+):
+    """
+    Supprime un produit (mise en corbeille par défaut)
+    """
+    from app.services.history_service import HistoryService
+    from app.api.v1.endpoints.trash_bin import move_to_trash
+    
+    if current_user.role not in ["admin", "super_admin", "superadmin", "gestionnaire"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Accès refusé. Seuls les administrateurs peuvent supprimer des produits."
+        )
+    
+    tenant_id = current_tenant.id if current_tenant else None
+    
+    product = db.query(Product).filter(
+        Product.id == product_id,
+        Product.tenant_id == tenant_id
+    ).first()
+    
+    if not product:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Produit non trouvé"
+        )
+    
+    history_service = HistoryService(db)
+    
+    if permanent:
+        # Suppression définitive
+        product_data = product.to_dict(include_details=True)
+        db.delete(product)
+        db.commit()
+        
+        history_service.log_delete(
+            user=current_user,
+            module="product",
+            entity_id=product.id,
+            entity_reference=product.code,
+            entity_name=product.name,
+            data=product_data,
+            deletion_reason=deletion_reason,
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            metadata={"permanent": True}
+        )
+        
+        return {
+            "message": "Produit supprimé définitivement",
+            "product_id": str(product_id),
+            "product_name": product.name
+        }
+    else:
+        # Mise en corbeille
+        product_data = product.to_dict(include_details=True)
+        
+        # Sauvegarder dans la corbeille
+        trash_item = move_to_trash(
+            db=db,
+            tenant_id=tenant_id,
+            pharmacy_id=current_pharmacy.id if current_pharmacy else product.pharmacy_id,
+            item_type="product",
+            original_id=product.id,
+            original_reference=product.code,
+            original_name=product.name,
+            data=product_data,
+            deleted_by_id=current_user.id,
+            deleted_by_name=current_user.nom_complet,
+            deleted_by_email=current_user.email,
+            deletion_reason=deletion_reason,
+            auto_delete_days=30  # Suppression automatique après 30 jours
+        )
+        
+        # Supprimer le produit de la base
+        db.delete(product)
+        db.commit()
+        
+        # Enregistrer dans l'historique
+        history_service.log_delete(
+            user=current_user,
+            module="product",
+            entity_id=product.id,
+            entity_reference=product.code,
+            entity_name=product.name,
+            data=product_data,
+            deletion_reason=deletion_reason,
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            metadata={"trash_id": str(trash_item.id)}
+        )
+        
+        return {
+            "message": "Produit déplacé dans la corbeille",
+            "product_id": str(product_id),
+            "product_name": product.name,
+            "trash_id": str(trash_item.id),
+            "auto_delete_at": trash_item.auto_delete_at.isoformat() if trash_item.auto_delete_at else None
+        }
+

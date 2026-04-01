@@ -745,6 +745,9 @@ def update_pharmacy_config(
             detail="Pharmacie non trouvée"
         )
     
+    if hasattr(config_in, 'currencyMode') and config_in.currencyMode:
+        current_config["currencyMode"] = config_in.currencyMode
+        
     current_config = pharmacy.config or {}
     update_data = config_in.dict(exclude_unset=True, exclude_none=True)
     
