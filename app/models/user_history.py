@@ -66,7 +66,7 @@ class UserHistory(Base):
     error_message = Column(Text, nullable=True, comment="Message d'erreur si l'action a échoué")
     
     # Métadonnées supplémentaires
-    metadata = Column(JSON, nullable=True, default=dict, comment="Métadonnées additionnelles")
+    user_metadata = Column(JSON, nullable=True, default=dict, comment="Métadonnées additionnelles")
     
     # Timestamps
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
@@ -109,7 +109,7 @@ class UserHistory(Base):
             "session_id": self.session_id,
             "status": self.status,
             "error_message": self.error_message,
-            "metadata": self.metadata or {},
+            "user_metadata": self.metadata or {},
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 

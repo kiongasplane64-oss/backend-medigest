@@ -49,6 +49,8 @@ from app.models.category import Category
 from app.models.user_session import UserSession
 from app.models.order import Order, OrderStatus, PaymentStatus
 from app.models.capital import Capital, CapitalAccount, CapitalTransaction, Turnover
+from app.models.user_history import UserHistory
+from app.models.trash_bin import TrashBin
 
 __all__ = [
     # Core
@@ -106,5 +108,7 @@ __all__ = [
     "PaymentStatus",
     "CapitalAccount", 
     "CapitalTransaction",
-    "turnover"
+    "Turnover",
+    "UserHistory",
+    "TrashBin"
 ]

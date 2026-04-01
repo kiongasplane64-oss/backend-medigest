@@ -58,7 +58,7 @@ class TrashBin(Base):
     is_restored = Column(Boolean, nullable=False, default=False, index=True)
     
     # Métadonnées
-    metadata = Column(JSON, nullable=True, default=dict)
+    trash_metadata = Column(JSON, nullable=True, default=dict)
     
     # Timestamps
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
@@ -103,7 +103,7 @@ class TrashBin(Base):
             "restored_by_name": self.restored_by_name,
             "auto_delete_at": self.auto_delete_at.isoformat() if self.auto_delete_at else None,
             "is_restored": self.is_restored,
-            "metadata": self.metadata or {},
+            "trash_metadata": self.metadata or {},
         }
         
         if include_data:
