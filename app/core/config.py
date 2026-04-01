@@ -76,8 +76,10 @@ class Settings(BaseSettings):
     DEFAULT_TIMEZONE: str = "Africa/Kinshasa"
     
     # =====================================
-    # FILES & UPLOADS
+    # FILES & UPLOADS 
     # =====================================
+    MEDIA_ROOT: str = os.getenv("MEDIA_ROOT", "/app/media")
+    MEDIA_URL: str = os.getenv("MEDIA_URL", "/media/")
     MAX_UPLOAD_SIZE: int = 10 * 1024 * 1024
     ALLOWED_EXTENSIONS: List[str] = [".jpg", ".jpeg", ".png", ".pdf", ".doc", ".docx"]
     
@@ -112,6 +114,11 @@ class Settings(BaseSettings):
     # =====================================
     LOG_LEVEL: str = "INFO"
     LOG_FORMAT: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+    # =====================================
+    # RECEIPT CONFIGURATION
+    # =====================================
+    GENERATE_RECEIPTS: bool = os.getenv("GENERATE_RECEIPTS", "true").lower() == "true"
     
     model_config = {
         "env_file": ".env",

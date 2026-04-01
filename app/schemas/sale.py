@@ -33,9 +33,7 @@ class PaymentMethod(str, Enum):
 class SaleItemBase(BaseModel):
     product_id: UUID
     quantity: int = Field(..., gt=0, description="Quantité du produit")
-    unit_price: Decimal = Field(..., gt=0, max_digits=12, decimal_places=2, description="Prix unitaire")
     discount_percent: Decimal = Field(Decimal('0.00'), ge=0, le=100, max_digits=5, decimal_places=2, description="Pourcentage de remise")
-    tva_rate: Decimal = Field(Decimal('0.00'), ge=0, le=100, max_digits=5, decimal_places=2, description="Taux de TVA")
     batch_number: Optional[str] = Field(None, max_length=100, description="Numéro de lot")
     expiry_date: Optional[date] = Field(None, description="Date de péremption")
     
@@ -47,20 +45,59 @@ class SaleItemBase(BaseModel):
 
 
 class SaleItemCreate(SaleItemBase):
+    """Schéma pour la création d'un item de vente.
+    
+    IMPORTANT:
+    - Le prix de vente (unit_price) est automatiquement pris depuis le stock
+    - Le taux de TVA (tva_rate) est automatiquement pris depuis le stock
+    - Ces champs ne doivent pas être fournis dans la requête
+    """
+    # Ces champs sont dépréciés et ne doivent pas être utilisés
+    unit_price: Optional[Decimal] = Field(
+        None, 
+        description="DÉPRÉCIÉ - Ignoré, utilise le prix du stock (product.selling_price)"
+    )
+    tva_rate: Optional[Decimal] = Field(
+        None, 
+        description="DÉPRÉCIÉ - Ignoré, utilise le taux du stock (product.tva_rate)"
+    )
+    
+    @model_validator(mode='after')
+    def validate_no_price_override(self):
+        """Empêche la modification du prix de vente et de la TVA"""
+        if self.unit_price is not None:
+            raise ValueError(
+                "Le prix de vente ne peut pas être modifié. "
+                "Utilisez le prix défini dans le stock (product.selling_price)."
+            )
+        if self.tva_rate is not None:
+            raise ValueError(
+                "Le taux de TVA ne peut pas être modifié. "
+                "Utilisez le taux défini dans le stock (product.tva_rate)."
+            )
+        return self
+    
     model_config = ConfigDict(from_attributes=True)
 
 
-class SaleItemResponse(SaleItemBase):
+class SaleItemResponse(BaseModel):
     id: UUID
     sale_id: UUID
     tenant_id: UUID
     pharmacy_id: UUID
+    product_id: UUID
     product_code: str
     product_name: str
-    subtotal: Decimal
+    quantity: int
+    unit_price: Decimal
+    discount_percent: Decimal
     discount_amount: Decimal
+    tva_rate: Decimal
     tva_amount: Decimal
+    subtotal: Decimal
     total: Decimal
+    batch_number: Optional[str]
+    expiry_date: Optional[date]
     created_at: datetime
     
     model_config = ConfigDict(from_attributes=True)
@@ -85,6 +122,13 @@ class SaleCreate(BaseModel):
     notes: Optional[str] = None
     invoice_number: Optional[str] = Field(None, max_length=50)
     items: List[SaleItemCreate]
+    
+    @computed_field
+    @property
+    def total_amount(self) -> Optional[Decimal]:
+        """Montant total calculé (optionnel, sera recalculé par le backend)"""
+        # Ce champ est optionnel, le backend recalcule toujours le total
+        return None
     
     @model_validator(mode='after')
     def validate_credit_sale(self):
@@ -359,7 +403,6 @@ class PeriodStatsResponse(BaseModel):
 class QuickSaleItem(BaseModel):
     product_id: UUID
     quantity: int = Field(..., gt=0)
-    unit_price: Optional[Decimal] = None
     
     model_config = ConfigDict(from_attributes=True)
 

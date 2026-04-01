@@ -26,6 +26,8 @@ from app.services.subscription_service import (
     create_trial_subscription,
     get_subscription_summary_for_superadmin,
     upgrade_subscription,
+    check_tenant_subscription,
+    get_tenant_subscription,
 )
 
 logger = logging.getLogger(__name__)
@@ -1190,7 +1192,9 @@ async def extend_trial_period(
             },
         )
 
-    if not getattr(user, "tenant_subscription", None) or user.tenant_subscription.plan_type != "trial":
+    # ✅ CORRECTION: Utiliser user_subscription au lieu de tenant_subscription
+    subscription = user.user_subscription
+    if not subscription or subscription.plan_type != "trial":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
@@ -1200,18 +1204,26 @@ async def extend_trial_period(
         )
 
     try:
-        old_end = user.tenant_subscription.end_date
+        old_end = subscription.end_date
         # Calculer la nouvelle date de fin
         new_end = (old_end + timedelta(days=extra_days)) if old_end else (datetime.utcnow() + timedelta(days=extra_days))
         
-        user.tenant_subscription.end_date = new_end
-        if hasattr(user.tenant_subscription, "trial_end_date"):
-            user.tenant_subscription.trial_end_date = new_end
-        config = user.tenant_subscription.config or {}
-        # ... (suite du traitement de config si nécessaire)
-        user.tenant_subscription.config = config
+        subscription.end_date = new_end
+        if hasattr(subscription, "trial_end_date"):
+            subscription.trial_end_date = new_end
+        
+        config = subscription.config or {}
+        config["trial_extended"] = {
+            "by": str(current_user.id),
+            "extra_days": extra_days,
+            "old_end_date": old_end.isoformat() if old_end else None,
+            "new_end_date": new_end.isoformat(),
+            "extended_at": datetime.utcnow().isoformat()
+        }
+        subscription.config = config
+        
         db.commit()
-        db.refresh(user.tenant_subscription)
+        db.refresh(subscription)
 
         return {
             "success": True,
@@ -1220,7 +1232,7 @@ async def extend_trial_period(
             "user_email": user.email,
             "old_end_date": old_end.isoformat() if old_end else None,
             "new_end_date": new_end.isoformat(),
-            "days_remaining": user.tenant_subscription.days_remaining(),
+            "days_remaining": subscription.days_remaining(),
             "extended_by": current_user.email,
             "extended_at": utc_now_iso(),
         }
@@ -1237,7 +1249,6 @@ async def extend_trial_period(
                 "message": "Erreur lors de la prolongation de l'essai.",
             },
         )
-
 
 @router.get("/admin/tenant/{tenant_id}", response_model=Dict[str, Any])
 async def get_tenant_subscriptions(
@@ -1273,27 +1284,49 @@ async def get_tenant_subscriptions(
 
         subscriptions: List[Dict[str, Any]] = []
         for user in users:
-            sub = getattr(user, "tenant_subscription", None)
-            if not sub:
-                continue
-
-            subscriptions.append({
-                "user_id": str(user.id),
-                "user_email": user.email,
-                "user_role": user.role,
-                "subscription": {
-                    "id": str(sub.id),
-                    "plan": sub.plan_type,
-                    "plan_name": sub.plan_name,
-                    "status": sub.status,
-                    "is_active": sub.is_active(),
-                    "start_date": sub.start_date.isoformat() if sub.start_date else None,
-                    "end_date": sub.end_date.isoformat() if sub.end_date else None,
-                    "days_remaining": sub.days_remaining(),
-                    "price": float(sub.price or 0),
-                    "currency": getattr(sub, "currency", "USD"),
-                },
-            })
+            # ✅ CORRECTION: Récupérer les deux types d'abonnements
+            user_sub = user.user_subscription
+            tenant_sub = get_tenant_subscription(db, tenant_uuid)  # À importer
+            
+            if user_sub:
+                subscriptions.append({
+                    "user_id": str(user.id),
+                    "user_email": user.email,
+                    "user_role": user.role,
+                    "type": "user_subscription",
+                    "subscription": {
+                        "id": str(user_sub.id),
+                        "plan": user_sub.plan_type,
+                        "plan_name": user_sub.plan_name,
+                        "status": user_sub.status,
+                        "is_active": user_sub.is_active(),
+                        "start_date": user_sub.start_date.isoformat() if user_sub.start_date else None,
+                        "end_date": user_sub.end_date.isoformat() if user_sub.end_date else None,
+                        "days_remaining": user_sub.days_remaining(),
+                        "price": float(user_sub.price or 0),
+                        "currency": user_sub.currency or "EUR",
+                    },
+                })
+            elif tenant_sub and user.role == "admin":
+                # ✅ CORRECTION: Utiliser les bons attributs pour TenantSubscription
+                subscriptions.append({
+                    "user_id": str(user.id),
+                    "user_email": user.email,
+                    "user_role": user.role,
+                    "type": "tenant_subscription",
+                    "subscription": {
+                        "id": str(tenant_sub.id),
+                        "plan": tenant_sub.plan.value if hasattr(tenant_sub.plan, 'value') else str(tenant_sub.plan),
+                        "plan_name": tenant_sub.plan_name,
+                        "status": tenant_sub.status.value if hasattr(tenant_sub.status, 'value') else str(tenant_sub.status),
+                        "is_active": tenant_sub.is_active(),
+                        "start_date": tenant_sub.start_date.isoformat() if tenant_sub.start_date else None,
+                        "end_date": tenant_sub.end_date.isoformat() if tenant_sub.end_date else None,
+                        "days_remaining": tenant_sub.days_remaining(),
+                        "price": float(tenant_sub.current_price or 0),
+                        "currency": "EUR",
+                    },
+                })
 
         return {
             "tenant_id": str(tenant_uuid),
@@ -1315,7 +1348,6 @@ async def get_tenant_subscriptions(
                 "message": "Erreur lors de la récupération des données.",
             },
         )
-
 
 # =============================================================================
 # ENDPOINTS TECHNIQUES

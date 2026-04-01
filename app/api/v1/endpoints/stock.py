@@ -4,7 +4,7 @@ API de gestion du stock avec intégration complète des ventes
 Version unifiée - Remplace products.py
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks, Request, Form
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, desc, and_, or_, distinct, case
 from typing import List, Optional, Dict, Any, Union
@@ -995,6 +995,158 @@ async def create_product(
         logger.exception("Erreur création produit")
         raise HTTPException(status_code=400, detail=f"Erreur création produit: {exc}")
 
+@router.get("/export", summary="Exporter le stock")
+async def export_stock(
+    format: str = Query("excel", description="Format d'export: excel, csv, json"),
+    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
+    category_id: Optional[UUID] = Query(None, description="Filtrer par catégorie"),
+    category: Optional[str] = Query(None, description="Filtrer par nom de catégorie"),
+    search: Optional[str] = Query(None, description="Recherche textuelle"),
+    stock_status: Optional[str] = Query(None, description="Filtrer par statut de stock"),
+    expiry_status: Optional[str] = Query(None, description="Filtrer par statut d'expiration"),
+    include_sales_stats: bool = Query(False, description="Inclure les statistiques de ventes"),
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Exporte le stock dans le format spécifié (Excel, CSV, JSON).
+    """
+    try:
+        _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant", "pharmacien", "vendeur"])
+        
+        pharmacy = _ensure_pharmacy_in_tenant(current_tenant, current_pharmacy)
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        # Construire la requête
+        query = db.query(Product).filter(
+            Product.tenant_id == tenant_id,
+            Product.pharmacy_id == pharmacy.id,
+            Product.is_active == True
+        )
+        
+        if pharmacy_id:
+            query = query.filter(Product.pharmacy_id == pharmacy_id)
+        
+        if category_id:
+            query = query.filter(Product.category_id == category_id)
+        elif category:
+            query = query.filter(Product.category == category)
+        
+        if search:
+            query = query.filter(
+                or_(
+                    Product.name.ilike(f"%{search}%"),
+                    Product.code.ilike(f"%{search}%"),
+                    Product.barcode.ilike(f"%{search}%")
+                )
+            )
+        
+        if stock_status:
+            query = query.filter(Product.stock_status == stock_status)
+        
+        if expiry_status:
+            query = query.filter(Product.expiry_status == expiry_status)
+        
+        products = query.order_by(Product.name).all()
+        
+        # Préparer les données
+        export_data = []  # ← Variable renommée de "data" à "export_data"
+        for product in products:
+            product_data = {
+                "ID": str(product.id),
+                "Nom": product.name,
+                "Code": product.code or "",
+                "Code-barres": product.barcode or "",
+                "Quantité": product.quantity or 0,
+                "Prix d'achat": float(product.purchase_price or 0),
+                "Prix de vente": float(product.selling_price or 0),
+                "Valeur d'achat": float(product.purchase_value or 0),
+                "Valeur de vente": float(product.selling_value or 0),
+                "Marge totale": float(product.total_margin or 0),
+                "Date d'expiration": product.expiry_date.isoformat() if product.expiry_date else "",
+                "Catégorie": product.category or "",
+                "Emplacement": product.location or "",
+                "Fournisseur": product.supplier or "",
+                "Numéro de lot": product.batch_number or "",
+                "Statut stock": product.stock_status or "normal",
+                "Statut expiration": product.expiry_status or "normal",
+                "Seuil d'alerte": product.alert_threshold or 0,
+                "Stock minimum": product.minimum_stock or 0,
+                "Unité": product.unit or "unité",
+                "TVA": f"{product.tva_rate}%" if product.has_tva else "0%",
+                "Type": product.product_type or "medicament",
+                "Nom commercial": product.commercial_name or "",
+                "Forme galénique": product.galenic_form or "",
+                "Dosage": product.dosage or "",
+                "Principe actif": product.active_ingredient or "",
+                "Créé le": product.created_at.isoformat() if product.created_at else "",
+                "Dernière modification": product.updated_at.isoformat() if product.updated_at else ""
+            }
+            
+            if include_sales_stats:
+                thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+                sales_stats = db.query(
+                    func.coalesce(func.sum(SaleItem.quantity), 0).label("total_sold"),
+                    func.coalesce(func.sum(SaleItem.total), 0).label("total_revenue"),
+                    func.count(distinct(Sale.id)).label("sale_count")
+                ).join(Sale).filter(
+                    SaleItem.product_id == product.id,
+                    SaleItem.tenant_id == tenant_id,
+                    Sale.status == "completed",
+                    Sale.created_at >= thirty_days_ago
+                ).first()
+                
+                product_data["Ventes 30j (quantité)"] = int(sales_stats.total_sold or 0)
+                product_data["Ventes 30j (CA)"] = float(sales_stats.total_revenue or 0)
+                product_data["Ventes 30j (nombre)"] = int(sales_stats.sale_count or 0)
+                
+                if product.quantity and product.quantity > 0:
+                    turnover_rate = (sales_stats.total_sold or 0) / product.quantity
+                    product_data["Taux de rotation"] = round(turnover_rate, 2)
+                else:
+                    product_data["Taux de rotation"] = 0
+            
+            export_data.append(product_data)
+        
+        # Exporter selon le format
+        import pandas as pd
+        import io
+        import json
+        
+        df = pd.DataFrame(export_data)  # ← Utiliser export_data
+        
+        if format.lower() == "csv":
+            output = io.StringIO()
+            df.to_csv(output, index=False, encoding='utf-8-sig')
+            content = output.getvalue().encode('utf-8')
+            media_type = "text/csv"
+            filename = f"stock_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        elif format.lower() == "json":
+            content = json.dumps(export_data, indent=2, default=str).encode('utf-8')  # ← Utiliser export_data
+            media_type = "application/json"
+            filename = f"stock_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        else:  # excel par défaut
+            output = io.BytesIO()
+            df.to_excel(output, index=False, engine="openpyxl")
+            content = output.getvalue()
+            media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            filename = f"stock_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        
+        from fastapi.responses import Response
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Erreur export stock")
+        raise HTTPException(status_code=500, detail=f"Erreur export stock: {exc}")
+    
 
 @router.get("/{product_id}", response_model=ProductInDB, summary="Détails d'un produit")
 async def get_product(
@@ -2362,54 +2514,6 @@ async def complete_inventory_count(
 
 
 # =======================
-# ROUTES POUR L'EXPORT
-# =======================
-
-@router.get("/export", summary="Exporter le stock")
-async def export_stock(
-    format: ExportFormat = Query(ExportFormat.CSV, description="Format d'export"),
-    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
-    category_id: Optional[UUID] = Query(None, description="Filtrer par catégorie"),
-    db: Session = Depends(get_db),
-    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
-    current_user: User = Depends(get_current_active_user)
-):
-    """Exporte le stock dans le format spécifié."""
-    try:
-        _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant", "pharmacien"])
-        
-        tenant_id = current_tenant.id if current_tenant else None
-        
-        query = db.query(Product).filter(
-            Product.tenant_id == tenant_id,
-            Product.is_active == True
-        )
-        
-        if pharmacy_id:
-            query = query.filter(Product.pharmacy_id == pharmacy_id)
-        
-        if category_id:
-            query = query.filter(Product.category_id == category_id)
-        
-        products = query.all()
-        
-        export_service = ExportService(current_tenant)
-        export_data = export_service.export_stock(
-            [p.to_dict() for p in products],
-            format.value,
-            current_user.id
-        )
-        
-        return export_data
-        
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("Erreur export stock")
-        raise HTTPException(status_code=500, detail=f"Erreur export stock: {exc}")
-
-
-# =======================
 # ROUTES POUR LES STATISTIQUES AVANCÉES
 # =======================
 
@@ -2654,11 +2758,13 @@ async def preview_import_products(
         raise HTTPException(status_code=500, detail=f"Erreur preview import: {exc}")
 
 
+
+
 @router.post("/import", summary="Importer des produits")
 async def import_products(
     file: UploadFile = File(...),
-    mode: str = Query("add", description="Mode d'import: add, update, replace"),
-    duplicate_actions: Optional[str] = Query(None, description="Actions pour les doublons (JSON)"),
+    mode: str = Form("add"),  # ← Utiliser Form au lieu de Query
+    duplicate_actions: Optional[str] = Form(None),
     db: Session = Depends(get_db),
     current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
@@ -2842,7 +2948,7 @@ async def import_products(
                         if location:
                             existing.location = location
                         if supplier:
-                            existing.supplier = supplier
+                            existing.main_supplier = supplier
                         if batch_number:
                             existing.batch_number = batch_number
                         
@@ -2918,7 +3024,7 @@ async def import_products(
                         expiry_date=expiry_date_obj,
                         category=category,
                         location=location,
-                        supplier=supplier,
+                        main_supplier=supplier,
                         batch_number=batch_number,
                         is_active=True
                     )
@@ -3055,156 +3161,3 @@ async def download_import_template(
         raise HTTPException(status_code=500, detail=f"Erreur génération template: {exc}")
 
 
-@router.get("/export", summary="Exporter le stock")
-async def export_stock(
-    format: str = Query("excel", description="Format d'export: excel, csv, json"),
-    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
-    category_id: Optional[UUID] = Query(None, description="Filtrer par catégorie"),
-    category: Optional[str] = Query(None, description="Filtrer par nom de catégorie (legacy)"),
-    search: Optional[str] = Query(None, description="Recherche textuelle"),
-    stock_status: Optional[str] = Query(None, description="Filtrer par statut de stock"),
-    expiry_status: Optional[str] = Query(None, description="Filtrer par statut d'expiration"),
-    include_sales_stats: bool = Query(False, description="Inclure les statistiques de ventes"),
-    db: Session = Depends(get_db),
-    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
-    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
-    current_user: User = Depends(get_current_active_user)
-):
-    """
-    Exporte le stock dans le format spécifié (Excel, CSV, JSON).
-    """
-    try:
-        _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant", "pharmacien", "vendeur"])
-        
-        pharmacy = _ensure_pharmacy_in_tenant(current_tenant, current_pharmacy)
-        tenant_id = current_tenant.id if current_tenant else None
-        
-        # Construire la requête
-        query = db.query(Product).filter(
-            Product.tenant_id == tenant_id,
-            Product.pharmacy_id == pharmacy.id,
-            Product.is_active == True
-        )
-        
-        if pharmacy_id:
-            query = query.filter(Product.pharmacy_id == pharmacy_id)
-        
-        if category_id:
-            query = query.filter(Product.category_id == category_id)
-        elif category:
-            query = query.filter(Product.category == category)
-        
-        if search:
-            query = query.filter(
-                or_(
-                    Product.name.ilike(f"%{search}%"),
-                    Product.code.ilike(f"%{search}%"),
-                    Product.barcode.ilike(f"%{search}%")
-                )
-            )
-        
-        if stock_status:
-            query = query.filter(Product.stock_status == stock_status)
-        
-        if expiry_status:
-            query = query.filter(Product.expiry_status == expiry_status)
-        
-        products = query.order_by(Product.name).all()
-        
-        # Préparer les données
-        data = []
-        for product in products:
-            product_data = {
-                "ID": str(product.id),
-                "Nom": product.name,
-                "Code": product.code or "",
-                "Code-barres": product.barcode or "",
-                "Quantité": product.quantity or 0,
-                "Prix d'achat": float(product.purchase_price or 0),
-                "Prix de vente": float(product.selling_price or 0),
-                "Valeur d'achat": float(product.purchase_value or 0),
-                "Valeur de vente": float(product.selling_value or 0),
-                "Marge totale": float(product.total_margin or 0),
-                "Date d'expiration": product.expiry_date.isoformat() if product.expiry_date else "",
-                "Catégorie": product.category or "",
-                "Emplacement": product.location or "",
-                "Fournisseur": product.supplier or "",
-                "Numéro de lot": product.batch_number or "",
-                "Statut stock": product.stock_status or "normal",
-                "Statut expiration": product.expiry_status or "normal",
-                "Seuil d'alerte": product.alert_threshold or 0,
-                "Stock minimum": product.minimum_stock or 0,
-                "Unité": product.unit or "unité",
-                "TVA": f"{product.tva_rate}%" if product.has_tva else "0%",
-                "Type": product.product_type or "medicament",
-                "Nom commercial": product.commercial_name or "",
-                "Forme galénique": product.galenic_form or "",
-                "Dosage": product.dosage or "",
-                "Principe actif": product.active_ingredient or "",
-                "Créé le": product.created_at.isoformat() if product.created_at else "",
-                "Dernière modification": product.updated_at.isoformat() if product.updated_at else ""
-            }
-            
-            if include_sales_stats:
-                # Calculer les statistiques de ventes
-                thirty_days_ago = datetime.utcnow() - timedelta(days=30)
-                sales_stats = db.query(
-                    func.coalesce(func.sum(SaleItem.quantity), 0).label("total_sold"),
-                    func.coalesce(func.sum(SaleItem.total), 0).label("total_revenue"),
-                    func.count(distinct(Sale.id)).label("sale_count")
-                ).join(Sale).filter(
-                    SaleItem.product_id == product.id,
-                    SaleItem.tenant_id == tenant_id,
-                    Sale.status == "completed",
-                    Sale.created_at >= thirty_days_ago
-                ).first()
-                
-                product_data["Ventes 30j (quantité)"] = int(sales_stats.total_sold or 0)
-                product_data["Ventes 30j (CA)"] = float(sales_stats.total_revenue or 0)
-                product_data["Ventes 30j (nombre)"] = int(sales_stats.sale_count or 0)
-                
-                # Rotation du stock
-                if product.quantity and product.quantity > 0:
-                    turnover_rate = (sales_stats.total_sold or 0) / product.quantity
-                    product_data["Taux de rotation"] = round(turnover_rate, 2)
-                else:
-                    product_data["Taux de rotation"] = 0
-            
-            data.append(product_data)
-        
-        # Exporter selon le format
-        import pandas as pd
-        import io
-        import json
-        
-        df = pd.DataFrame(data)
-        
-        if format.lower() == "csv":
-            output = io.StringIO()
-            df.to_csv(output, index=False, encoding='utf-8-sig')
-            content = output.getvalue()
-            media_type = "text/csv"
-            filename = f"stock_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        elif format.lower() == "json":
-            content = json.dumps(data, indent=2, default=str)
-            media_type = "application/json"
-            filename = f"stock_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        else:
-            output = io.BytesIO()
-            df.to_excel(output, index=False, engine="openpyxl")
-            content = output.getvalue()
-            media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            filename = f"stock_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        
-        from fastapi.responses import Response
-        return Response(
-            content=content,
-            media_type=media_type,
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("Erreur export stock")
-        raise HTTPException(status_code=500, detail=f"Erreur export stock: {exc}")

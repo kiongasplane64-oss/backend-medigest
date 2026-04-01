@@ -56,6 +56,16 @@ logger = logging.getLogger(__name__)
 async def generate_sale_receipt(sale_id: UUID, tenant_id: UUID, pharmacy_id: UUID, db: Session):
     """Génère un reçu PDF pour la vente"""
     try:
+        # Vérifier que MEDIA_ROOT est configuré
+        if not hasattr(settings, 'MEDIA_ROOT') or not settings.MEDIA_ROOT:
+            logger.warning(f"⚠️ MEDIA_ROOT non configuré, génération de reçu ignorée pour la vente {sale_id}")
+            return
+        
+        # Vérifier si la génération des reçus est activée
+        if not getattr(settings, 'GENERATE_RECEIPTS', True):
+            logger.info(f"📄 Génération de reçus désactivée pour la vente {sale_id}")
+            return
+        
         receipt_service = ReceiptService(db)
         sale = db.query(Sale).filter(
             Sale.id == sale_id,
@@ -65,19 +75,24 @@ async def generate_sale_receipt(sale_id: UUID, tenant_id: UUID, pharmacy_id: UUI
         
         if sale:
             receipt_path = await receipt_service.generate_sale_receipt(sale)
-            sale.receipt_path = receipt_path
-            db.commit()
-            logger.info(f"Reçu généré pour la vente {sale.reference}: {receipt_path}")
+            if receipt_path:
+                sale.receipt_path = receipt_path
+                db.commit()
+                logger.info(f"✅ Reçu généré pour la vente {sale.reference}: {receipt_path}")
+            else:
+                logger.warning(f"⚠️ Échec génération reçu pour {sale.reference}")
+                
     except Exception as e:
-        logger.error(f"Erreur génération reçu pour vente {sale_id}: {str(e)}")
+        logger.error(f"❌ Erreur génération reçu pour vente {sale_id}: {str(e)}")
 
 
 async def update_sales_statistics(tenant_id: UUID, pharmacy_id: UUID, sale_date: date, db: Session):
     """Met à jour les statistiques de ventes"""
     try:
-        report_service = ReportService(db, tenant_id)
+        report_service = ReportService(db)
+        # Note: La fonction update_daily_sales_stats a été modifiée pour accepter pharmacy_id
         await report_service.update_daily_sales_stats(tenant_id, pharmacy_id, sale_date)
-        logger.info(f"Statistiques mises à jour pour {sale_date}")
+        logger.info(f"Statistiques mises à jour pour {sale_date} - pharmacy {pharmacy_id}")
     except Exception as e:
         logger.error(f"Erreur mise à jour statistiques: {str(e)}")
 
@@ -99,7 +114,7 @@ def get_user_accessible_pharmacies(db: Session, user_id: UUID, tenant_id: Option
     return [p.pharmacy_id for p in query.all()]
 
 
-def check_stock_availability_for_sale(
+def check_stock_availability_with_prices(
     db: Session,
     tenant_id: UUID,
     pharmacy_id: UUID,
@@ -107,7 +122,7 @@ def check_stock_availability_for_sale(
     inventory_service: InventoryService
 ) -> tuple[List[Dict], List[Dict]]:
     """
-    Vérifie la disponibilité des stocks
+    Vérifie la disponibilité des stocks et récupère les prix du stock.
     Retourne (items_disponibles, items_indisponibles)
     """
     available_items = []
@@ -131,7 +146,7 @@ def check_stock_availability_for_sale(
             })
             continue
         
-        # Récupérer le stock disponible
+        # Vérifier le stock disponible
         available_quantity = product.available_quantity
         
         if available_quantity < item.quantity:
@@ -147,7 +162,9 @@ def check_stock_availability_for_sale(
             available_items.append({
                 "product": product,
                 "item": item,
-                "available_stock": available_quantity
+                "available_stock": available_quantity,
+                "selling_price": product.selling_price,
+                "tva_rate": product.tva_rate if product.has_tva else Decimal('0')
             })
     
     return available_items, unavailable_items
@@ -168,7 +185,13 @@ async def create_sale(
 ):
     """
     Crée une nouvelle vente avec gestion complète par pharmacie
-    et mise à jour automatique du stock avec traçabilité
+    et mise à jour automatique du stock avec traçabilité.
+    
+    IMPORTANT:
+    - Le prix de vente est TOUJOURS celui défini dans le stock (product.selling_price)
+    - Le taux de TVA est TOUJOURS celui défini dans le stock (product.tva_rate)
+    - Les champs unit_price et tva_rate dans SaleItemCreate sont ignorés
+    - Seule la remise (discount_percent) peut être appliquée par l'utilisateur
     """
     # Vérifier les permissions
     allowed_roles = ["admin", "super_admin", "superadmin", "vendeur", "gerant", "caissier"]
@@ -196,11 +219,27 @@ async def create_sale(
                 detail="La vente doit contenir au moins un article"
             )
 
+        # VALIDATION: Vérifier qu'aucun prix n'est spécifié dans la requête
+        for idx, item in enumerate(sale_data.items):
+            if hasattr(item, 'unit_price') and item.unit_price is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Article {idx + 1}: Le prix de vente ne peut pas être spécifié. "
+                           f"Utilisez le prix défini dans le stock."
+                )
+            if hasattr(item, 'tva_rate') and item.tva_rate is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Article {idx + 1}: Le taux de TVA ne peut pas être spécifié. "
+                           f"Utilisez le taux défini dans le stock."
+                )
+
         # Service d'inventaire
         inventory_service = InventoryService(db, tenant_id)
 
-        # Vérification des stocks
-        available_items, unavailable_items = check_stock_availability_for_sale(
+        # Vérification des stocks et récupération des produits avec leurs prix
+        # PAS DE AWAIT car la fonction est synchrone
+        available_items, unavailable_items = check_stock_availability_with_prices(
             db=db,
             tenant_id=tenant_id,
             pharmacy_id=pharmacy.id,
@@ -245,10 +284,30 @@ async def create_sale(
                 current_debt = getattr(client, 'dette_actuelle', Decimal('0'))
                 credit_available = credit_limit - current_debt
                 
-                if sale_data.total_amount > credit_available:
+                # Calcul temporaire du total pour validation
+                temp_total = Decimal('0')
+                for available in available_items:
+                    product = available["product"]
+                    item = available["item"]
+                    unit_price = product.selling_price
+                    tva_rate = product.tva_rate if product.has_tva else Decimal('0')
+                    
+                    item_subtotal = unit_price * Decimal(str(item.quantity))
+                    item_discount = item_subtotal * (Decimal(str(item.discount_percent)) / Decimal('100')) if item.discount_percent else Decimal('0')
+                    item_after_discount = item_subtotal - item_discount
+                    item_tva = item_after_discount * (tva_rate / Decimal('100'))
+                    item_total = item_after_discount + item_tva
+                    temp_total += item_total
+                
+                # Appliquer la remise globale
+                if sale_data.global_discount:
+                    global_discount_amount = temp_total * (Decimal(str(sale_data.global_discount)) / Decimal('100'))
+                    temp_total -= global_discount_amount
+                
+                if temp_total > credit_available:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Crédit insuffisant. Disponible: {float(credit_available):.2f}, Requis: {float(sale_data.total_amount):.2f}"
+                        detail=f"Crédit insuffisant. Disponible: {float(credit_available):.2f}, Requis: {float(temp_total):.2f}"
                     )
 
         # Génération référence
@@ -256,34 +315,57 @@ async def create_sale(
         pharmacy_code = getattr(pharmacy, 'pharmacy_code', 'PHARM')
         reference = f"VNT-{timestamp}-{pharmacy_code}"
 
-        # Calcul des totaux
+        # Calcul des totaux en utilisant les prix du stock
         subtotal = Decimal('0')
         total_discount = Decimal('0')
         total_tva = Decimal('0')
         total_amount = Decimal('0')
         
+        # Stocker les données calculées pour chaque item
+        items_calculated = []
+        
         for available in available_items:
-            item = available["item"]
             product = available["product"]
+            item = available["item"]
             
-            item_subtotal = Decimal(str(item.unit_price)) * Decimal(str(item.quantity))
-            item_discount = item_subtotal * (Decimal(str(item.discount_percent)) / Decimal('100'))
+            # Utiliser le prix de vente du stock
+            unit_price = product.selling_price
+            tva_rate = product.tva_rate if product.has_tva else Decimal('0')
+            discount_percent = Decimal(str(item.discount_percent)) if item.discount_percent else Decimal('0')
+            
+            # Calculs
+            item_subtotal = unit_price * Decimal(str(item.quantity))
+            item_discount = item_subtotal * (discount_percent / Decimal('100'))
             item_after_discount = item_subtotal - item_discount
-            item_tva = item_after_discount * (Decimal(str(item.tva_rate)) / Decimal('100'))
+            item_tva = item_after_discount * (tva_rate / Decimal('100'))
             item_total = item_after_discount + item_tva
             
             subtotal += item_subtotal
             total_discount += item_discount
             total_tva += item_tva
             total_amount += item_total
+            
+            # Stocker pour utilisation ultérieure
+            items_calculated.append({
+                "product": product,
+                "item": item,
+                "unit_price": unit_price,
+                "tva_rate": tva_rate,
+                "discount_percent": discount_percent,
+                "item_subtotal": item_subtotal,
+                "item_discount": item_discount,
+                "item_tva": item_tva,
+                "item_total": item_total
+            })
         
         # Appliquer la remise globale
-        if sale_data.global_discount:
-            global_discount_amount = total_amount * (Decimal(str(sale_data.global_discount)) / Decimal('100'))
+        global_discount_percent = Decimal(str(sale_data.global_discount)) if sale_data.global_discount else Decimal('0')
+        if global_discount_percent > 0:
+            global_discount_amount = total_amount * (global_discount_percent / Decimal('100'))
             total_discount += global_discount_amount
             total_amount -= global_discount_amount
 
-        # CORRECTION: Supprimer les champs amount_paid et amount_due qui sont des propriétés calculées
+        # Créer la vente
         sale = Sale(
             tenant_id=tenant_id,
             pharmacy_id=pharmacy.id,
@@ -301,7 +383,7 @@ async def create_sale(
             guarantee_deposit=Decimal(str(sale_data.guarantee_deposit)) if sale_data.guarantee_deposit else Decimal('0'),
             guarantor_name=sale_data.guarantor_name,
             guarantor_phone=sale_data.guarantor_phone,
-            global_discount=Decimal(str(sale_data.global_discount)) if sale_data.global_discount else Decimal('0'),
+            global_discount=global_discount_percent,
             notes=sale_data.notes,
             subtotal=subtotal,
             total_discount=total_discount,
@@ -320,18 +402,11 @@ async def create_sale(
         # Création des items et mise à jour des stocks
         sale_items = []
         
-        for available in available_items:
-            product = available["product"]
-            item = available["item"]
+        for calc in items_calculated:
+            product = calc["product"]
+            item = calc["item"]
             
-            # Calcul des montants pour l'item
-            item_subtotal = Decimal(str(item.unit_price)) * Decimal(str(item.quantity))
-            item_discount = item_subtotal * (Decimal(str(item.discount_percent)) / Decimal('100'))
-            item_after_discount = item_subtotal - item_discount
-            item_tva = item_after_discount * (Decimal(str(item.tva_rate)) / Decimal('100'))
-            item_total = item_after_discount + item_tva
-            
-            # Créer l'item de vente
+            # Créer l'item de vente avec les prix du stock
             sale_item = SaleItem(
                 sale_id=sale.id,
                 tenant_id=tenant_id,
@@ -340,13 +415,13 @@ async def create_sale(
                 product_code=product.code,
                 product_name=product.name,
                 quantity=item.quantity,
-                unit_price=Decimal(str(item.unit_price)),
-                discount_percent=Decimal(str(item.discount_percent)) if item.discount_percent else Decimal('0'),
-                discount_amount=item_discount,
-                tva_rate=Decimal(str(item.tva_rate)) if item.tva_rate else Decimal('0'),
-                tva_amount=item_tva,
-                subtotal=item_subtotal,
-                total=item_total,
+                unit_price=calc["unit_price"],
+                discount_percent=calc["discount_percent"],
+                discount_amount=calc["item_discount"],
+                tva_rate=calc["tva_rate"],
+                tva_amount=calc["item_tva"],
+                subtotal=calc["item_subtotal"],
+                total=calc["item_total"],
                 batch_number=item.batch_number,
                 expiry_date=item.expiry_date
             )
@@ -369,7 +444,7 @@ async def create_sale(
             product.last_sale_date = datetime.utcnow()
             product.refresh_statuses()
             
-            # Créer un mouvement de stock
+            # Créer un mouvement de stock avec traçabilité du prix utilisé
             movement = StockMovement(
                 tenant_id=tenant_id,
                 branch_id=getattr(pharmacy, 'branch_id', None),
@@ -383,7 +458,7 @@ async def create_sale(
                 reference=sale.reference,
                 batch_number=item.batch_number,
                 purchase_price=product.purchase_price,
-                selling_price=Decimal(str(item.unit_price)),
+                selling_price=calc["unit_price"],
                 sale_id=sale.id,
                 sale_item_id=sale_item.id,
                 created_by=current_user.id
@@ -761,7 +836,7 @@ async def get_sales_by_product(
 # =======================
 
 @router.get("/stats/daily", response_model=DailyStatsResponse)
-async def get_daily_stats(
+async def get_daily_stats_endpoint(
     db: Session = Depends(get_db),
     current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_user: User = Depends(get_current_active_user),
@@ -994,7 +1069,7 @@ async def get_sales_stats(
             }
         
         # Statistiques du jour
-        today_stats = await get_daily_stats(
+        today_stats = await get_daily_stats_endpoint(
             db=db,
             current_tenant=current_tenant,
             current_user=current_user,

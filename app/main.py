@@ -33,7 +33,7 @@ from app.api.v1.endpoints.transfers import router as transfers_router
 from app.api.v1.orders import router as orders_router
 
 
-
+from app.core.startup import init_storage
 # Routers admin / legacy
 from app.api.routes.pharmacies import router as pharmacies_router
 from app.api.routes.tenants import router as admin_tenants_router
@@ -68,6 +68,21 @@ app = FastAPI(
     docs_url="/api/docs",
     redoc_url="/api/redoc",
 )
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialisation au démarrage"""
+    logger.info("🚀 Démarrage de l'application...")
+    
+    # Initialiser le stockage
+    storage_ready = init_storage()
+    if storage_ready:
+        logger.info("✅ Stockage initialisé avec succès")
+    else:
+        logger.warning("⚠️ Problème d'initialisation du stockage")
+    
+    logger.info("✅ Application prête")
+
 
 
 # ============================================================================

@@ -689,16 +689,15 @@ class ReportService:
     # Mise à jour des statistiques
     # =======================
     
-    async def update_daily_sales_stats(self, tenant_id: UUID, target_date: date):
-        """Met à jour les statistiques quotidiennes des ventes"""
+    async def update_daily_sales_stats(self, tenant_id: UUID, pharmacy_id: UUID, target_date: date):
+        """Met à jour les statistiques quotidiennes des ventes pour une pharmacie"""
         try:
-            # Implémentation simplifiée
-            # Dans une vraie implémentation, on pourrait stocker dans Redis ou une table dédiée
-            logger.info(f"Mise à jour stats ventes pour {target_date} - tenant {tenant_id}")
+            logger.info(f"Mise à jour stats ventes pour {target_date} - tenant {tenant_id} - pharmacy {pharmacy_id}")
             
-            # Exemple: calculer et stocker les stats
+            # Calculer les stats pour cette pharmacie spécifique
             sales_today = self.db.query(Sale).filter(
                 Sale.tenant_id == tenant_id,
+                Sale.pharmacy_id == pharmacy_id,  # Ajouter le filtre par pharmacie
                 Sale.status == "completed",
                 func.date(Sale.created_at) == target_date
             ).all()
@@ -709,6 +708,7 @@ class ReportService:
             stats = {
                 "date": target_date.isoformat(),
                 "tenant_id": str(tenant_id),
+                "pharmacy_id": str(pharmacy_id),  # Ajouter la pharmacie
                 "sales_count": total_count,
                 "total_amount": float(total_amount),
                 "average_amount": float(total_amount / total_count if total_count > 0 else 0),
@@ -716,6 +716,8 @@ class ReportService:
             }
             
             logger.info(f"Stats calculées: {stats}")
+            
+            # Ici vous pourriez sauvegarder dans une table DailySalesStats ou Redis
             
         except Exception as e:
             logger.error(f"Erreur mise à jour stats: {str(e)}")
