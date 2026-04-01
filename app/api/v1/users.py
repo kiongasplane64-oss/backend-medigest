@@ -7,7 +7,7 @@ import traceback
 import sys
 from datetime import datetime, timedelta
 from uuid import UUID
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.user import UserCreate, UserUpdate, UserResponse, UserListSchema
@@ -48,14 +48,44 @@ class SimpleUserProfile(BaseModel):
     class Config:
         from_attributes = True
 
+
 class UserCreateRequest(BaseModel):
-    """Schéma pour la création d'utilisateur"""
-    nom_complet: str = Field(..., min_length=2, max_length=100)
+    """
+    Schéma pour la création d'utilisateur - Compatible avec le frontend
+    Le frontend envoie 'full_name' mais nous stockons 'nom_complet'
+    """
+    full_name: str = Field(..., min_length=2, max_length=100, alias="full_name")
     email: EmailStr
     password: str = Field(..., min_length=8)
     role: str = Field(..., pattern="^(admin|pharmacien|vendeur|caissier|gestionnaire|comptable|preparateur|stockiste)$")
-    telephone: Optional[str] = None
+    telephone: Optional[str] = Field(None, max_length=20)
     adresse: Optional[str] = None
+    is_active: Optional[bool] = True
+    permissions: Optional[Dict[str, bool]] = None
+    
+    class Config:
+        populate_by_name = True  # Permet d'utiliser 'full_name' dans la requête
+        from_attributes = True
+    
+    @field_validator('full_name')
+    @classmethod
+    def validate_full_name(cls, v: str) -> str:
+        """Valide et nettoie le nom complet"""
+        if not v or len(v.strip()) < 2:
+            raise ValueError('Le nom complet doit contenir au moins 2 caractères')
+        return v.strip()
+    
+    @field_validator('telephone')
+    @classmethod
+    def validate_telephone(cls, v: Optional[str]) -> Optional[str]:
+        """Valide le format du téléphone"""
+        if v:
+            # Supprime les espaces et vérifie les caractères valides
+            cleaned = v.replace(' ', '').replace('-', '')
+            if not cleaned.replace('+', '').isdigit():
+                raise ValueError('Le numéro de téléphone doit contenir uniquement des chiffres et éventuellement +')
+        return v
+
 
 class UserUpdateRequest(BaseModel):
     """Schéma pour la mise à jour d'utilisateur"""
@@ -66,11 +96,16 @@ class UserUpdateRequest(BaseModel):
     telephone: Optional[str] = None
     adresse: Optional[str] = None
     actif: Optional[bool] = None
+    
+    class Config:
+        from_attributes = True
+
 
 class ChangePasswordRequest(BaseModel):
     """Schéma pour le changement de mot de passe"""
     old_password: str
     new_password: str = Field(..., min_length=8)
+
 
 # =========================
 # FONCTIONS UTILITAIRES
@@ -83,6 +118,7 @@ def is_valid_uuid(uuid_string):
         return True
     except ValueError:
         return False
+
 
 def get_default_permissions(role: str) -> dict:
     """
@@ -173,6 +209,7 @@ def get_default_permissions(role: str) -> dict:
     
     return permissions.get(role, {})
 
+
 # =========================
 # ENDPOINTS SPÉCIAUX (DOIVENT ÊTRE AVANT LES ROUTES AVEC PARAMÈTRES)
 # =========================
@@ -224,8 +261,7 @@ def get_all_online_users(
             "role": user.role,
             "last_login": user.last_login.isoformat() if user.last_login else None,
             "login_duration": f"{duration_minutes} min",
-            "status": status,
-            "pharmacy_id": user.pharmacy_id
+            "status": status
         })
     
     return {
@@ -234,6 +270,7 @@ def get_all_online_users(
         "users": result,
         "timestamp": datetime.utcnow().isoformat()
     }
+
 
 @router.get("/me/profile", status_code=status.HTTP_200_OK)
 def get_my_profile(
@@ -257,6 +294,7 @@ def get_my_profile(
         profile["pharmacie"] = None
     
     return profile
+
 
 @router.post("/me/change-password", status_code=status.HTTP_200_OK)
 def change_my_password(
@@ -320,6 +358,7 @@ def change_my_password(
             detail=f"Erreur lors du changement de mot de passe: {str(e)}"
         )
 
+
 # =========================
 # ENDPOINTS GÉNÉRAUX
 # =========================
@@ -350,11 +389,9 @@ def list_users(
     if search:
         search_term = f"%{search.lower()}%"
         query = query.filter(
-            db.or_(
-                User.nom_complet.ilike(search_term),
-                User.email.ilike(search_term),
-                User.telephone.ilike(search_term)
-            )
+            (User.nom_complet.ilike(search_term)) |
+            (User.email.ilike(search_term)) |
+            (User.telephone.ilike(search_term))
         )
     
     if role:
@@ -381,7 +418,8 @@ def list_users(
 
     return result
 
-@router.post("/", status_code=status.HTTP_201_CREATED, response_model=UserResponse)
+
+@router.post("/", status_code=status.HTTP_201_CREATED)
 def create_user(
     user_data: UserCreateRequest,
     request: Request,
@@ -390,7 +428,7 @@ def create_user(
 ):
     """
     Crée un utilisateur pour le tenant de l'admin connecté.
-    L'utilisateur créé pourra se connecter uniquement à sa pharmacie.
+    Accepte 'full_name' du frontend et le convertit en 'nom_complet'.
     """
     # Vérifier les permissions
     if current_user.role not in ["admin", "super_admin"]:
@@ -454,17 +492,18 @@ def create_user(
         )
 
     try:
-        # Création de l'utilisateur
+        # Création de l'utilisateur - Conversion full_name -> nom_complet
+        # Note: Les champs pharmacy_id et branch_id ne sont pas dans le modèle User
         new_user = User(
             tenant_id=current_user.tenant_id,
-            nom_complet=user_data.nom_complet,
+            nom_complet=user_data.full_name,  # Conversion ici
             email=user_data.email.lower().strip(),
             password_hash=hash_password(user_data.password),
             role=user_data.role,
-            actif=True,
+            actif=user_data.is_active if user_data.is_active is not None else True,
             telephone=user_data.telephone,
             adresse=user_data.adresse,
-            permissions=get_default_permissions(user_data.role)
+            permissions=user_data.permissions or get_default_permissions(user_data.role)
         )
         
         db.add(new_user)
@@ -489,13 +528,13 @@ def create_user(
         return {
             "message": "Utilisateur créé avec succès",
             "user": {
-                "id": new_user.id,
+                "id": str(new_user.id),
                 "email": new_user.email,
                 "nom_complet": new_user.nom_complet,
                 "role": new_user.role,
                 "telephone": new_user.telephone,
                 "actif": new_user.actif,
-                "date_creation": new_user.date_creation,
+                "date_creation": new_user.date_creation.isoformat() if new_user.date_creation else None,
                 "pharmacie": pharmacie_nom
             },
             "instructions": f"L'utilisateur peut se connecter à votre pharmacie '{pharmacie_nom}' avec son email et mot de passe"
@@ -508,6 +547,7 @@ def create_user(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur lors de la création de l'utilisateur: {str(e)}"
         )
+
 
 # =========================
 # ENDPOINTS PAR USER_ID
@@ -554,7 +594,8 @@ def get_user(
 
     return user.to_dict(include_tenant=False)
 
-@router.put("/{user_id}", status_code=status.HTTP_200_OK, response_model=UserResponse)
+
+@router.put("/{user_id}", status_code=status.HTTP_200_OK)
 def update_user(
     user_id: str,
     user_data: UserUpdateRequest,
@@ -676,6 +717,7 @@ def update_user(
             detail=f"Erreur lors de la mise à jour: {str(e)}"
         )
 
+
 @router.patch("/{user_id}/toggle", status_code=status.HTTP_200_OK)
 def toggle_user(
     user_id: str,
@@ -719,7 +761,6 @@ def toggle_user(
 
     try:
         # Basculer l'état
-        old_status = user.actif
         user.actif = not user.actif
         db.commit()
         db.refresh(user)
@@ -750,6 +791,7 @@ def toggle_user(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur lors de la modification du statut: {str(e)}"
         )
+
 
 @router.post("/{user_id}/reset-password", status_code=status.HTTP_200_OK)
 def reset_user_password(
@@ -813,7 +855,7 @@ def reset_user_password(
             "temporary_password": temp_password,
             "instructions": "Communiquez ce mot de passe temporaire à l'utilisateur. Il devra le changer à sa première connexion.",
             "user": {
-                "id": user.id,
+                "id": str(user.id),
                 "email": user.email,
                 "nom_complet": user.nom_complet
             }
@@ -827,7 +869,8 @@ def reset_user_password(
             detail=f"Erreur lors de la réinitialisation: {str(e)}"
         )
 
-# récupérer tous les users
+
+# Récupérer tous les users (super_admin seulement)
 @router.get("/all", status_code=status.HTTP_200_OK)
 def get_all_users(
     db: Session = Depends(get_db),
@@ -844,6 +887,7 @@ def get_all_users(
     
     users = db.query(User).order_by(User.date_creation.desc()).offset((page-1)*limit).limit(limit).all()
     return [user.to_dict(include_tenant=True) for user in users]
+
 
 # =========================
 # STATISTIQUES ET HEALTH
@@ -871,7 +915,7 @@ def get_user_statistics(
     ).count()
     inactive = total - active
     
-    # Compter par rôle - CORRECTION ICI
+    # Compter par rôle
     roles = db.query(User.role, func.count(User.id)).filter(
         User.tenant_id == current_user.tenant_id
     ).group_by(User.role).all()
@@ -899,6 +943,7 @@ def get_user_statistics(
         "recent_users": recent_users_data,
         "timestamp": datetime.utcnow().isoformat()
     }
+
 
 @router.get("/health", status_code=status.HTTP_200_OK)
 def health_check():
