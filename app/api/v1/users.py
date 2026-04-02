@@ -12,6 +12,7 @@ from app.db.session import get_db
 from app.models.user import User
 from app.models.user_pharmacy import UserPharmacy
 from app.models.pharmacy import Pharmacy
+from app.models.branch import Branch
 from app.schemas.user import UserCreate, UserUpdate, UserResponse, UserListSchema
 from app.core.security import hash_password, verify_password
 from app.api.v1.auth import get_current_user
@@ -218,6 +219,93 @@ def get_default_permissions(role: str) -> dict:
 # =========================
 # ENDPOINTS SPÉCIAUX (DOIVENT ÊTRE AVANT LES ROUTES AVEC PARAMÈTRES)
 # =========================
+
+
+@router.get("/sessions/stats", status_code=status.HTTP_200_OK)
+def get_session_stats(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    date_range: str = Query("month", description="Période: day, week, month, year"),
+    pharmacy_id: Optional[str] = Query(None, description="Filtrer par pharmacie"),
+    branch_id: Optional[str] = Query(None, description="Filtrer par branche")
+):
+    """
+    Récupère les statistiques de sessions des utilisateurs
+    """
+    if current_user.role not in ["admin", "super_admin", "gestionnaire"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Accès refusé"
+        )
+    
+    # Calculer la date de début selon la période
+    now = datetime.utcnow()
+    if date_range == "day":
+        start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif date_range == "week":
+        start_date = now - timedelta(days=now.weekday())
+        start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif date_range == "month":
+        start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    elif date_range == "year":
+        start_date = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    else:
+        start_date = now - timedelta(days=30)
+    
+    # Construire la requête de base
+    query = db.query(User).filter(User.tenant_id == current_user.tenant_id)
+    
+    # Filtrer par pharmacie si spécifiée
+    if pharmacy_id:
+        # Vérifier que l'utilisateur a accès à cette pharmacie via user_pharmacy
+        query = query.filter(User.pharmacy_associations.any(pharmacy_id=pharmacy_id))
+    
+    # Filtrer par branche si spécifiée
+    if branch_id:
+        query = query.filter(User.active_branch_id == branch_id)
+    
+    # Récupérer les utilisateurs
+    users = query.filter(User.actif == True).all()
+    
+    # Compter les sessions actives (last_login dans les 15 dernières minutes)
+    threshold = now - timedelta(minutes=15)
+    active_sessions = query.filter(User.last_login >= threshold).count()
+    
+    # Connexions par jour (derniers 7 jours)
+    from sqlalchemy import func, cast, Date
+    
+    daily_logins = db.query(
+        cast(User.last_login, Date).label("login_date"),
+        func.count(User.id).label("count")
+    ).filter(
+        User.tenant_id == current_user.tenant_id,
+        User.last_login >= now - timedelta(days=7)
+    ).group_by(cast(User.last_login, Date)).all()
+    
+    daily_logins_data = [
+        {"date": str(row.login_date), "count": row.count}
+        for row in daily_logins
+    ]
+    
+    # Connexions par rôle
+    role_stats = db.query(
+        User.role,
+        func.count(User.id).label("count")
+    ).filter(
+        User.tenant_id == current_user.tenant_id
+    ).group_by(User.role).all()
+    
+    role_distribution = {role: count for role, count in role_stats}
+    
+    return {
+        "total_users": len(users),
+        "active_sessions": active_sessions,
+        "inactive_sessions": len(users) - active_sessions,
+        "date_range": date_range,
+        "daily_logins": daily_logins_data,
+        "role_distribution": role_distribution,
+        "timestamp": now.isoformat()
+    }
 
 @router.get("/online-users", status_code=status.HTTP_200_OK)
 def get_all_online_users(
@@ -436,23 +524,23 @@ def create_user(
     """
     Crée un utilisateur pour le tenant de l'admin connecté.
     Accepte 'full_name' du frontend et le convertit en 'nom_complet'.
-    Optionnellement associe l'utilisateur à une pharmacie.
+    Associe automatiquement l'utilisateur à une pharmacie et une branche.
     """
-    # Vérifier les permissions
+    # Verifier les permissions
     if current_user.role not in ["admin", "super_admin"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, 
             detail="Accès refusé. Seuls les administrateurs peuvent créer des utilisateurs."
         )
 
-    # Vérifier que l'admin est actif
+    # Verifier que l'admin est actif
     if not current_user.actif:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Votre compte est désactivé"
         )
 
-    # Vérifier si le tenant existe
+    # Verifier si le tenant existe
     tenant = db.query(Tenant).filter(Tenant.id == current_user.tenant_id).first()
     if not tenant:
         raise HTTPException(
@@ -460,7 +548,7 @@ def create_user(
             detail="Tenant non trouvé"
         )
     
-    # Vérifier l'unicité de l'email dans le tenant
+    # Verifier l'unicite de l'email dans le tenant
     existing_user = db.query(User).filter(
         User.email == user_data.email.lower().strip(),
         User.tenant_id == current_user.tenant_id
@@ -472,13 +560,13 @@ def create_user(
             detail="Cet email est déjà utilisé dans votre pharmacie"
         )
 
-    # Vérifier les limites du plan
+    # Verifier les limites du plan
     user_count = db.query(User).filter(
         User.tenant_id == current_user.tenant_id,
         User.actif == True
     ).count()
     
-    max_users = 10  # Valeur par défaut
+    max_users = 10
     if hasattr(tenant, 'max_users') and tenant.max_users:
         max_users = tenant.max_users
     
@@ -488,7 +576,7 @@ def create_user(
             detail=f"Limite d'utilisateurs atteinte ({max_users} maximum). Veuillez mettre à jour votre plan."
         )
 
-    # Vérifier les rôles autorisés
+    # Verifier les roles autorises
     allowed_roles = ["pharmacien", "vendeur", "caissier", "gestionnaire", "comptable", "preparateur", "stockiste"]
     if current_user.role != "super_admin":
         allowed_roles = [role for role in allowed_roles if role != "admin"]
@@ -499,22 +587,8 @@ def create_user(
             detail=f"Rôle non autorisé. Rôles autorisés: {', '.join(allowed_roles)}"
         )
 
-    # Si une pharmacie est fournie, vérifier qu'elle existe et appartient au tenant
-    pharmacy = None
-    if user_data.pharmacy_id:
-        pharmacy = db.query(Pharmacy).filter(
-            Pharmacy.id == user_data.pharmacy_id,
-            Pharmacy.tenant_id == current_user.tenant_id
-        ).first()
-        
-        if not pharmacy:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Pharmacie non trouvée"
-            )
-
     try:
-        # Création de l'utilisateur
+        # Creation de l'utilisateur
         new_user = User(
             tenant_id=current_user.tenant_id,
             nom_complet=user_data.full_name,
@@ -530,22 +604,98 @@ def create_user(
         db.add(new_user)
         db.flush()  # Pour obtenir l'ID du nouvel utilisateur
         
-        # Associer l'utilisateur à la pharmacie si fournie
-        if pharmacy:
-            user_pharmacy = UserPharmacy(
-                user_id=new_user.id,
-                pharmacy_id=pharmacy.id,
-                is_primary=True,  # Par défaut, c'est la pharmacie principale
-                can_manage=(user_data.role in ["admin", "gestionnaire"])
+        # =========================
+        # ASSOCIATION OBLIGATOIRE À LA PHARMACIE
+        # =========================
+        
+        # Determiner la pharmacie a associer
+        pharmacy_id = None
+        if user_data.pharmacy_id:
+            pharmacy_id = user_data.pharmacy_id
+        elif current_user.active_pharmacy_id:
+            pharmacy_id = current_user.active_pharmacy_id
+        elif current_user.pharmacies:
+            pharmacy_id = current_user.pharmacies[0].id
+        
+        if not pharmacy_id:
+            # Si aucune pharmacie n'est trouvee, prendre la premiere pharmacie du tenant
+            first_pharmacy = db.query(Pharmacy).filter(
+                Pharmacy.tenant_id == current_user.tenant_id,
+                Pharmacy.is_active == True
+            ).first()
+            if first_pharmacy:
+                pharmacy_id = first_pharmacy.id
+        
+        if pharmacy_id:
+            # Recuperer la pharmacie
+            pharmacy = db.query(Pharmacy).filter(
+                Pharmacy.id == pharmacy_id,
+                Pharmacy.tenant_id == current_user.tenant_id
+            ).first()
+            
+            if pharmacy:
+                # Creer l'association user_pharmacy
+                user_pharmacy = UserPharmacy(
+                    user_id=new_user.id,
+                    pharmacy_id=pharmacy.id,
+                    is_primary=(user_data.role in ["admin", "gestionnaire"]),
+                    role_in_pharmacy=user_data.role,
+                    can_manage=(user_data.role in ["admin", "gestionnaire"])
+                )
+                db.add(user_pharmacy)
+                
+                # Definir la pharmacie active
+                new_user.active_pharmacy_id = pharmacy.id
+                
+                # =========================
+                # ASSIGNATION DE LA BRANCHE PAR DEFAUT
+                # =========================
+                
+                # Chercher une branche par defaut pour cette pharmacie
+                default_branch = None
+                
+                # Priorite 1: Branche fournie par l'utilisateur
+                if user_data.branch_id:
+                    default_branch = db.query(Branch).filter(
+                        Branch.id == user_data.branch_id,
+                        Branch.parent_pharmacy_id == pharmacy.id,
+                        Branch.is_active == True
+                    ).first()
+                
+                # Priorite 2: Branche principale de la pharmacie
+                if not default_branch:
+                    default_branch = db.query(Branch).filter(
+                        Branch.parent_pharmacy_id == pharmacy.id,
+                        Branch.is_active == True,
+                        Branch.is_main_branch == True
+                    ).first()
+                
+                # Priorite 3: Premiere branche active de la pharmacie
+                if not default_branch:
+                    default_branch = db.query(Branch).filter(
+                        Branch.parent_pharmacy_id == pharmacy.id,
+                        Branch.is_active == True
+                    ).first()
+                
+                if default_branch:
+                    new_user.active_branch_id = default_branch.id
+                    logger.info(f"Branche assignee a {new_user.email}: {default_branch.name} (id: {default_branch.id})")
+                else:
+                    logger.warning(f"Aucune branche trouvee pour la pharmacie {pharmacy.name}, l'utilisateur {new_user.email} n'aura pas de branche active")
+                
+                db.add(new_user)
+            else:
+                logger.error(f"Pharmacie non trouvee avec l'id {pharmacy_id}")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Pharmacie non trouvee"
+                )
+        else:
+            logger.error(f"Aucune pharmacie disponible pour le tenant {current_user.tenant_id}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Aucune pharmacie disponible pour associer l'utilisateur"
             )
-            db.add(user_pharmacy)
-            
-            # Définir la pharmacie active
-            new_user.active_pharmacy_id = pharmacy.id
-            
-            # Si une branche est fournie, la définir comme active
-            if user_data.branch_id:
-                new_user.active_branch_id = user_data.branch_id
         
         db.commit()
         db.refresh(new_user)
@@ -557,16 +707,22 @@ def create_user(
             user_id=current_user.id,
             action="CREATE_USER",
             cible="user",
-            description=f"Création utilisateur: {new_user.email} (role={new_user.role})",
+            description=f"Creation utilisateur: {new_user.email} (role={new_user.role})",
             ip=request.client.host if request.client else None
         )
 
-        # Récupérer le nom de la pharmacie
+        # Recuperer le nom de la pharmacie
         pharmacie_nom = getattr(tenant, 'nom_pharmacie', 'Votre pharmacie')
         pharmacie_nom = pharmacie_nom if pharmacie_nom else 'Votre pharmacie'
+        
+        # Recuperer le nom de la branche assignee
+        branch_name = None
+        if new_user.active_branch_id:
+            branch = db.query(Branch).filter(Branch.id == new_user.active_branch_id).first()
+            branch_name = branch.name if branch else None
 
         return {
-            "message": "Utilisateur créé avec succès",
+            "message": "Utilisateur cree avec succes",
             "user": {
                 "id": str(new_user.id),
                 "email": new_user.email,
@@ -577,20 +733,22 @@ def create_user(
                 "date_creation": new_user.date_creation.isoformat() if new_user.date_creation else None,
                 "active_pharmacy_id": str(new_user.active_pharmacy_id) if new_user.active_pharmacy_id else None,
                 "active_branch_id": str(new_user.active_branch_id) if new_user.active_branch_id else None,
-                "pharmacie": pharmacie_nom
+                "pharmacie": pharmacie_nom,
+                "branche": branch_name
             },
-            "instructions": f"L'utilisateur peut se connecter à votre pharmacie '{pharmacie_nom}' avec son email et mot de passe"
+            "instructions": f"L'utilisateur peut se connecter a votre pharmacie '{pharmacie_nom}' avec son email et mot de passe"
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
-        logger.error(f"Erreur création utilisateur: {str(e)}")
+        logger.error(f"Erreur creation utilisateur: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erreur lors de la création de l'utilisateur: {str(e)}"
+            detail=f"Erreur lors de la creation de l'utilisateur: {str(e)}"
         )
-
-
+    
 # =========================
 # ENDPOINTS PAR USER_ID
 # =========================
@@ -1024,3 +1182,25 @@ def health_check():
             "GET /users/statistics/overview - Statistiques"
         ]
     }
+
+@router.get("/", status_code=status.HTTP_200_OK)
+def list_users_with_slash(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=100),
+    search: Optional[str] = Query(None),
+    role: Optional[str] = Query(None),
+    actif: Optional[bool] = Query(None)
+):
+    """Alias pour GET /users avec slash"""
+    return list_users(db, current_user, page, limit, search, role, actif)
+
+
+@router.get("/me/profile/", status_code=status.HTTP_200_OK)
+def get_my_profile_with_slash(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Alias pour GET /users/me/profile avec slash"""
+    return get_my_profile(db, current_user)

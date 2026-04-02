@@ -33,6 +33,12 @@ from app.schemas.transfer import (
     TransferUpdate,
 )
 from app.services.transfer_service import TransferService
+from app.api.v1.endpoints.stock import _check_permission
+from app.models.product import Product
+from app.models.branch import Branch
+from app.models.stock_movement import StockMovement
+from app.db.session import get_db
+from app.api.deps import get_current_tenant, get_current_active_user
 
 # Configuration du logger
 logger = logging.getLogger(__name__)
@@ -679,3 +685,167 @@ def cancel_transfer(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
         ) from e
+
+@router.post("/transfer-between-branches", summary="Transférer du stock entre succursales")
+async def transfer_stock_between_branches(
+    product_id: UUID,
+    quantity: int,
+    from_branch_id: UUID,
+    to_branch_id: UUID,
+    reason: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Transfère du stock d'une succursale à une autre.
+    L'admin peut gérer toutes les branches.
+    """
+    try:
+        _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant"])
+        
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        # Vérifier les branches
+        from_branch = db.query(Branch).filter(
+            Branch.id == from_branch_id,
+            Branch.tenant_id == tenant_id,
+            Branch.is_active == True
+        ).first()
+        
+        to_branch = db.query(Branch).filter(
+            Branch.id == to_branch_id,
+            Branch.tenant_id == tenant_id,
+            Branch.is_active == True
+        ).first()
+        
+        if not from_branch or not to_branch:
+            raise HTTPException(status_code=404, detail="Succursale source ou destination non trouvée")
+        
+        # Récupérer le produit dans la branche source
+        source_product = db.query(Product).filter(
+            Product.id == product_id,
+            Product.tenant_id == tenant_id,
+            Product.branch_id == from_branch_id,
+            Product.is_active == True
+        ).first()
+        
+        if not source_product:
+            raise HTTPException(status_code=404, detail="Produit non trouvé dans la succursale source")
+        
+        if source_product.quantity < quantity:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Quantité insuffisante. Disponible: {source_product.quantity}"
+            )
+        
+        # Récupérer ou créer le produit dans la branche destination
+        target_product = db.query(Product).filter(
+            Product.name == source_product.name,
+            Product.code == source_product.code,
+            Product.tenant_id == tenant_id,
+            Product.branch_id == to_branch_id,
+            Product.is_active == True
+        ).first()
+        
+        # Décrémenter la quantité source
+        old_source_qty = source_product.quantity
+        source_product.quantity -= quantity
+        source_product.available_quantity = max(0, source_product.quantity - source_product.reserved_quantity)
+        source_product.refresh_statuses()
+        
+        # Mouvement source (sortie)
+        movement_out = StockMovement(
+            tenant_id=tenant_id,
+            product_id=source_product.id,
+            pharmacy_id=source_product.pharmacy_id,
+            branch_id=from_branch_id,
+            quantity_before=old_source_qty,
+            quantity_after=source_product.quantity,
+            quantity_change=-quantity,
+            movement_type="branch_transfer_out",
+            reason=f"Transfert vers {to_branch.name}" + (f" - {reason}" if reason else ""),
+            created_by=current_user.id
+        )
+        db.add(movement_out)
+        
+        if target_product:
+            # Incrémenter la quantité destination
+            old_target_qty = target_product.quantity
+            target_product.quantity += quantity
+            target_product.available_quantity = max(0, target_product.quantity - target_product.reserved_quantity)
+            target_product.refresh_statuses()
+            
+            movement_in = StockMovement(
+                tenant_id=tenant_id,
+                product_id=target_product.id,
+                pharmacy_id=target_product.pharmacy_id,
+                branch_id=to_branch_id,
+                quantity_before=old_target_qty,
+                quantity_after=target_product.quantity,
+                quantity_change=quantity,
+                movement_type="branch_transfer_in",
+                reason=f"Transfert depuis {from_branch.name}" + (f" - {reason}" if reason else ""),
+                created_by=current_user.id
+            )
+            db.add(movement_in)
+        else:
+            # Créer un nouveau produit dans la destination
+            new_product = Product(
+                tenant_id=tenant_id,
+                pharmacy_id=from_branch.parent_pharmacy_id,
+                branch_id=to_branch_id,
+                name=source_product.name,
+                code=source_product.code,
+                barcode=source_product.barcode,
+                purchase_price=source_product.purchase_price,
+                selling_price=source_product.selling_price,
+                unit=source_product.unit,
+                category=source_product.category,
+                quantity=quantity,
+                available_quantity=quantity,
+                reserved_quantity=0,
+                expiry_date=source_product.expiry_date,
+                batch_number=source_product.batch_number,
+                is_active=True
+            )
+            new_product.refresh_statuses()
+            db.add(new_product)
+            db.flush()
+            
+            movement_in = StockMovement(
+                tenant_id=tenant_id,
+                product_id=new_product.id,
+                pharmacy_id=new_product.pharmacy_id,
+                branch_id=to_branch_id,
+                quantity_before=0,
+                quantity_after=quantity,
+                quantity_change=quantity,
+                movement_type="branch_transfer_in",
+                reason=f"Transfert depuis {from_branch.name}" + (f" - {reason}" if reason else ""),
+                created_by=current_user.id
+            )
+            db.add(movement_in)
+        
+        db.commit()
+        
+        logger.info(
+            f"Transfert entre branches: {quantity} x {source_product.name} de {from_branch.name} vers {to_branch.name} par {current_user.email}"
+        )
+        
+        return {
+            "message": "Transfert entre succursales effectué avec succès",
+            "product_name": source_product.name,
+            "quantity": quantity,
+            "from_branch": from_branch.name,
+            "to_branch": to_branch.name,
+            "source_remaining_stock": source_product.quantity
+        }
+        
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Erreur transfert entre branches")
+        raise HTTPException(status_code=400, detail=f"Erreur transfert entre branches: {exc}")

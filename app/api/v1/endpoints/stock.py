@@ -20,6 +20,7 @@ from app.models.stock_movement import StockMovement, InventoryCount, InventoryCo
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.models.pharmacy import Pharmacy
+from app.schemas.pharmacy import PharmacyConfig
 from app.models.sale import Sale, SaleItem
 from app.models.user_pharmacy import UserPharmacy
 from app.models.category import Category
@@ -409,7 +410,6 @@ def _base_product_query(db: Session, tenant_id: UUID, pharmacy_id: Optional[UUID
     
     return query
 
-
 def _ensure_pharmacy_in_tenant(current_tenant: Optional[Tenant], current_pharmacy: Optional[Pharmacy]) -> Pharmacy:
     """Vérifie que la pharmacie appartient bien au tenant courant."""
     if current_pharmacy is None:
@@ -458,10 +458,7 @@ def _check_permission(current_user: User, required_roles: List[str]) -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Accès non autorisé"
         )
-
-
-
-
+    
 # =======================
 # ROUTES POUR LES CATÉGORIES
 # =======================
@@ -721,8 +718,20 @@ async def list_products(
         pharmacy = _ensure_pharmacy_in_tenant(current_tenant, current_pharmacy)
         tenant_id = current_tenant.id if current_tenant else None
         
-        # Utiliser branch_id si fourni, sinon celui du contexte
-        effective_branch_id = branch_id or (current_branch.id if current_branch else None)
+        # Gestion des permissions par branche
+        is_admin = current_user.role in ["super_admin", "superadmin", "admin", "gerant"]
+        
+        if not is_admin:
+            # Les non-admins ne voient que leur propre branche
+            if branch_id and branch_id != current_user.active_branch_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Vous ne pouvez voir que le stock de votre branche"
+                )
+            effective_branch_id = current_user.active_branch_id
+        else:
+            # Les admins peuvent voir toutes les branches ou filtrer
+            effective_branch_id = branch_id or (current_branch.id if current_branch else None)
         
         query = _base_product_query(db, tenant_id, pharmacy.id, effective_branch_id)
         
@@ -730,7 +739,6 @@ async def list_products(
         if category_id:
             query = query.filter(Product.category_id == category_id)
         elif category:
-            # Legacy support
             query = query.filter(Product.category == category)
         
         if search:
@@ -808,9 +816,8 @@ async def list_products(
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("Erreur lors de la récupération des produits")
+        logger.exception("Erreur lors de la recuperation des produits")
         raise HTTPException(status_code=500, detail=f"Erreur interne du serveur: {exc}")
-
 
 @router.post("/", response_model=ProductResponse, summary="Créer un produit")
 async def create_product(
@@ -822,18 +829,30 @@ async def create_product(
     current_branch: Optional[Branch] = Depends(get_current_branch_entity),
     current_user: User = Depends(get_current_active_user)
 ):
-    """Crée un nouveau produit ou fusionne avec un existant."""
+    """Crée un nouveau produit."""
     try:
         _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant", "pharmacien"])
         
         pharmacy = _ensure_pharmacy_in_tenant(current_tenant, current_pharmacy)
         tenant_id = current_tenant.id if current_tenant else None
         
-        if product_data.pharmacy_id != pharmacy.id:
-            raise HTTPException(
-                status_code=403,
-                detail="La pharmacie du produit ne correspond pas à la pharmacie courante",
-            )
+        # Récupérer la configuration de la pharmacie
+        config = db.query(PharmacyConfig).filter(
+            PharmacyConfig.pharmacy_id == pharmacy.id,
+            PharmacyConfig.is_active == True
+        ).first()
+        
+        # Configuration des prix
+        calcul_auto_prix = product_data.calcul_auto_prix if product_data.calcul_auto_prix is not None else (
+            config.calcul_auto_prix if config else True
+        )
+        marge_par_defaut = product_data.marge_par_defaut if product_data.marge_par_defaut is not None else (
+            config.marge_par_defaut if config else 30.0
+        )
+        sales_type = product_data.sales_type or (config.sales_type if config else "both")
+        tva_rate = product_data.tva_rate if product_data.tva_rate is not None else (
+            config.taux_tva if config else 0.0
+        )
         
         # Vérifier si un produit avec le même code existe
         if product_data.code:
@@ -849,86 +868,7 @@ async def create_product(
                     detail=f"Un produit avec le code {product_data.code} existe déjà"
                 )
         
-        # Vérifier si un produit avec le même code-barres existe
-        if product_data.barcode:
-            existing_by_barcode = db.query(Product).filter(
-                Product.tenant_id == tenant_id,
-                Product.barcode == product_data.barcode,
-                Product.is_active == True
-            ).first()
-            
-            if existing_by_barcode:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Un produit avec le code-barres {product_data.barcode} existe déjà"
-                )
-        
-        # Fusion avec un produit existant (même nom, lot, date d'expiration)
-        existing_product = (
-            db.query(Product)
-            .filter(
-                Product.name == product_data.name,
-                Product.expiry_date == product_data.expiry_date,
-                Product.batch_number == product_data.batch_number,
-                Product.is_active.is_(True),
-            )
-        )
-        if tenant_id:
-            existing_product = existing_product.filter(Product.tenant_id == tenant_id)
-        if pharmacy:
-            existing_product = existing_product.filter(Product.pharmacy_id == pharmacy.id)
-        
-        existing_product = existing_product.first()
-        
-        if existing_product:
-            added_quantity = int(getattr(product_data, "quantity", 0) or 0)
-            current_quantity = int(getattr(existing_product, "quantity", 0) or 0)
-            
-            new_quantity = current_quantity + added_quantity
-            existing_product.quantity = new_quantity
-            existing_product.available_quantity = max(
-                0,
-                new_quantity - int(getattr(existing_product, "reserved_quantity", 0) or 0),
-            )
-            
-            if getattr(product_data, "purchase_price", None) is not None:
-                existing_product.purchase_price = product_data.purchase_price
-            
-            if getattr(product_data, "selling_price", None) is not None:
-                existing_product.selling_price = product_data.selling_price
-            
-            if getattr(product_data, "has_tva", None) is not None:
-                existing_product.has_tva = product_data.has_tva
-            
-            if getattr(product_data, "tva_rate", None) is not None:
-                existing_product.tva_rate = product_data.tva_rate
-            
-            existing_product.refresh_statuses()
-            
-            # Créer un mouvement de stock
-            movement = StockMovement(
-                tenant_id=tenant_id,
-                product_id=existing_product.id,
-                pharmacy_id=pharmacy.id,
-                branch_id=current_branch.id if current_branch else None,
-                quantity_before=current_quantity,
-                quantity_after=new_quantity,
-                quantity_change=added_quantity,
-                movement_type="purchase",
-                reason="Fusion avec produit existant",
-                created_by=current_user.id
-            )
-            db.add(movement)
-            
-            db.commit()
-            db.refresh(existing_product)
-            
-            return ProductResponse(
-                message="Produit existant mis à jour - quantités fusionnées",
-                product=_serialize_product(existing_product),
-            )
-        
-        # Création d'un nouveau produit
+        # Création du produit
         payload = product_data.model_dump(exclude_unset=True)
         if tenant_id:
             payload["tenant_id"] = tenant_id
@@ -941,14 +881,51 @@ async def create_product(
         
         product = Product(**payload)
         
-        # Calcul automatique des prix
-        calcul_auto_prix = bool(_tenant_get_config(current_tenant, "calcul_auto_prix", True))
-        marge_par_defaut = _to_float(_tenant_get_config(current_tenant, "marge_par_defaut", 30.0), 30.0)
-        has_tva = bool(getattr(product_data, "has_tva", False))
-        tva_rate = _to_float(_tenant_get_config(current_tenant, "taux_tva", 0.0), 0.0) if has_tva else 0.0
+        # Calcul des prix selon la configuration
+        if calcul_auto_prix and product_data.purchase_price > 0:
+            # Calcul automatique
+            if sales_type == "wholesale":
+                product.selling_price = product_data.selling_price_wholesale or 0
+                product.selling_price_wholesale = product.selling_price
+            elif sales_type == "retail":
+                product.selling_price = product_data.selling_price_retail or 0
+                product.selling_price_retail = product.selling_price
+            else:
+                product.selling_price = product_data.selling_price_retail or 0
+                product.selling_price_retail = product.selling_price
+                product.selling_price_wholesale = product_data.selling_price_wholesale or 0
+        else:
+            # Prix manuel
+            if sales_type == "wholesale":
+                product.selling_price = product_data.selling_price_wholesale or 0
+                product.selling_price_wholesale = product.selling_price
+            elif sales_type == "retail":
+                product.selling_price = product_data.selling_price_retail or 0
+                product.selling_price_retail = product.selling_price
+            else:
+                product.selling_price = product_data.selling_price_retail or 0
+                product.selling_price_retail = product.selling_price
+                product.selling_price_wholesale = product_data.selling_price_wholesale or 0
         
-        if calcul_auto_prix and (product.purchase_price > 0):
-            _safe_calculate_prices(product, marge_par_defaut, tva_rate)
+        # Appliquer l'arrondissement si activé
+        if config and config.rounding_enabled:
+            precision = config.rounding_precision or 0
+            method = config.rounding_method or "nearest"
+            
+            if method == "nearest":
+                product.selling_price = round(product.selling_price / precision) * precision if precision > 0 else product.selling_price
+                product.selling_price_wholesale = round(product.selling_price_wholesale / precision) * precision if precision > 0 else product.selling_price_wholesale
+                product.selling_price_retail = round(product.selling_price_retail / precision) * precision if precision > 0 else product.selling_price_retail
+            elif method == "up":
+                import math
+                product.selling_price = math.ceil(product.selling_price / precision) * precision if precision > 0 else product.selling_price
+                product.selling_price_wholesale = math.ceil(product.selling_price_wholesale / precision) * precision if precision > 0 else product.selling_price_wholesale
+                product.selling_price_retail = math.ceil(product.selling_price_retail / precision) * precision if precision > 0 else product.selling_price_retail
+            elif method == "down":
+                import math
+                product.selling_price = math.floor(product.selling_price / precision) * precision if precision > 0 else product.selling_price
+                product.selling_price_wholesale = math.floor(product.selling_price_wholesale / precision) * precision if precision > 0 else product.selling_price_wholesale
+                product.selling_price_retail = math.floor(product.selling_price_retail / precision) * precision if precision > 0 else product.selling_price_retail
         
         product.refresh_statuses()
         
@@ -974,14 +951,6 @@ async def create_product(
         db.commit()
         db.refresh(product)
         
-        logger.info(
-            "Produit créé: %s | tenant=%s | pharmacy=%s | user=%s",
-            getattr(product, "name", "N/A"),
-            str(tenant_id) if tenant_id else "None",
-            str(pharmacy.id) if pharmacy else "None",
-            getattr(current_user, "email", None),
-        )
-        
         return ProductResponse(
             message="Produit créé avec succès",
             product=_serialize_product(product),
@@ -994,7 +963,7 @@ async def create_product(
         db.rollback()
         logger.exception("Erreur création produit")
         raise HTTPException(status_code=400, detail=f"Erreur création produit: {exc}")
-
+    
 @router.get("/export", summary="Exporter le stock")
 async def export_stock(
     format: str = Query("excel", description="Format d'export: excel, csv, json"),
@@ -3269,4 +3238,407 @@ async def delete_product(
             "trash_id": str(trash_item.id),
             "auto_delete_at": trash_item.auto_delete_at.isoformat() if trash_item.auto_delete_at else None
         }
+
+@router.get("/by-branch/{branch_id}", summary="Stock par succursale")
+async def get_stock_by_branch(
+    branch_id: UUID,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    search: Optional[str] = None,
+    category_id: Optional[UUID] = None,
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Récupère le stock d'une succursale spécifique."""
+    try:
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        # Vérifier que la branche appartient au tenant
+        branch = db.query(Branch).filter(
+            Branch.id == branch_id,
+            Branch.tenant_id == tenant_id,
+            Branch.is_active == True
+        ).first()
+        
+        if not branch:
+            raise HTTPException(status_code=404, detail="Succursale non trouvée")
+        
+        query = db.query(Product).filter(
+            Product.tenant_id == tenant_id,
+            Product.branch_id == branch_id,
+            Product.is_active == True
+        )
+        
+        if search:
+            query = query.filter(
+                or_(
+                    Product.name.ilike(f"%{search}%"),
+                    Product.code.ilike(f"%{search}%"),
+                    Product.barcode.ilike(f"%{search}%")
+                )
+            )
+        
+        if category_id:
+            query = query.filter(Product.category_id == category_id)
+        
+        total = query.count()
+        products = query.offset(skip).limit(limit).all()
+        
+        # Récupérer la configuration pour la conversion
+        config = db.query(PharmacyConfig).filter(
+            PharmacyConfig.pharmacy_id == branch.parent_pharmacy_id,
+            PharmacyConfig.is_active == True
+        ).first()
+        
+        exchange_rate = config.exchange_rate if config and config.exchange_rate else 1.0
+        primary_currency = config.primary_currency if config else "CDF"
+        
+        stats = {
+            "total_products": total,
+            "total_quantity": sum(p.quantity or 0 for p in products),
+            "total_value_cdf": sum((p.selling_price or 0) * (p.quantity or 0) for p in products),
+            "total_value_usd": sum(((p.selling_price or 0) / exchange_rate) * (p.quantity or 0) for p in products),
+            "out_of_stock": len([p for p in products if p.stock_status == "out_of_stock"]),
+            "low_stock": len([p for p in products if p.stock_status == "low_stock"])
+        }
+        
+        return {
+            "branch": {
+                "id": str(branch.id),
+                "name": branch.name,
+                "code": branch.code,
+                "parent_pharmacy_id": str(branch.parent_pharmacy_id) if branch.parent_pharmacy_id else None
+            },
+            "exchange_rate": exchange_rate,
+            "primary_currency": primary_currency,
+            "stats": stats,
+            "total": total,
+            "skip": skip,
+            "limit": limit,
+            "products": [_serialize_product_with_conversion(p, exchange_rate, primary_currency) for p in products]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Erreur récupération stock par branche")
+        raise HTTPException(status_code=500, detail=f"Erreur interne du serveur: {exc}")
+
+
+def _serialize_product_with_conversion(product: Product, exchange_rate: float, primary_currency: str) -> Dict[str, Any]:
+    """Sérialise un produit avec conversion des prix."""
+    result = product.to_dict(include_details=False)
+    
+    if primary_currency == "CDF":
+        result["selling_price_cdf"] = result.get("selling_price", 0)
+        result["selling_price_usd"] = round(result.get("selling_price", 0) / exchange_rate, 2) if exchange_rate > 0 else 0
+    else:
+        result["selling_price_usd"] = result.get("selling_price", 0)
+        result["selling_price_cdf"] = round(result.get("selling_price", 0) * exchange_rate, 2)
+    
+    result["exchange_rate"] = exchange_rate
+    result["primary_currency"] = primary_currency
+    
+    return result
+        
+
+
+@router.get("/branches-stock-overview", summary="Vue d'ensemble du stock par branche")
+async def get_branches_stock_overview(
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Retourne une vue d'ensemble du stock pour toutes les branches de la pharmacie.
+    L'admin peut voir toutes les branches, les vendeurs seulement leur branche.
+    """
+    try:
+        _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant", "pharmacien", "vendeur"])
+        
+        pharmacy = _ensure_pharmacy_in_tenant(current_tenant, current_pharmacy)
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        # Récupérer les branches de la pharmacie
+        branches_query = db.query(Branch).filter(
+            Branch.tenant_id == tenant_id,
+            Branch.parent_pharmacy_id == pharmacy.id,
+            Branch.is_active == True
+        )
+        
+        # Si l'utilisateur n'est pas admin, filtrer par sa branche active
+        if current_user.role not in ["super_admin", "superadmin", "admin", "gerant"]:
+            branches_query = branches_query.filter(Branch.id == current_user.active_branch_id)
+        
+        branches = branches_query.all()
+        
+        result = []
+        total_overall = {
+            "total_products": 0,
+            "total_quantity": 0,
+            "total_value": 0,
+            "out_of_stock": 0,
+            "low_stock": 0,
+            "expired": 0,
+            "expiring_soon": 0
+        }
+        
+        for branch in branches:
+            # Récupérer les produits de la branche
+            products = db.query(Product).filter(
+                Product.tenant_id == tenant_id,
+                Product.pharmacy_id == pharmacy.id,
+                Product.branch_id == branch.id,
+                Product.is_active == True
+            ).all()
+            
+            branch_stats = {
+                "total_products": len(products),
+                "total_quantity": sum(p.quantity or 0 for p in products),
+                "total_purchase_value": sum((p.purchase_price or 0) * (p.quantity or 0) for p in products),
+                "total_selling_value": sum((p.selling_price or 0) * (p.quantity or 0) for p in products),
+                "out_of_stock": len([p for p in products if p.stock_status == "out_of_stock"]),
+                "low_stock": len([p for p in products if p.stock_status == "low_stock"]),
+                "expired": len([p for p in products if p.expiry_status == "expired"]),
+                "expiring_soon": len([p for p in products if p.expiry_status in ["critical", "warning"]])
+            }
+            
+            # Ajouter aux totaux globaux
+            total_overall["total_products"] += branch_stats["total_products"]
+            total_overall["total_quantity"] += branch_stats["total_quantity"]
+            total_overall["total_value"] += branch_stats["total_selling_value"]
+            total_overall["out_of_stock"] += branch_stats["out_of_stock"]
+            total_overall["low_stock"] += branch_stats["low_stock"]
+            total_overall["expired"] += branch_stats["expired"]
+            total_overall["expiring_soon"] += branch_stats["expiring_soon"]
+            
+            result.append({
+                "branch": {
+                    "id": str(branch.id),
+                    "name": branch.name,
+                    "code": branch.code,
+                    "is_main_branch": branch.is_main_branch
+                },
+                "stats": branch_stats,
+                "products": [_serialize_product(p) for p in products[:20]]  # Limite à 20 produits par branche
+            })
+        
+        return {
+            "pharmacy": {
+                "id": str(pharmacy.id),
+                "name": pharmacy.name
+            },
+            "total_branches": len(branches),
+            "total_overall": total_overall,
+            "branches": result
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Erreur récupération vue d'ensemble stock par branche")
+        raise HTTPException(status_code=500, detail=f"Erreur interne du serveur: {exc}")
+
+@router.get("/branch-stock-dashboard", summary="Tableau de bord stock par branche")
+async def get_branch_stock_dashboard(
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Tableau de bord comparatif du stock entre les branches.
+    """
+    try:
+        _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant"])
+        
+        pharmacy = _ensure_pharmacy_in_tenant(current_tenant, current_pharmacy)
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        # Récupérer toutes les branches
+        branches = db.query(Branch).filter(
+            Branch.tenant_id == tenant_id,
+            Branch.parent_pharmacy_id == pharmacy.id,
+            Branch.is_active == True
+        ).all()
+        
+        dashboard = {
+            "pharmacy": {
+                "id": str(pharmacy.id),
+                "name": pharmacy.name
+            },
+            "branches": [],
+            "comparison": {
+                "best_selling_branch": None,
+                "highest_value_branch": None,
+                "lowest_stock_branch": None
+            }
+        }
+        
+        branch_data = []
+        
+        for branch in branches:
+            # Statistiques de la branche
+            products = db.query(Product).filter(
+                Product.tenant_id == tenant_id,
+                Product.pharmacy_id == pharmacy.id,
+                Product.branch_id == branch.id,
+                Product.is_active == True
+            ).all()
+            
+            # Ventes des 30 derniers jours pour cette branche
+            thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+            sales_stats = db.query(
+                func.coalesce(func.sum(SaleItem.quantity), 0).label("total_sold"),
+                func.coalesce(func.sum(SaleItem.total), 0).label("total_revenue")
+            ).join(Sale).filter(
+                Sale.branch_id == branch.id,
+                Sale.status == "completed",
+                Sale.created_at >= thirty_days_ago
+            ).first()
+            
+            branch_info = {
+                "branch": {
+                    "id": str(branch.id),
+                    "name": branch.name,
+                    "code": branch.code
+                },
+                "stock_stats": {
+                    "total_products": len(products),
+                    "total_quantity": sum(p.quantity or 0 for p in products),
+                    "total_value": sum((p.selling_price or 0) * (p.quantity or 0) for p in products),
+                    "out_of_stock": len([p for p in products if p.stock_status == "out_of_stock"]),
+                    "low_stock": len([p for p in products if p.stock_status == "low_stock"])
+                },
+                "sales_stats": {
+                    "last_30_days_sold": int(sales_stats.total_sold or 0),
+                    "last_30_days_revenue": float(sales_stats.total_revenue or 0)
+                },
+                "turnover_rate": round(
+                    (sales_stats.total_sold or 0) / max(1, sum(p.quantity or 0 for p in products)), 
+                    2
+                )
+            }
+            
+            branch_data.append(branch_info)
+        
+        # Trouver les meilleures branches
+        if branch_data:
+            dashboard["comparison"]["highest_value_branch"] = max(
+                branch_data, 
+                key=lambda x: x["stock_stats"]["total_value"]
+            )["branch"]["name"]
+            
+            dashboard["comparison"]["best_selling_branch"] = max(
+                branch_data,
+                key=lambda x: x["sales_stats"]["last_30_days_revenue"]
+            )["branch"]["name"]
+            
+            dashboard["comparison"]["lowest_stock_branch"] = min(
+                branch_data,
+                key=lambda x: x["stock_stats"]["total_quantity"]
+            )["branch"]["name"]
+        
+        dashboard["branches"] = branch_data
+        
+        return dashboard
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Erreur récupération tableau de bord stock par branche")
+        raise HTTPException(status_code=500, detail=f"Erreur interne du serveur: {exc}")
+
+@router.get("/export-by-branch", summary="Exporter le stock par branche")
+async def export_stock_by_branch(
+    format: str = Query("excel", description="Format: excel, csv"),
+    branch_id: Optional[UUID] = Query(None, description="Filtrer par branche specifique"),
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Exporte le stock de toutes les branches ou d'une branche specifique.
+    """
+    try:
+        _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant"])
+        
+        pharmacy = _ensure_pharmacy_in_tenant(current_tenant, current_pharmacy)
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        # Recuperer les branches
+        branches_query = db.query(Branch).filter(
+            Branch.tenant_id == tenant_id,
+            Branch.parent_pharmacy_id == pharmacy.id,
+            Branch.is_active == True
+        )
+        
+        if branch_id:
+            branches_query = branches_query.filter(Branch.id == branch_id)
+        
+        branches = branches_query.all()
+        
+        # Preparer les donnees pour l'export
+        export_data = []
+        
+        for branch in branches:
+            products = db.query(Product).filter(
+                Product.tenant_id == tenant_id,
+                Product.pharmacy_id == pharmacy.id,
+                Product.branch_id == branch.id,
+                Product.is_active == True
+            ).all()
+            
+            for product in products:
+                export_data.append({
+                    "Branche": branch.name,
+                    "Code branche": branch.code,
+                    "Nom produit": product.name,
+                    "Code produit": product.code or "",
+                    "Code-barres": product.barcode or "",
+                    "Quantite": product.quantity or 0,
+                    "Prix d'achat": float(product.purchase_price or 0),
+                    "Prix de vente": float(product.selling_price or 0),
+                    "Valeur totale": float((product.selling_price or 0) * (product.quantity or 0)),
+                    "Date expiration": product.expiry_date.isoformat() if product.expiry_date else "",
+                    "Categorie": product.category or "",
+                    "Emplacement": product.location or "",
+                    "Statut stock": product.stock_status or "normal",
+                    "Statut expiration": product.expiry_status or "normal"
+                })
+        
+        # Exporter selon le format
+        import pandas as pd
+        import io
+        
+        df = pd.DataFrame(export_data)
+        
+        if format.lower() == "csv":
+            output = io.StringIO()
+            df.to_csv(output, index=False, encoding='utf-8-sig')
+            content = output.getvalue().encode('utf-8')
+            media_type = "text/csv"
+            filename = f"stock_par_branche_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        else:
+            output = io.BytesIO()
+            df.to_excel(output, index=False, engine="openpyxl")
+            content = output.getvalue()
+            media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            filename = f"stock_par_branche_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        
+        from fastapi.responses import Response
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Erreur export stock par branche")
+        raise HTTPException(status_code=500, detail=f"Erreur export: {exc}")
 

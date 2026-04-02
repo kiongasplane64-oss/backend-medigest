@@ -572,11 +572,10 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
                 "suggestion": "Vérifiez vos informations et réessayez"
             }
         )
-
     # =========================
     # 6. CRÉATION DE LA PHARMACIE PRINCIPALE
     # =========================
-    
+
     try:
         # Générer un numéro de licence par défaut
         license_number = f"LIC-{tenant_code}-{datetime.utcnow().strftime('%Y%m')}"
@@ -608,9 +607,70 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         db.add(pharmacy)
         db.flush()  # Pour obtenir l'ID
         
+        # =========================
+        # 6.1 CRÉATION DE LA BRANCHE PAR DÉFAUT
+        # =========================
+        
+        from app.models.pharmacy import Branch
+        import uuid
+        
+        # Générer un code de branche unique
+        branch_code = f"BR-{tenant_code}-001"
+        
+        # Créer la branche principale
+        default_branch = Branch(
+            id=uuid.uuid4(),
+            tenant_id=tenant.id,
+            parent_pharmacy_id=pharmacy.id,
+            name="Pharmacie Principale",
+            code=branch_code,
+            address=data.ville,
+            city=data.ville,
+            country=data.pays,
+            phone=data.telephone,
+            email=data.email.lower(),
+            is_active=True,
+            is_main_branch=True,
+            manager_id=admin.id,  # L'admin est le manager
+            manager_name=data.nom_complet,
+            created_by=admin.id,
+            config={
+                "workingHours": {
+                    "enabled": True,
+                    "startTime": "08:00",
+                    "endTime": "20:00",
+                    "timezone": "Africa/Kinshasa",
+                    "daysOff": {
+                        "monday": True,
+                        "tuesday": True,
+                        "wednesday": True,
+                        "thursday": True,
+                        "friday": True,
+                        "saturday": True,
+                        "sunday": False
+                    }
+                },
+                "marginConfig": {
+                    "defaultMargin": 30,
+                    "minMargin": 10,
+                    "maxMargin": 50
+                },
+                "automaticPricing": {
+                    "enabled": True,
+                    "method": "percentage",
+                    "value": 25
+                },
+                "inheritedFromParent": True
+            }
+        )
+        db.add(default_branch)
+        db.flush()
+        
+        logger.info(f"Branche principale créée: {default_branch.name}")
+
     except Exception as e:
         db.rollback()
-        logger.error(f"Erreur création pharmacie: {e}")
+        logger.error(f"Erreur création pharmacie/branche: {e}")
         raise HTTPException(
             status_code=500,
             detail={
@@ -623,15 +683,26 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
     # =========================
     # 7. ASSOCIATION ADMIN-PHARMACIE
     # =========================
-    
+
     try:
         association = UserPharmacy(
             user_id=admin.id,
             pharmacy_id=pharmacy.id,
             is_primary=True,
-            role_in_pharmacy="admin"
+            role_in_pharmacy="admin",
+            can_manage=True  # ⚠️ IMPORTANT: L'admin doit pouvoir gérer
         )
         db.add(association)
+        
+        # =========================
+        # 7.1 ASSOCIATION ADMIN À LA BRANCHE
+        # =========================
+        
+        # Définir la pharmacie et branche actives pour l'admin
+        admin.active_pharmacy_id = pharmacy.id
+        admin.active_branch_id = default_branch.id
+        
+        db.add(admin)
         
     except Exception as e:
         db.rollback()

@@ -50,8 +50,8 @@ class PharmacyLimits:
             "essentiel": {"max_pharmacies": 1, "max_branches_per_pharmacy": 0, "description": "1 pharmacie"},
             "starter": {"max_pharmacies": 1, "max_branches_per_pharmacy": 0, "description": "1 pharmacie"},
             "basic": {"max_pharmacies": 1, "max_branches_per_pharmacy": 0, "description": "1 pharmacie"},
-            "professionnel": {"max_pharmacies": 2, "max_branches_per_pharmacy": 1, "description": "2 pharmacies, 1 succursale"},
-            "professional": {"max_pharmacies": 2, "max_branches_per_pharmacy": 1, "description": "2 pharmacies, 1 succursale"},
+            "professionnel": {"max_pharmacies": 2, "max_branches_per_pharmacy": 3, "description": "2 pharmacies, 3 succursale"},
+            "professional": {"max_pharmacies": 2, "max_branches_per_pharmacy": 3, "description": "2 pharmacies, 3 succursale"},
             "entreprise": {"max_pharmacies": 10, "max_branches_per_pharmacy": 5, "description": "10 pharmacies, 5 succursales"},
             "enterprise": {"max_pharmacies": 10, "max_branches_per_pharmacy": 5, "description": "10 pharmacies, 5 succursales"},
             "premium": {"max_pharmacies": 10, "max_branches_per_pharmacy": 5, "description": "10 pharmacies, 5 succursales"},
@@ -745,11 +745,29 @@ def update_pharmacy_config(
             detail="Pharmacie non trouvée"
         )
     
+    # Récupérer la config actuelle
+    current_config = pharmacy.config or {}
+    
+    # ✅ CORRECTION : Fonction pour convertir les datetime en string
+    def convert_datetime_to_iso(obj):
+        """Convertit récursivement les datetime en chaînes ISO"""
+        if isinstance(obj, dict):
+            return {k: convert_datetime_to_iso(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_datetime_to_iso(item) for item in obj]
+        elif isinstance(obj, datetime):
+            return obj.isoformat()
+        else:
+            return obj
+    
+    # Vérifier si currencyMode est présent dans la requête
     if hasattr(config_in, 'currencyMode') and config_in.currencyMode:
         current_config["currencyMode"] = config_in.currencyMode
-        
-    current_config = pharmacy.config or {}
+    
     update_data = config_in.dict(exclude_unset=True, exclude_none=True)
+    
+    # Convertir les datetime dans update_data
+    update_data = convert_datetime_to_iso(update_data)
     
     def deep_merge(original, updates):
         for key, value in updates.items():
@@ -760,10 +778,15 @@ def update_pharmacy_config(
         return original
     
     updated_config = deep_merge(current_config.copy(), update_data)
+    
+    # ✅ CORRECTION : Toujours mettre updatedAt en string ISO
     updated_config["updatedAt"] = datetime.utcnow().isoformat()
     
+    # ✅ CORRECTION : Nettoyer la config entière des datetime
+    updated_config = convert_datetime_to_iso(updated_config)
+    
     pharmacy.config = updated_config
-    pharmacy.updated_at = datetime.utcnow()
+    pharmacy.updated_at = datetime.utcnow()  # Ce champ est une colonne datetime, c'est OK
     
     db.commit()
     db.refresh(pharmacy)
@@ -773,7 +796,6 @@ def update_pharmacy_config(
         "config": pharmacy.config,
         "updated_at": pharmacy.updated_at
     }
-
 
 @router.patch("/{pharmacy_id}/config/sales", response_model=dict)
 def update_sales_config(
