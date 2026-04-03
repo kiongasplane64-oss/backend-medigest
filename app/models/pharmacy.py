@@ -1,5 +1,5 @@
 # app/models/pharmacy.py
-from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, Text, JSON, Float
+from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, Text, JSON, Float, Integer
 from sqlalchemy.orm import relationship, Session, validates
 from datetime import datetime
 from app.db.base import Base
@@ -685,3 +685,32 @@ class Pharmacy(Base):
     
     def __str__(self):
         return f"{self.name} - {self.city}, {self.country}"
+
+
+class PharmacyConfig(Base):
+    __tablename__ = "pharmacy_configs"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    pharmacy_id = Column(UUID(as_uuid=True), ForeignKey("pharmacies.id", ondelete="CASCADE"), nullable=False)
+    is_active = Column(Boolean, default=True)
+    
+    # Configuration des prix
+    calcul_auto_prix = Column(Boolean, default=True)
+    marge_par_defaut = Column(Float, default=30.0)
+    sales_type = Column(String(20), default="both")
+    taux_tva = Column(Float, default=0.0)
+    
+    # Arrondissement
+    rounding_enabled = Column(Boolean, default=False)
+    rounding_precision = Column(Integer, default=0)
+    rounding_method = Column(String(20), default="nearest")
+    
+    # Devises
+    exchange_rate = Column(Float, default=1.0)
+    primary_currency = Column(String(3), default="CDF")
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relations
+    pharmacy = relationship("Pharmacy", backref="configs")

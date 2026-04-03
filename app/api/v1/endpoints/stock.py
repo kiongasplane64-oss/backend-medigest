@@ -20,7 +20,7 @@ from app.models.stock_movement import StockMovement, InventoryCount, InventoryCo
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.models.pharmacy import Pharmacy
-from app.schemas.pharmacy import PharmacyConfig
+from app.models.pharmacy import PharmacyConfig
 from app.models.sale import Sale, SaleItem
 from app.models.user_pharmacy import UserPharmacy
 from app.models.category import Category

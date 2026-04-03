@@ -38,7 +38,7 @@ from .refund import Refund
 from .debt import Debt
 from .debt_payment import DebtPayment
 from .payment import Payment
-
+from app.models.pharmacy import Pharmacy, PharmacyConfig
 from .transfert import ProductTransfer, TransferItem, TransferStatus, TransferType, TransferPriority
 from .stock_movement import StockMovement, InventoryCount, InventoryCountItem
 from app.models.stock_adjustment import StockAdjustment, StockAdjustmentItem
@@ -110,5 +110,6 @@ __all__ = [
     "CapitalTransaction",
     "Turnover",
     "UserHistory",
-    "TrashBin"
+    "TrashBin",
+    "PharmacyConfig"
 ]

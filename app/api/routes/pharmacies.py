@@ -387,7 +387,9 @@ def create_pharmacy(
             "branches": []
         },
         # Champs pour la configuration de vente
-        "salesType": "both",
+        "salesType": {
+            "type": "both"
+        },
         "calcul_auto_prix": True,
         "marge_par_defaut": 25,
         "taux_tva": 16,
@@ -748,9 +750,8 @@ def update_pharmacy_config(
     # Récupérer la config actuelle
     current_config = pharmacy.config or {}
     
-    # ✅ CORRECTION : Fonction pour convertir les datetime en string
+    # ✅ CORRECTION : Appliquer la conversion AVANT le merge
     def convert_datetime_to_iso(obj):
-        """Convertit récursivement les datetime en chaînes ISO"""
         if isinstance(obj, dict):
             return {k: convert_datetime_to_iso(v) for k, v in obj.items()}
         elif isinstance(obj, list):
@@ -760,15 +761,11 @@ def update_pharmacy_config(
         else:
             return obj
     
-    # Vérifier si currencyMode est présent dans la requête
-    if hasattr(config_in, 'currencyMode') and config_in.currencyMode:
-        current_config["currencyMode"] = config_in.currencyMode
-    
+    # Convertir les datetime dans update_data AVANT le merge
     update_data = config_in.dict(exclude_unset=True, exclude_none=True)
-    
-    # Convertir les datetime dans update_data
     update_data = convert_datetime_to_iso(update_data)
     
+    # Puis faire le merge
     def deep_merge(original, updates):
         for key, value in updates.items():
             if isinstance(value, dict) and key in original and isinstance(original[key], dict):
@@ -776,6 +773,26 @@ def update_pharmacy_config(
             else:
                 original[key] = value
         return original
+    
+    updated_config = deep_merge(current_config.copy(), update_data)
+    
+    # Mettre à jour la date
+    updated_config["updatedAt"] = datetime.utcnow().isoformat()
+    
+    # ✅ S'assurer qu'il n'y a plus aucun datetime
+    updated_config = convert_datetime_to_iso(updated_config)
+    
+    pharmacy.config = updated_config
+    pharmacy.updated_at = datetime.utcnow()
+    
+    db.commit()
+    db.refresh(pharmacy)
+    
+    return {
+        "pharmacy_id": pharmacy_id,
+        "config": pharmacy.config,
+        "updated_at": pharmacy.updated_at
+    }
     
     updated_config = deep_merge(current_config.copy(), update_data)
     
