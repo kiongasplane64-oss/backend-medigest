@@ -172,11 +172,17 @@ class ProductBase(BaseModel):
 # =========================================================
 # CRÉATION
 # =========================================================
-
 class ProductCreate(ProductBase):
     """Création d'un nouveau produit."""
 
     pharmacy_id: UUID = Field(..., description="Pharmacie propriétaire du produit")
+    
+    # Nouveaux champs pour la gestion des prix
+    calcul_auto_prix: Optional[bool] = Field(None, description="Calcul automatique des prix")
+    marge_par_defaut: Optional[float] = Field(None, ge=0, description="Marge par défaut (%)")
+    sales_type: Optional[str] = Field(None, pattern="^(retail|wholesale|both)$", description="Type de vente")
+    selling_price_retail: Optional[float] = Field(None, ge=0, description="Prix de vente détail")
+    selling_price_wholesale: Optional[float] = Field(None, ge=0, description="Prix de vente gros")
 
     @field_validator("expiry_date")
     @classmethod
@@ -194,7 +200,6 @@ class ProductCreate(ProductBase):
             raise ValueError("Le taux TVA doit être 0 si has_tva=False")
 
         return self
-
 
 # =========================================================
 # MISE À JOUR

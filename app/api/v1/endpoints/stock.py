@@ -842,17 +842,18 @@ async def create_product(
             PharmacyConfig.is_active == True
         ).first()
         
-        # Configuration des prix
-        calcul_auto_prix = product_data.calcul_auto_prix if product_data.calcul_auto_prix is not None else (
-            config.calcul_auto_prix if config else True
-        )
-        marge_par_defaut = product_data.marge_par_defaut if product_data.marge_par_defaut is not None else (
-            config.marge_par_defaut if config else 30.0
-        )
-        sales_type = product_data.sales_type or (config.sales_type if config else "both")
-        tva_rate = product_data.tva_rate if product_data.tva_rate is not None else (
-            config.taux_tva if config else 0.0
-        )
+        # Configuration des prix - utiliser getattr pour éviter les erreurs
+        calcul_auto_prix = getattr(product_data, 'calcul_auto_prix', None)
+        if calcul_auto_prix is None:
+            calcul_auto_prix = config.calcul_auto_prix if config else True
+        
+        marge_par_defaut = getattr(product_data, 'marge_par_defaut', None)
+        if marge_par_defaut is None:
+            marge_par_defaut = config.marge_par_defaut if config else 30.0
+        
+        sales_type = getattr(product_data, 'sales_type', None)
+        if sales_type is None:
+            sales_type = config.sales_type if config else "both"
         
         # Vérifier si un produit avec le même code existe
         if product_data.code:
@@ -868,64 +869,136 @@ async def create_product(
                     detail=f"Un produit avec le code {product_data.code} existe déjà"
                 )
         
-        # Création du produit
-        payload = product_data.model_dump(exclude_unset=True)
-        if tenant_id:
-            payload["tenant_id"] = tenant_id
-        if pharmacy:
-            payload["pharmacy_id"] = pharmacy.id
-        if current_branch:
-            payload["branch_id"] = current_branch.id
-        payload["available_quantity"] = int(getattr(product_data, "quantity", 0) or 0)
-        payload["reserved_quantity"] = 0
+        # =========================================================
+        # CONSTRUCTION DU PAYLOAD - NE PAS INCLURE calcul_auto_prix
+        # =========================================================
+        payload = {
+            "tenant_id": tenant_id,
+            "pharmacy_id": pharmacy.id,
+            "branch_id": current_branch.id if current_branch else None,
+            "code": product_data.code,
+            "barcode": product_data.barcode,
+            "name": product_data.name,
+            "commercial_name": product_data.commercial_name,
+            "description": product_data.description,
+            "active_ingredient": product_data.active_ingredient,
+            "dosage": product_data.dosage,
+            "galenic_form": product_data.galenic_form,
+            "laboratory": product_data.laboratory,
+            "dci": product_data.dci,
+            "category": product_data.category,
+            "subcategory": product_data.subcategory,
+            "therapeutic_class": product_data.therapeutic_class,
+            "product_type": product_data.product_type,
+            "quantity": product_data.quantity,
+            "unit": product_data.unit,
+            "alert_threshold": product_data.alert_threshold,
+            "minimum_stock": product_data.minimum_stock,
+            "maximum_stock": product_data.maximum_stock,
+            "purchase_price": product_data.purchase_price,
+            "wholesale_price": product_data.wholesale_price,
+            "has_tva": product_data.has_tva,
+            "tva_rate": product_data.tva_rate,
+            "expiry_date": product_data.expiry_date,
+            "batch_number": product_data.batch_number,
+            "authorization_number": product_data.authorization_number,
+            "packaging": product_data.packaging,
+            "prescription_required": product_data.prescription_required,
+            "regulatory_class": product_data.regulatory_class,
+            "main_supplier": product_data.main_supplier,
+            "location": product_data.location,
+            "image_url": product_data.image_url,
+            "leaflet_url": product_data.leaflet_url,
+            "notes": product_data.notes,
+            "meta_data": product_data.meta_data,
+            "available_quantity": product_data.quantity,
+            "reserved_quantity": 0,
+            "is_active": True,
+            "is_available": True
+        }
         
+        # Nettoyer les valeurs None (optionnel mais recommandé)
+        payload = {k: v for k, v in payload.items() if v is not None}
+        
+        # Créer l'objet Product
         product = Product(**payload)
         
-        # Calcul des prix selon la configuration
-        if calcul_auto_prix and product_data.purchase_price > 0:
-            # Calcul automatique
-            if sales_type == "wholesale":
-                product.selling_price = product_data.selling_price_wholesale or 0
-                product.selling_price_wholesale = product.selling_price
-            elif sales_type == "retail":
-                product.selling_price = product_data.selling_price_retail or 0
-                product.selling_price_retail = product.selling_price
-            else:
-                product.selling_price = product_data.selling_price_retail or 0
-                product.selling_price_retail = product.selling_price
-                product.selling_price_wholesale = product_data.selling_price_wholesale or 0
-        else:
-            # Prix manuel
-            if sales_type == "wholesale":
-                product.selling_price = product_data.selling_price_wholesale or 0
-                product.selling_price_wholesale = product.selling_price
-            elif sales_type == "retail":
-                product.selling_price = product_data.selling_price_retail or 0
-                product.selling_price_retail = product.selling_price
-            else:
-                product.selling_price = product_data.selling_price_retail or 0
-                product.selling_price_retail = product.selling_price
-                product.selling_price_wholesale = product_data.selling_price_wholesale or 0
+        # =========================================================
+        # GESTION DES PRIX
+        # =========================================================
         
-        # Appliquer l'arrondissement si activé
+        # Récupérer les prix spécifiques selon le type de vente
+        selling_price_retail = getattr(product_data, 'selling_price_retail', None)
+        selling_price_wholesale = getattr(product_data, 'selling_price_wholesale', None)
+        
+        if calcul_auto_prix and product_data.purchase_price > 0:
+            # Calcul automatique avec marge
+            from decimal import Decimal
+            margin_percent = Decimal(str(marge_par_defaut))
+            purchase_price = Decimal(str(product_data.purchase_price))
+            
+            # Prix de vente HT = Prix d'achat * (1 + marge%)
+            selling_price_ht = purchase_price * (Decimal('1') + (margin_percent / Decimal('100')))
+            
+            # Appliquer TVA si nécessaire
+            if product_data.has_tva:
+                tva = Decimal(str(product_data.tva_rate or 0))
+                calculated_price = selling_price_ht * (Decimal('1') + (tva / Decimal('100')))
+            else:
+                calculated_price = selling_price_ht
+            
+            # Assigner selon le type de vente
+            if sales_type == "wholesale":
+                product.selling_price = calculated_price
+                product.selling_price_wholesale = calculated_price
+                product.selling_price_retail = None
+            elif sales_type == "retail":
+                product.selling_price = calculated_price
+                product.selling_price_retail = calculated_price
+                product.selling_price_wholesale = None
+            else:  # both
+                product.selling_price = calculated_price
+                product.selling_price_retail = calculated_price
+                product.selling_price_wholesale = calculated_price
+        else:
+            # Utiliser les prix fournis
+            if sales_type == "wholesale":
+                product.selling_price = selling_price_wholesale or product_data.selling_price
+                product.selling_price_wholesale = product.selling_price
+            elif sales_type == "retail":
+                product.selling_price = selling_price_retail or product_data.selling_price
+                product.selling_price_retail = product.selling_price
+            else:  # both
+                product.selling_price = selling_price_retail or product_data.selling_price
+                product.selling_price_retail = product.selling_price
+                product.selling_price_wholesale = selling_price_wholesale or product_data.selling_price
+        
+        # Arrondissement si activé
         if config and config.rounding_enabled:
             precision = config.rounding_precision or 0
             method = config.rounding_method or "nearest"
             
-            if method == "nearest":
-                product.selling_price = round(product.selling_price / precision) * precision if precision > 0 else product.selling_price
-                product.selling_price_wholesale = round(product.selling_price_wholesale / precision) * precision if precision > 0 else product.selling_price_wholesale
-                product.selling_price_retail = round(product.selling_price_retail / precision) * precision if precision > 0 else product.selling_price_retail
-            elif method == "up":
-                import math
-                product.selling_price = math.ceil(product.selling_price / precision) * precision if precision > 0 else product.selling_price
-                product.selling_price_wholesale = math.ceil(product.selling_price_wholesale / precision) * precision if precision > 0 else product.selling_price_wholesale
-                product.selling_price_retail = math.ceil(product.selling_price_retail / precision) * precision if precision > 0 else product.selling_price_retail
-            elif method == "down":
-                import math
-                product.selling_price = math.floor(product.selling_price / precision) * precision if precision > 0 else product.selling_price
-                product.selling_price_wholesale = math.floor(product.selling_price_wholesale / precision) * precision if precision > 0 else product.selling_price_wholesale
-                product.selling_price_retail = math.floor(product.selling_price_retail / precision) * precision if precision > 0 else product.selling_price_retail
+            if precision > 0:
+                if method == "nearest":
+                    product.selling_price = round(product.selling_price / precision) * precision
+                    if product.selling_price_retail:
+                        product.selling_price_retail = round(product.selling_price_retail / precision) * precision
+                    if product.selling_price_wholesale:
+                        product.selling_price_wholesale = round(product.selling_price_wholesale / precision) * precision
+                elif method == "up":
+                    import math
+                    product.selling_price = math.ceil(product.selling_price / precision) * precision
+                    if product.selling_price_retail:
+                        product.selling_price_retail = math.ceil(product.selling_price_retail / precision) * precision
+                    if product.selling_price_wholesale:
+                        product.selling_price_wholesale = math.ceil(product.selling_price_wholesale / precision) * precision
+                elif method == "down":
+                    import math
+                    product.selling_price = math.floor(product.selling_price / precision) * precision
+                    if product.selling_price_retail:
+                        product.selling_price_retail = math.floor(product.selling_price_retail / precision) * precision
+                    if product.selling_price_wholesale:
+                        product.selling_price_wholesale = math.floor(product.selling_price_wholesale / precision) * precision
         
         product.refresh_statuses()
         
@@ -963,7 +1036,7 @@ async def create_product(
         db.rollback()
         logger.exception("Erreur création produit")
         raise HTTPException(status_code=400, detail=f"Erreur création produit: {exc}")
-    
+        
 @router.get("/export", summary="Exporter le stock")
 async def export_stock(
     format: str = Query("excel", description="Format d'export: excel, csv, json"),

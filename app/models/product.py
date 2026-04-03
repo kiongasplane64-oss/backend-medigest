@@ -104,6 +104,8 @@ class Product(Base):
     purchase_price = Column(Numeric(12, 2), nullable=False, default=0.00)
     selling_price = Column(Numeric(12, 2), nullable=False, default=0.00)
     wholesale_price = Column(Numeric(12, 2), nullable=True)
+    selling_price_retail = Column(Numeric(12, 2), nullable=True, comment="Prix de vente au détail")
+    selling_price_wholesale = Column(Numeric(12, 2), nullable=True, comment="Prix de vente en gros")
 
     tva_rate = Column(Numeric(5, 2), nullable=False, default=0.00, comment="Taux TVA en %")
     has_tva = Column(Boolean, nullable=False, default=False)
