@@ -5,13 +5,14 @@ API de gestion des ventes avec intégration complète du stock
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks
 from sqlalchemy.orm import Session, selectinload, joinedload
-from sqlalchemy import func, desc, and_, or_, distinct
+from sqlalchemy import func, desc, and_, or_, distinct, asc
 from typing import List, Optional, Dict, Any
 from uuid import UUID
 from datetime import datetime, date, timedelta
 import logging
 from decimal import Decimal
-
+from fastapi import status
+from http import HTTPStatus  
 from app.db.session import get_db
 from app.models.sale import Sale, SaleItem
 from app.models.product import Product, ProductStock
@@ -197,7 +198,7 @@ async def create_sale(
     allowed_roles = ["admin", "super_admin", "superadmin", "vendeur", "gerant", "caissier"]
     if current_user.role not in allowed_roles:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             detail=f"Rôle insuffisant pour créer une vente. Rôles autorisés: {allowed_roles}"
         )
     
@@ -513,7 +514,8 @@ async def create_sale(
         db.rollback()
         logger.error(f"Erreur création vente: {str(e)}", exc_info=True)
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             detail=f"Erreur création vente: {str(e)}"
         )
 
@@ -1108,7 +1110,320 @@ async def get_sales_stats(
             detail=f"Erreur récupération stats: {str(e)}"
         )
 
+# =======================
+# Endpoint: Liste des ventes (avec filtres et pagination)
+# =======================
 
+@router.get("/", response_model=SaleListResponse)
+async def get_sales(
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+    # Pagination
+    skip: int = Query(0, ge=0, description="Nombre d'éléments à sauter"),
+    limit: int = Query(100, ge=1, le=1000, description="Nombre d'éléments par page"),
+    # Filtres
+    start_date: Optional[datetime] = Query(None, description="Date de début"),
+    end_date: Optional[datetime] = Query(None, description="Date de fin"),
+    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
+    user_id: Optional[UUID] = Query(None, description="Filtrer par utilisateur (caissier)"),
+    payment_method: Optional[str] = Query(None, description="Filtrer par méthode de paiement"),
+    status: Optional[str] = Query(None, description="Filtrer par statut (completed, pending, cancelled)"),
+    client_id: Optional[UUID] = Query(None, description="Filtrer par client"),
+    search: Optional[str] = Query(None, description="Recherche par référence, client, vendeur"),
+    # Tri
+    sort_by: str = Query("created_at", description="Champ de tri (created_at, total_amount, reference)"),
+    sort_order: str = Query("desc", description="Ordre de tri (asc, desc)"),
+):
+    """
+    Récupère la liste des ventes avec filtres et pagination.
+    Accessible aux administrateurs et vendeurs (limité à leurs pharmacies).
+    """
+    try:
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        # Déterminer les pharmacies accessibles
+        if current_user.role in ["super_admin", "superadmin", "admin", "gerant"]:
+            if pharmacy_id:
+                # Vérifier que la pharmacie existe
+                pharmacy_check = db.query(Pharmacy).filter(Pharmacy.id == pharmacy_id).first()
+                if not pharmacy_check:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Pharmacie non trouvée"
+                    )
+                pharmacy_ids = [pharmacy_id]
+            else:
+                pharmacies_query = db.query(Pharmacy.id).filter(Pharmacy.is_active == True)
+                if tenant_id:
+                    pharmacies_query = pharmacies_query.filter(Pharmacy.tenant_id == tenant_id)
+                pharmacy_ids = [p.id for p in pharmacies_query.all()]
+        else:
+            # Vendeur, caissier - uniquement ses pharmacies
+            accessible_pharmacies = get_user_accessible_pharmacies(db, current_user.id, tenant_id)
+            if pharmacy_id:
+                if pharmacy_id not in accessible_pharmacies:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Accès non autorisé à cette pharmacie"
+                    )
+                pharmacy_ids = [pharmacy_id]
+            else:
+                pharmacy_ids = accessible_pharmacies
+        
+        if not pharmacy_ids:
+            return SaleListResponse(
+                total=0,
+                page=skip // limit + 1 if limit > 0 else 1,
+                page_size=limit,
+                data=[]
+            )
+        
+        # Construction de la requête de base
+        query = db.query(Sale).filter(
+            Sale.pharmacy_id.in_(pharmacy_ids),
+            Sale.status != "deleted"  # Exclure les ventes supprimées
+        )
+        
+        if tenant_id:
+            query = query.filter(Sale.tenant_id == tenant_id)
+        
+        # Filtres
+        if start_date:
+            query = query.filter(Sale.created_at >= start_date)
+        if end_date:
+            query = query.filter(Sale.created_at <= end_date)
+        
+        if user_id:
+            query = query.filter(Sale.created_by == user_id)
+        
+        if payment_method:
+            query = query.filter(Sale.payment_method == payment_method)
+        
+        if status:
+            query = query.filter(Sale.status == status)
+        
+        if client_id:
+            query = query.filter(Sale.client_id == client_id)
+        
+        if search:
+            search_term = f"%{search}%"
+            query = query.filter(
+                or_(
+                    Sale.reference.ilike(search_term),
+                    Sale.client_name.ilike(search_term),
+                    Sale.seller_name.ilike(search_term),
+                    Sale.invoice_number.ilike(search_term)
+                )
+            )
+        
+        # Compter le total avant pagination
+        total = query.count()
+        
+        # Appliquer le tri
+        sort_column = getattr(Sale, sort_by, Sale.created_at)
+        if sort_order.lower() == "desc":
+            query = query.order_by(desc(sort_column))
+        else:
+            query = query.order_by(asc(sort_column))
+        
+        # Pagination
+        sales = query.offset(skip).limit(limit).all()
+        
+        # Construire la réponse
+        sales_data = []
+        for sale in sales:
+            # Récupérer les items de la vente
+            items = db.query(SaleItem).filter(SaleItem.sale_id == sale.id).all()
+            
+            # Récupérer le nom de la pharmacie
+            pharmacy = db.query(Pharmacy).filter(Pharmacy.id == sale.pharmacy_id).first()
+            
+            sales_data.append(SaleInDB(
+                id=sale.id,
+                tenant_id=sale.tenant_id,
+                pharmacy_id=sale.pharmacy_id,
+                pharmacy_name=pharmacy.name if pharmacy else None,
+                reference=sale.reference,
+                client_id=sale.client_id,
+                client_name=sale.client_name,
+                client_phone=sale.client_phone,
+                created_by=sale.created_by,
+                seller_name=sale.seller_name,
+                created_at=sale.created_at,
+                updated_at=sale.updated_at,
+                payment_method=sale.payment_method,
+                reference_payment=sale.reference_payment,
+                payment_date=sale.payment_date,
+                is_credit=sale.is_credit,
+                credit_due_date=sale.credit_due_date,
+                guarantee_deposit=sale.guarantee_deposit,
+                guarantor_name=sale.guarantor_name,
+                guarantor_phone=sale.guarantor_phone,
+                global_discount=sale.global_discount,
+                notes=sale.notes,
+                subtotal=float(sale.subtotal) if sale.subtotal else 0,
+                total_discount=float(sale.total_discount) if sale.total_discount else 0,
+                total_tva=float(sale.total_tva) if sale.total_tva else 0,
+                total_amount=float(sale.total_amount) if sale.total_amount else 0,
+                status=sale.status,
+                validated_by=sale.validated_by,
+                validated_at=sale.validated_at,
+                cancelled_at=sale.cancelled_at,
+                cancelled_by=sale.cancelled_by,
+                cancel_reason=sale.cancel_reason,
+                invoice_number=sale.invoice_number,
+                receipt_path=sale.receipt_path,
+                invoice_path=getattr(sale, 'invoice_path', None),
+                items=[
+                    SaleItemResponse(
+                        id=item.id,
+                        sale_id=item.sale_id,
+                        tenant_id=item.tenant_id,
+                        pharmacy_id=item.pharmacy_id,
+                        created_at=item.created_at,
+                        product_id=item.product_id,
+                        product_name=item.product_name,
+                        product_code=item.product_code,
+                        quantity=float(item.quantity),
+                        unit_price=float(item.unit_price),
+                        discount_percent=float(item.discount_percent) if item.discount_percent else 0,
+                        discount_amount=float(item.discount_amount) if item.discount_amount else 0,
+                        tva_rate=float(item.tva_rate) if item.tva_rate else 0,
+                        tva_amount=float(item.tva_amount) if item.tva_amount else 0,
+                        subtotal=float(item.subtotal) if item.subtotal else 0,
+                        total=float(item.total) if item.total else 0,
+                        batch_number=item.batch_number,
+                        expiry_date=item.expiry_date
+                    )
+                    for item in items
+                ]
+            ))
+        
+        return SaleListResponse(
+            items=sales_data,
+            total=total,
+            page=skip // limit + 1 if limit > 0 else 1,
+            size=len(sales_data),
+            has_more=(skip + limit) < total,
+            page_size=limit
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur récupération liste des ventes: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur récupération des ventes: {str(e)}"
+        )
+
+
+@router.get("/{sale_id}", response_model=SaleDetailResponse)
+async def get_sale_by_id(
+    sale_id: UUID,
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+):
+    """
+    Récupère les détails d'une vente spécifique par son ID.
+    """
+    try:
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        # Récupérer la vente
+        query = db.query(Sale).filter(Sale.id == sale_id)
+        if tenant_id:
+            query = query.filter(Sale.tenant_id == tenant_id)
+        
+        sale = query.first()
+        
+        if not sale:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Vente non trouvée"
+            )
+        
+        # Vérifier l'accès à la pharmacie
+        if current_user.role not in ["super_admin", "superadmin", "admin", "gerant"]:
+            accessible_pharmacies = get_user_accessible_pharmacies(db, current_user.id, tenant_id)
+            if sale.pharmacy_id not in accessible_pharmacies:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Accès non autorisé à cette vente"
+                )
+        
+        # Récupérer les items
+        items = db.query(SaleItem).filter(SaleItem.sale_id == sale.id).all()
+        
+        # Récupérer la pharmacie
+        pharmacy = db.query(Pharmacy).filter(Pharmacy.id == sale.pharmacy_id).first()
+        
+        return SaleDetailResponse(
+            id=sale.id,
+            tenant_id=sale.tenant_id,
+            pharmacy_id=sale.pharmacy_id,
+            pharmacy_name=pharmacy.name if pharmacy else None,
+            reference=sale.reference,
+            client_id=sale.client_id,
+            client_name=sale.client_name,
+            client_phone=sale.client_phone,
+            created_by=sale.created_by,
+            seller_name=sale.seller_name,
+            created_at=sale.created_at,
+            updated_at=sale.updated_at,
+            payment_method=sale.payment_method,
+            reference_payment=sale.reference_payment,
+            payment_date=sale.payment_date,
+            is_credit=sale.is_credit,
+            credit_due_date=sale.credit_due_date,
+            guarantee_deposit=float(sale.guarantee_deposit) if sale.guarantee_deposit else 0,
+            guarantor_name=sale.guarantor_name,
+            guarantor_phone=sale.guarantor_phone,
+            global_discount=float(sale.global_discount) if sale.global_discount else 0,
+            notes=sale.notes,
+            subtotal=float(sale.subtotal) if sale.subtotal else 0,
+            total_discount=float(sale.total_discount) if sale.total_discount else 0,
+            total_tva=float(sale.total_tva) if sale.total_tva else 0,
+            total_amount=float(sale.total_amount) if sale.total_amount else 0,
+            status=sale.status,
+            validated_by=sale.validated_by,
+            validated_at=sale.validated_at,
+            cancelled_at=sale.cancelled_at,
+            cancelled_by=sale.cancelled_by,
+            cancel_reason=sale.cancel_reason,
+            invoice_number=sale.invoice_number,
+            receipt_path=sale.receipt_path,
+            items=[
+                SaleItemResponse(
+                    id=item.id,
+                    product_id=item.product_id,
+                    product_name=item.product_name,
+                    product_code=item.product_code,
+                    quantity=float(item.quantity),
+                    unit_price=float(item.unit_price),
+                    discount_percent=float(item.discount_percent) if item.discount_percent else 0,
+                    discount_amount=float(item.discount_amount) if item.discount_amount else 0,
+                    tva_rate=float(item.tva_rate) if item.tva_rate else 0,
+                    tva_amount=float(item.tva_amount) if item.tva_amount else 0,
+                    subtotal=float(item.subtotal) if item.subtotal else 0,
+                    total=float(item.total) if item.total else 0,
+                    batch_number=item.batch_number,
+                    expiry_date=item.expiry_date
+                )
+                for item in items
+            ]
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur récupération vente {sale_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur récupération de la vente: {str(e)}"
+        )
 # =======================
 # Endpoint: Statistiques par période
 # =======================

@@ -31,6 +31,7 @@ from app.api.v1.sync import router as sync_router
 from app.api.v1.dashboard import router as dashboard_router
 from app.api.v1.endpoints.transfers import router as transfers_router
 from app.api.v1.orders import router as orders_router
+from app.api.v1.capital import router as capital_router
 
 
 from app.core.startup import init_storage
@@ -244,6 +245,7 @@ app.include_router(sync_router, prefix="/api/v1", tags=["Synchronization"])
 include_router_auto(app, orders_router, tags=["orders"])
 include_router_auto(app, transfers_router, tags=["transfers"])
 include_router_auto(app, dashboard_router)
+include_router_auto(app, capital_router)
 
 
 

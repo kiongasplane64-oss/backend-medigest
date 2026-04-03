@@ -320,6 +320,7 @@ class SaleListResponse(BaseModel):
     size: int
     has_more: bool
     pharmacies_summary: Optional[Dict[str, Any]] = None
+    
 
 
 # ============================
