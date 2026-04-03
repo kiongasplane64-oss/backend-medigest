@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field, field_validator, ConfigDict
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from datetime import datetime
 import re
 from uuid import UUID
@@ -384,7 +384,7 @@ class PharmacyConfigUpdate(BaseModel):
     branchConfig: Optional[BranchConfig] = None
     
     # Nouveaux champs
-    salesType: Optional[SalesTypeConfig] = None
+    salesType: Optional[Union[str, Dict[str, str]]] = None
     expiredProducts: Optional[ExpiredProductsConfig] = None
     overtime: Optional[OvertimeConfig] = None
     sellByExchangeRate: Optional[bool] = None
@@ -402,6 +402,15 @@ class PharmacyConfigUpdate(BaseModel):
     language: Optional[str] = None
     
     model_config = ConfigDict(from_attributes=True)
+
+    @field_validator('salesType')
+    @classmethod
+    def validate_sales_type(cls, v):
+        """Accepte soit une chaîne, soit un objet avec 'type'"""
+        if isinstance(v, dict):
+            return v.get("type", "both")
+        return v
+
 
 
 # ============================================
