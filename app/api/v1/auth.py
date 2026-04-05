@@ -23,6 +23,7 @@ from app.core.security import (
 )
 from app.db.session import get_db
 from app.models.pharmacy import Pharmacy
+from app.models.branch import Branch
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.models.user_pharmacy import UserPharmacy
@@ -846,10 +847,10 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
             detail="Identifiants invalides"
         )
 
-    # Vérifier si c'est la première connexion (pour envoyer le SMS de bienvenue)
+    # Vérifier si c'est la première connexion
     is_first_login = user.last_login is None
     
-    # Si c'est la première connexion, envoyer un SMS de bienvenue
+    # Envoi SMS de bienvenue si première connexion
     if is_first_login and user.telephone:
         try:
             formatted_phone = format_phone_for_twilio(user.telephone)
@@ -871,6 +872,10 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
     pharmacies = []
     main_pharmacy = None
     subscription_active = False
+    
+    # Récupérer la branche principale par défaut
+    default_branch_id = None
+    default_branch_name = None
 
     if user.tenant_id:
         tenant = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
@@ -885,6 +890,28 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
                 (pharmacy for pharmacy in pharmacies if pharmacy.is_main),
                 pharmacies[0] if pharmacies else None
             )
+            
+            # Récupérer la branche principale par défaut si l'utilisateur n'en a pas
+            if main_pharmacy and not user.active_branch_id:
+                # Chercher la branche principale de la pharmacie
+                main_branch = db.query(Branch).filter(
+                    Branch.parent_pharmacy_id == main_pharmacy.id,
+                    Branch.is_main_branch == True,
+                    Branch.is_active == True
+                ).first()
+                
+                if main_branch:
+                    default_branch_id = str(main_branch.id)
+                    default_branch_name = main_branch.name
+                else:
+                    # Si pas de branche principale, prendre la première branche active
+                    first_branch = db.query(Branch).filter(
+                        Branch.parent_pharmacy_id == main_pharmacy.id,
+                        Branch.is_active == True
+                    ).first()
+                    if first_branch:
+                        default_branch_id = str(first_branch.id)
+                        default_branch_name = first_branch.name
 
             subscription_active = is_subscription_active(db, str(user.tenant_id))
 
@@ -923,6 +950,16 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
         pharmacy_id=str(main_pharmacy.id) if main_pharmacy else None
     )
 
+    # Déterminer l'ID de branche actif
+    active_branch_id = str(user.active_branch_id) if user.active_branch_id else default_branch_id
+    active_branch_name = None
+    
+    if active_branch_id:
+        branch = db.query(Branch).filter(Branch.id == active_branch_id).first()
+        active_branch_name = branch.name if branch else default_branch_name
+    else:
+        active_branch_name = default_branch_name or "Succursale principale"
+
     response_data = {
         **token_pair,
         "subscription_active": subscription_active,
@@ -934,7 +971,9 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
             "role": user.role,
             "tenant_id": str(user.tenant_id) if user.tenant_id else None,
             "actif": user.actif,
-            "telephone": user.telephone
+            "telephone": user.telephone,
+            "active_branch_id": active_branch_id,  # AJOUTÉ
+            "branch_name": active_branch_name        # AJOUTÉ
         },
         "tenant": tenant_data,
         "pharmacies": [
@@ -966,9 +1005,8 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
             "pharmacy_code": main_pharmacy.pharmacy_code
         }
 
-    logger.info(f"Login réussi pour: {email}")
+    logger.info(f"Login réussi pour: {email} (branche: {active_branch_name})")
     return response_data
-
 
 # =========================
 # ENDPOINTS RÉINITIALISATION MOT DE PASSE
