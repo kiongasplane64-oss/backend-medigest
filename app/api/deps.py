@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Callable
 from uuid import UUID
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, status, Header
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
@@ -22,11 +22,13 @@ from app.models.branch import Branch
 from app.models.pharmacy import Pharmacy
 from app.models.tenant import Tenant
 from app.models.user import User
+from app.models.user_pharmacy import UserPharmacy
 from app.services.subscription_service import (
     can_user_access_feature,
     check_tenant_limits,
     check_user_subscription,
 )
+
 
 oauth2_scheme = OAuth2PasswordBearer(
     tokenUrl="/api/v1/auth/login",
@@ -34,6 +36,88 @@ oauth2_scheme = OAuth2PasswordBearer(
 )
 
 logger = logging.getLogger(__name__)
+
+from fastapi import Header as FastAPIHeader
+
+# Ajoutez cette fonction utilitaire après les imports
+def _get_token_from_authorization_header(authorization: Optional[str]) -> Optional[str]:
+    """Extrait le token du header Authorization"""
+    if not authorization:
+        return None
+    if authorization.startswith("Bearer "):
+        return authorization[7:].strip()
+    return None
+
+# Modifiez la fonction get_current_user
+def get_current_user(
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+) -> User:
+    """
+    Récupère l'utilisateur courant à partir du token JWT dans le header Authorization.
+    """
+    # Extraire le token du header
+    token = _get_token_from_authorization_header(authorization)
+    
+    if not token:
+        logger.warning("❌ Aucun token trouvé dans le header Authorization")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated - Missing authorization header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        payload = security_verify_token(token)
+        
+        user_id: str = payload.get("sub")
+        if not user_id:
+            logger.error("❌ Payload invalide : champ 'sub' manquant")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token invalide : identifiant manquant",
+            )
+
+        user = db.query(User).filter(User.id == user_id).first()
+        
+        if not user:
+            logger.warning("❌ Utilisateur inexistant dans la DB : %s", user_id)
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Utilisateur non trouvé",
+            )
+
+        # Vérifier si l'utilisateur est actif
+        if not getattr(user, "actif", True):
+            logger.warning("⚠️ Tentative de connexion sur compte désactivé : %s", user.email)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Compte inactif",
+            )
+
+        # Ajouter les infos d'impersonnation si présentes
+        user.is_impersonated = bool(payload.get("is_impersonation", False))
+        user.impersonated_by = payload.get("impersonated_by")
+        user.jwt_payload = payload
+
+        logger.info("✅ Authentification réussie : %s (ID: %s)", user.email, user.id)
+        return user
+
+    except JWTError as e:
+        logger.warning("❌ Signature JWT invalide ou expirée : %s", str(e))
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expirée ou invalide",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.critical("🔥 Erreur système lors de l'authentification : %s", str(e), exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Erreur interne d'authentification",
+        )
 
 
 # =============================================================================
@@ -206,6 +290,7 @@ def get_current_active_user(
     """
     logger.info("🔐 Vérification utilisateur actif: %s", getattr(current_user, "email", None))
 
+    # Vérifier le verrouillage
     locked_until = getattr(current_user, "locked_until", None)
     if locked_until and locked_until > datetime.utcnow():
         remaining = int((locked_until - datetime.utcnow()).total_seconds() / 60)
@@ -215,7 +300,8 @@ def get_current_active_user(
             detail=f"Compte verrouillé. Réessayez dans {remaining} minutes.",
         )
 
-    if not getattr(current_user, "is_active", True):
+    # CORRECTION : utiliser 'actif' au lieu de 'is_active'
+    if not getattr(current_user, "actif", True):
         logger.warning("⚠️ Compte désactivé: %s", getattr(current_user, "email", None))
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -223,7 +309,6 @@ def get_current_active_user(
         )
 
     return current_user
-
 
 def get_optional_current_user(
     token: Optional[str] = Depends(oauth2_scheme),
@@ -1535,6 +1620,31 @@ def get_current_active_branch_dict(
         "config": branch.config or {},
     }
 
+def get_optional_token_user(
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db),
+) -> Optional[User]:
+    """
+    Retourne l'utilisateur si un token valide est fourni, sinon None.
+    Utile pour les endpoints qui supportent à la fois auth et non-auth.
+    """
+    token = _get_token_from_authorization_header(authorization)
+    if not token:
+        return None
+    
+    try:
+        payload = security_verify_token(token)
+        user_id = payload.get("sub")
+        if not user_id:
+            return None
+        
+        user = db.query(User).filter(User.id == user_id).first()
+        if user and getattr(user, "actif", True):
+            return user
+        return None
+    except Exception:
+        return None
+
 
 # =============================================================================
 # 8. EXPORTS
@@ -1572,4 +1682,6 @@ __all__ = [
     "get_current_active_branch",
     "get_current_active_pharmacy_dict",
     "get_current_active_branch_dict",
+    "get_optional_token_user",
+    "_get_token_from_authorization_header",
 ]

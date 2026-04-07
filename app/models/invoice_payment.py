@@ -10,7 +10,7 @@ from app.db.base import Base
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from .payment import Payment  # Import uniquement pour le type hinting
+    from .payment import Payment
 
 
 class InvoicePayment(Base):
@@ -25,7 +25,7 @@ class InvoicePayment(Base):
     invoice_id = Column(UUID(as_uuid=True), ForeignKey("invoices.id"), nullable=False)
     
     # Lien vers le paiement général (optionnel)
-    payment_id = Column(UUID(as_uuid=True), nullable=True)  # On met nullable=True pour éviter les dépendances circulaires
+    payment_id = Column(UUID(as_uuid=True), nullable=True)
     
     # Paiement
     amount = Column(DECIMAL(15, 2), nullable=False)

@@ -23,6 +23,7 @@ class Payment(Base):
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
     sale_id = Column(UUID(as_uuid=True), ForeignKey("sales.id"), nullable=True)
     invoice_id = Column(UUID(as_uuid=True), ForeignKey("invoices.id"), nullable=True)
+    invoice_payment_id = Column(UUID(as_uuid=True), ForeignKey("invoice_payments.id"), nullable=True)
 
     # =====================================
     # INFORMATIONS D'ABONNEMENT
@@ -41,7 +42,7 @@ class Payment(Base):
     payment_method = Column(
         String(30),
         nullable=False,
-        comment="cash, mobile_money, visa, bank_transfer, cheque, credit_note"
+        comment="cash, mobile_money, visa, mastercard, bank_transfer, cheque, credit_note"
     )
 
     # =====================================
@@ -58,7 +59,7 @@ class Payment(Base):
     # =====================================
     # STATUT
     # =====================================
-    status = Column(String(20), default="success")  # success, failed, pending, refunded
+    status = Column(String(20), default="success", comment="success, failed, pending, refunded, cancelled")
     
     # =====================================
     # INFORMATIONS MOBILE MONEY
@@ -85,9 +86,7 @@ class Payment(Base):
     tenant = relationship("Tenant", back_populates="payments")
     sale = relationship("Sale", back_populates="payments")
     invoice = relationship("Invoice", foreign_keys=[invoice_id])
-    
-    # Note: Nous ne pouvons pas référencer InvoicePayment ici car cela créerait une dépendance circulaire
-    # Cette relation sera définie de manière différente si nécessaire
+    invoice_payment = relationship("InvoicePayment", foreign_keys=[invoice_payment_id])
 
     # =====================================
     # PROPRIÉTÉS
@@ -140,6 +139,7 @@ class Payment(Base):
             'tenant_id': str(self.tenant_id),
             'sale_id': str(self.sale_id) if self.sale_id else None,
             'invoice_id': str(self.invoice_id) if self.invoice_id else None,
+            'invoice_payment_id': str(self.invoice_payment_id) if self.invoice_payment_id else None,
             
             # Abonnement
             'subscription_id': str(self.subscription_id) if self.subscription_id else None,

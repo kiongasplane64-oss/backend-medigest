@@ -4,7 +4,7 @@ import datetime
 import logging
 from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRouter
 from sqlalchemy import text
@@ -27,14 +27,13 @@ from app.api.v1.endpoints.stock import router as stock_router
 from app.api.v1 import users
 from app.api.v1.categories import router as categories_router
 from app.api.v1 import session
-from app.api.v1.sync import router as sync_router
 from app.api.v1.dashboard import router as dashboard_router
 from app.api.v1.endpoints.transfers import router as transfers_router
 from app.api.v1.orders import router as orders_router
 from app.api.v1.capital import router as capital_router
 
-
 from app.core.startup import init_storage
+
 # Routers admin / legacy
 from app.api.routes.pharmacies import router as pharmacies_router
 from app.api.routes.tenants import router as admin_tenants_router
@@ -70,12 +69,12 @@ app = FastAPI(
     redoc_url="/api/redoc",
 )
 
+
 @app.on_event("startup")
 async def startup_event():
     """Initialisation au démarrage"""
     logger.info("🚀 Démarrage de l'application...")
     
-    # Initialiser le stockage
     storage_ready = init_storage()
     if storage_ready:
         logger.info("✅ Stockage initialisé avec succès")
@@ -83,7 +82,6 @@ async def startup_event():
         logger.warning("⚠️ Problème d'initialisation du stockage")
     
     logger.info("✅ Application prête")
-
 
 
 # ============================================================================
@@ -126,14 +124,7 @@ def include_router_auto(
     default_prefix: Optional[str] = "/api/v1",
     tags: Optional[list[str]] = None,
 ) -> None:
-    """
-    Inclut un routeur sans casser ses routes existantes.
-
-    Règles :
-    - si le routeur commence déjà par /api/v1 -> on ne rajoute rien
-    - sinon si default_prefix est défini -> on le rajoute
-    - sinon on l'inclut tel quel
-    """
+    """Inclut un routeur sans casser ses routes existantes."""
     router_prefix = getattr(router, "prefix", "") or ""
 
     if router_prefix.startswith("/api/v1"):
@@ -145,17 +136,10 @@ def include_router_auto(
 
     if final_prefix:
         application.include_router(router, prefix=final_prefix, tags=tags)
-        logger.info(
-            "✅ Router inclus: prefix ajouté=%s | router.prefix=%s",
-            final_prefix,
-            router_prefix,
-        )
+        logger.info("✅ Router inclus: prefix ajouté=%s | router.prefix=%s", final_prefix, router_prefix)
     else:
         application.include_router(router, tags=tags)
-        logger.info(
-            "✅ Router inclus sans prefix ajouté | router.prefix=%s",
-            router_prefix,
-        )
+        logger.info("✅ Router inclus sans prefix ajouté | router.prefix=%s", router_prefix)
 
 
 # ============================================================================
@@ -187,43 +171,32 @@ def health_check():
 def debug_tables():
     with engine.connect() as conn:
         rows = conn.execute(
-            text(
-                """
+            text("""
                 SELECT tablename
                 FROM pg_tables
                 WHERE schemaname = 'public'
                 ORDER BY tablename;
-                """
-            )
+            """)
         ).fetchall()
-
     return {"tables": [row[0] for row in rows]}
 
 
 @app.get("/debug/routes", tags=["Debug"])
 def debug_routes():
     routes = []
-
     for route in app.routes:
         methods = sorted(list(route.methods)) if getattr(route, "methods", None) else []
-        routes.append(
-            {
-                "path": route.path,
-                "name": route.name,
-                "methods": methods,
-            }
-        )
-
+        routes.append({
+            "path": route.path,
+            "name": route.name,
+            "methods": methods,
+        })
     return {"routes": routes}
 
 
 # ============================================================================
 # ROUTERS API V1
 # ============================================================================
-
-# Ces routeurs seront inclus automatiquement :
-# - si le router a déjà prefix="/api/v1/..." => pas de doublon
-# - sinon => on ajoute "/api/v1"
 
 include_router_auto(app, tenant_router)
 include_router_auto(app, auth_router)
@@ -248,11 +221,9 @@ include_router_auto(app, dashboard_router)
 include_router_auto(app, capital_router)
 
 
-
 # ============================================================================
 # ROUTERS LEGACY / ADMIN
 # ============================================================================
 
-# Ceux-ci restent tels quels, sauf si tu veux aussi les normaliser plus tard.
 include_router_auto(app, pharmacies_router, default_prefix=None)
 include_router_auto(app, admin_tenants_router, default_prefix=None)

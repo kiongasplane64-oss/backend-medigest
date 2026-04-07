@@ -70,6 +70,7 @@ class Invoice(Base):
     # Relations
     pharmacy = relationship("Pharmacy", foreign_keys=[pharmacy_id])
     tenant = relationship("Tenant", foreign_keys=[tenant_id])
+    payments = relationship("InvoicePayment", back_populates="invoice", cascade="all, delete-orphan")
     
     def is_overdue(self) -> bool:
         return self.status != InvoiceStatus.PAID and self.due_date < datetime.utcnow()
@@ -78,3 +79,18 @@ class Invoice(Base):
         if not self.is_overdue():
             return 0
         return (datetime.utcnow() - self.due_date).days
+    
+    @property
+    def total_paid(self) -> float:
+        """Montant total payé pour cette facture"""
+        return sum(float(payment.amount) for payment in self.payments if payment.status == 'success')
+    
+    @property
+    def remaining_amount(self) -> float:
+        """Montant restant à payer"""
+        return self.total_amount - self.total_paid
+    
+    @property
+    def is_fully_paid(self) -> bool:
+        """Vérifie si la facture est entièrement payée"""
+        return self.remaining_amount <= 0 and self.status == InvoiceStatus.PAID
