@@ -23,7 +23,7 @@ from .client import Client
 from .product import Product, ProductStock
 from .sale import Sale
 
-from .invoice import Invoice, InvoiceItem
+from .invoice import Invoice
 from .invoice_payment import InvoicePayment
 
 from .purchase import Purchase, PurchaseItem, PurchasePayment
@@ -65,7 +65,6 @@ __all__ = [
     "Product",
     "Sale",
     "Invoice",
-    "InvoiceItem",
     "InvoicePayment",
     "InventoryCount",
     "InventoryCountItem",

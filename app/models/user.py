@@ -113,14 +113,18 @@ class User(Base):
         overlaps="payments_processed"
     )
 
-    tenant_subscription = relationship(
-        "Subscription", 
-        back_populates="user",
-        uselist=False,
-        foreign_keys="[Subscription.user_id]"
-    )
+    # ========== DÉPRÉCIÉ / À SUPPRIMER (abonnement tenant) ==========
+    # tenant_subscription = relationship(
+    #     "Subscription", 
+    #     back_populates="user",
+    #     uselist=False,
+    #     foreign_keys="[Subscription.user_id]"
+    # )
+    # ========== FIN DÉPRÉCIÉ ==========
 
-    user_subscription = relationship("UserSubscription", back_populates="user", uselist=False)
+    # ========== DÉPRÉCIÉ / À SUPPRIMER (abonnement utilisateur individuel) ==========
+    # user_subscription = relationship("UserSubscription", back_populates="user", uselist=False)
+    # ========== FIN DÉPRÉCIÉ ==========
 
     # =========================
     # Méthodes utilitaires
@@ -220,44 +224,136 @@ class User(Base):
     def update_last_login(self):
         self.last_login = datetime.utcnow()
     
-    def get_subscription_status(self):
-        """Retourne le statut complet de l'abonnement"""
-        if not self.subscription:
+    # ========== MÉTHODES MODIFIÉES (abonnement par branche) ==========
+    
+    def get_active_pharmacy_subscription_status(self, db_session=None):
+        """
+        Retourne le statut de l'abonnement de la pharmacie active de l'utilisateur.
+        Si aucune pharmacie active, retourne un statut inactif.
+        """
+        if not self.active_pharmacy_id:
             return {
                 "has_subscription": False,
                 "mode": "READ_ONLY",
-                "message": "Aucun abonnement trouvé"
+                "message": "Aucune pharmacie active sélectionnée"
             }
         
-        return {
-            "has_subscription": True,
-            "plan": self.subscription.plan_type,
-            "plan_name": self.subscription.plan_name,
-            "status": self.subscription.status,
-            "mode": self.subscription.get_mode(),
-            "is_active": self.subscription.is_active(),
-            "is_trial": self.subscription.is_trial(),
-            "days_remaining": self.subscription.days_remaining(),
-            "end_date": self.subscription.end_date.isoformat() if self.subscription.end_date else None,
-            "trial_end_date": self.subscription.trial_end_date.isoformat() if self.subscription.trial_end_date else None
-        }
-
+        if not db_session:
+            from app.db.session import SessionLocal
+            db_session = SessionLocal()
+            try:
+                return self._get_pharmacy_subscription_status(db_session)
+            finally:
+                db_session.close()
+        
+        return self._get_pharmacy_subscription_status(db_session)
+    
+    def _get_pharmacy_subscription_status(self, db_session):
+        """Méthode interne pour récupérer le statut d'abonnement d'une pharmacie"""
+        from app.services.pharmacy_subscription_service import check_pharmacy_subscription
+        
+        try:
+            result = check_pharmacy_subscription(
+                db_session, 
+                self.active_pharmacy_id, 
+                raise_if_inactive=False
+            )
+            
+            if not result.get("has_subscription") or not result.get("is_active"):
+                return {
+                    "has_subscription": False,
+                    "mode": "READ_ONLY",
+                    "message": "Abonnement de la pharmacie inactif ou expiré",
+                    "plan": result.get("plan"),
+                    "days_remaining": result.get("days_remaining", 0)
+                }
+            
+            return {
+                "has_subscription": True,
+                "mode": "FULL",
+                "plan": result.get("plan"),
+                "plan_name": result.get("plan_name"),
+                "is_active": True,
+                "days_remaining": result.get("days_remaining", 0),
+                "end_date": result.get("end_date"),
+                "max_products": result.get("max_products"),
+                "max_users": result.get("max_users"),
+                "is_unlimited_products": result.get("is_unlimited_products", False),
+                "is_unlimited_users": result.get("is_unlimited_users", False)
+            }
+        except Exception as e:
+            return {
+                "has_subscription": False,
+                "mode": "READ_ONLY",
+                "message": f"Erreur de vérification: {str(e)}"
+            }
+    
+    def get_subscription_mode(self, db_session=None) -> str:
+        """
+        Retourne le mode d'accès: "FULL" ou "READ_ONLY"
+        Basé sur l'abonnement de la pharmacie active.
+        """
+        status = self.get_active_pharmacy_subscription_status(db_session)
+        return status.get("mode", "READ_ONLY")
+    
+    def can_create_product(self, db_session=None) -> bool:
+        """
+        Vérifie si l'utilisateur peut créer un produit dans sa pharmacie active.
+        Basé sur l'abonnement de la pharmacie et les limites.
+        """
+        if not self.active_pharmacy_id:
+            return False
+        
+        from app.services.pharmacy_subscription_service import can_add_product
+        
+        if not db_session:
+            from app.db.session import SessionLocal
+            db_session = SessionLocal()
+            try:
+                return can_add_product(db_session, self.active_pharmacy_id)
+            finally:
+                db_session.close()
+        
+        return can_add_product(db_session, self.active_pharmacy_id)
+    
+    def can_add_user_to_pharmacy(self, db_session=None) -> bool:
+        """
+        Vérifie si l'admin peut ajouter un utilisateur à la pharmacie active.
+        """
+        if self.role != "admin":
+            return False
+        
+        if not self.active_pharmacy_id:
+            return False
+        
+        from app.services.pharmacy_subscription_service import can_add_user_to_pharmacy
+        
+        if not db_session:
+            from app.db.session import SessionLocal
+            db_session = SessionLocal()
+            try:
+                return can_add_user_to_pharmacy(db_session, self.active_pharmacy_id)
+            finally:
+                db_session.close()
+        
+        return can_add_user_to_pharmacy(db_session, self.active_pharmacy_id)
+    
     def can_create_pharmacy(self) -> bool:
-        """Vérifie si l'admin peut créer une nouvelle pharmacie"""
+        """
+        Vérifie si l'admin peut créer une nouvelle pharmacie.
+        Note: Dans la nouvelle architecture, le nombre de pharmacies est illimité,
+        donc toujours True pour les admins actifs.
+        """
         if self.role != "admin":
             return False
         
-        if not self.subscription or not self.subscription.is_active():
+        if not self.actif:
             return False
         
         return True
 
-    def can_add_user(self) -> bool:
-        """Vérifie si l'admin peut ajouter un nouvel utilisateur"""
-        if self.role != "admin":
-            return False
-        
-        if not self.subscription or not self.subscription.is_active():
-            return False
-        
-        return True
+    def can_add_user(self, db_session=None) -> bool:
+        """
+        Alias pour can_add_user_to_pharmacy (compatibilité)
+        """
+        return self.can_add_user_to_pharmacy(db_session)

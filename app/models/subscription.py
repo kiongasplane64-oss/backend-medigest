@@ -107,11 +107,7 @@ class Subscription(Base):
     
     # Relations
     tenant = relationship("Tenant", back_populates="subscriptions")
-    user = relationship(
-        "User", 
-        back_populates="tenant_subscription",  
-        foreign_keys=[user_id]
-    )
+    user = relationship("User", foreign_keys=[user_id])
     creator = relationship(
         "User", 
         foreign_keys=[created_by],

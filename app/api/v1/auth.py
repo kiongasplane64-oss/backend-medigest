@@ -6,7 +6,7 @@ import re
 import uuid
 from typing import Optional
 import os
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from pydantic import BaseModel, EmailStr, field_validator, model_validator
 from sqlalchemy.orm import Session
 from jose import jwt  
@@ -29,9 +29,11 @@ from app.models.user import User
 from app.models.user_pharmacy import UserPharmacy
 from app.models.payment import Payment
 from app.services.notification_service import send_sms, send_whatsapp, send_sms_with_fallback
-from app.services.subscription_service import check_subscription_status 
+from app.services.subscription_service import check_subscription_status
+from app.services.pharmacy_subscription_service import create_pharmacy_subscription
 from prometheus_client import Counter, Histogram
 from app.core.config import settings 
+
 
 login_attempts = Counter('login_attempts_total', 'Total login attempts')
 login_duration = Histogram('login_duration_seconds', 'Login duration')
@@ -445,9 +447,11 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
     plan_name = data.plan_name if data.plan_name else plan.capitalize()
 
     plan_limits = {
-        "starter": {"max_users": 2, "max_products": 500, "max_pharmacies": 1},
-        "professional": {"max_users": 10, "max_products": 0, "max_pharmacies": 3},
-        "enterprise": {"max_users": 0, "max_products": 0, "max_pharmacies": 0}
+        "trial": {"max_users": 5, "max_products": 2000, "max_pharmacies": 1},
+        "starter": {"max_users": 5, "max_products": 1500, "max_pharmacies": 1},
+        "professional": {"max_users": 20, "max_products": 3000, "max_pharmacies": 3},
+        "enterprise": {"max_users": 20, "max_products": 10000, "max_pharmacies": 0},
+        "infinite": {"max_users": 0, "max_products": 0, "max_pharmacies": 0}
     }
 
     if plan not in plan_limits:
@@ -507,39 +511,11 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         )
 
     # =========================
-    # 5. CRÉATION DE L'UTILISATEUR ADMIN
+    # 5. CRÉATION DE LA PHARMACIE PRINCIPALE
     # =========================
-    
-    try:
-        hashed_password = hash_password(data.password)
-        admin = User(
-            tenant_id=tenant.id,
-            nom_complet=data.nom_complet,
-            email=data.email.lower(),
-            password_hash=hashed_password,
-            role="admin",
-            actif=True,
-            telephone=data.telephone,
-            login_attempts=0,
-        )
-        db.add(admin)
-        db.flush()
-        
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Erreur création admin: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": "admin_creation_failed",
-                "message": "Erreur lors de la création du compte administrateur",
-                "suggestion": "Vérifiez vos informations et réessayez"
-            }
-        )
-    
-    # =========================
-    # 6. CRÉATION DE LA PHARMACIE PRINCIPALE
-    # =========================
+
+    pharmacy = None
+    default_branch = None
 
     try:
         license_number = f"LIC-{tenant_code}-{datetime.utcnow().strftime('%Y%m')}"
@@ -562,7 +538,7 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
                 "low_stock_threshold": 10,
                 "enable_barcode": True,
                 "tax_rate": 18.0,
-                "currency": "XOF",
+                "currency": "CDF",
                 "language": "fr",
                 "date_format": "dd/MM/yyyy",
                 "decimal_precision": 2
@@ -572,7 +548,7 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         db.flush()
         
         # CRÉATION DE LA BRANCHE PAR DÉFAUT
-        from app.models.pharmacy import Branch
+        from app.models.branch import Branch
         
         branch_code = f"BR-{tenant_code}-001"
         
@@ -589,9 +565,9 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
             email=data.email.lower(),
             is_active=True,
             is_main_branch=True,
-            manager_id=admin.id,
+            manager_id=None,
             manager_name=data.nom_complet,
-            created_by=admin.id,
+            created_by=None,
             config={
                 "workingHours": {
                     "enabled": True,
@@ -639,10 +615,29 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         )
 
     # =========================
-    # 7. ASSOCIATION ADMIN-PHARMACIE
+    # 6. CRÉATION DE L'UTILISATEUR ADMIN ET ASSOCIATION (UNE SEULE FOIS)
     # =========================
 
     try:
+        hashed_password = hash_password(data.password)
+        
+        # Créer l'utilisateur
+        admin = User(
+            tenant_id=tenant.id,
+            nom_complet=data.nom_complet,
+            email=data.email.lower(),
+            password_hash=hashed_password,
+            role="admin",
+            actif=True,
+            telephone=data.telephone,
+            login_attempts=0,
+            active_pharmacy_id=pharmacy.id,
+            active_branch_id=default_branch.id
+        )
+        db.add(admin)
+        db.flush()
+        
+        # Créer l'association user_pharmacy (UNE SEULE FOIS)
         association = UserPharmacy(
             user_id=admin.id,
             pharmacy_id=pharmacy.id,
@@ -651,73 +646,51 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
             can_manage=True
         )
         db.add(association)
+        db.flush()
         
-        admin.active_pharmacy_id = pharmacy.id
-        admin.active_branch_id = default_branch.id
-        db.add(admin)
+        # Mettre à jour la branche
+        default_branch.manager_id = admin.id
+        default_branch.created_by = admin.id
+        db.add(default_branch)
         
     except Exception as e:
         db.rollback()
-        logger.error(f"Erreur association admin-pharmacie: {e}")
+        logger.error(f"Erreur création admin/association: {e}")
         raise HTTPException(
             status_code=500,
             detail={
-                "error": "association_failed",
-                "message": "Erreur lors de l'association admin-pharmacie",
-                "suggestion": "Contactez le support technique"
+                "error": "admin_creation_failed",
+                "message": "Erreur lors de la création du compte administrateur",
+                "suggestion": "Vérifiez vos informations et réessayez"
             }
         )
-    
+
     # =========================
-    # 8. CRÉATION DE L'ABONNEMENT D'ESSAI
+    # 7. CRÉATION DE L'ABONNEMENT DE LA PHARMACIE
     # =========================
 
-    from app.services.subscription_service import create_trial_subscription
-    import inspect
+    from app.services.pharmacy_subscription_service import create_pharmacy_subscription
 
+    pharmacy_sub = None
     try:
-        sig = inspect.signature(create_trial_subscription)
-        params = sig.parameters
+        # Créer un abonnement d'essai pour la pharmacie principale
+        pharmacy_sub = create_pharmacy_subscription(
+            db=db,
+            pharmacy_id=pharmacy.id,
+            plan="trial",
+            billing_cycle="monthly",
+            custom_trial_days=14
+        )
         
-        kwargs = {
-            'db': db,
-            'user_id': admin.id,
-            'tenant_id': tenant.id
-        }
+        logger.info(f"Abonnement d'essai créé pour la pharmacie {pharmacy.id}")
         
-        if 'trial_days' in params:
-            kwargs['trial_days'] = 14
-        elif 'days' in params:
-            kwargs['days'] = 14
-        elif 'duration' in params:
-            kwargs['duration'] = 14
-        elif 'duration_days' in params:
-            kwargs['duration_days'] = 14
-        
-        trial_subscription = create_trial_subscription(**kwargs)
-        logger.info(f"Abonnement d'essai créé pour l'utilisateur {admin.id}")
-        
-    except TypeError as e:
-        db.rollback()
-        logger.error(f"Erreur de signature dans create_trial_subscription: {e}")
-        
-        try:
-            trial_subscription = create_trial_subscription(db, admin.id, tenant.id)
-        except Exception as e2:
-            db.rollback()
-            logger.error(f"Erreur création abonnement d'essai (second essai): {e2}")
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "error": "subscription_creation_failed",
-                    "message": "Erreur lors de la création de l'abonnement d'essai",
-                    "suggestion": "Contactez le support technique"
-                }
-            )
+        # Mettre à jour la pharmacie avec l'abonnement
+        pharmacy.subscription_id = pharmacy_sub.id
+        db.add(pharmacy)
         
     except Exception as e:
         db.rollback()
-        logger.error(f"Erreur création abonnement d'essai: {e}")
+        logger.error(f"Erreur création abonnement pharmacie: {e}")
         raise HTTPException(
             status_code=500,
             detail={
@@ -761,14 +734,14 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
             "pharmacy_id": str(pharmacy.id),
             "plan": "trial",
             "plan_name": "Essai gratuit",
-            "trial_end_date": trial_subscription.end_date.isoformat(),
+            "trial_end_date": pharmacy_sub.end_date.isoformat(),
             "trial_days": 14,
             "subscription": {
-                "id": str(trial_subscription.id),
-                "status": trial_subscription.status,
-                "days_remaining": trial_subscription.days_remaining(),
-                "is_trial": trial_subscription.is_trial(),
-                "mode": trial_subscription.get_mode()
+                "id": str(pharmacy_sub.id),
+                "status": pharmacy_sub.status,
+                "days_remaining": pharmacy_sub.days_remaining(),
+                "is_trial": pharmacy_sub.plan == "trial",
+                "mode": "FULL" if pharmacy_sub.is_active() else "READ_ONLY"
             },
             "limits": {
                 "max_users": limits["max_users"],
@@ -776,7 +749,7 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
                 "max_pharmacies": limits["max_pharmacies"]
             },
             "created_at": datetime.utcnow().isoformat(),
-            "trial_end_date": trial_subscription.end_date.isoformat()
+            "trial_end_date": pharmacy_sub.end_date.isoformat()
         },
         "next_steps": {
             "login": {
@@ -791,7 +764,7 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
                 "message": "Un SMS de bienvenue sera envoyé lors de votre première connexion",
                 "note": "Le SMS sera envoyé automatiquement après votre première connexion réussie"
             },
-            "trial_info": f"Vous bénéficiez de 14 jours d'essai gratuit jusqu'au {trial_subscription.end_date.strftime('%d/%m/%Y')}",
+            "trial_info": f"Vous bénéficiez de 14 jours d'essai gratuit jusqu'au {pharmacy_sub.end_date.strftime('%d/%m/%Y')}",
             "dashboard_access": "Connectez-vous pour accéder à votre tableau de bord"
         },
         "recommendations": [
@@ -803,7 +776,6 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
     }
     
     return response
-
 
 # =========================
 # ENDPOINTS DE CONNEXION (SANS OTP)
@@ -1151,10 +1123,21 @@ def check_availability(
 
 @router.post("/check-phone-exists")
 async def check_phone_exists(
-    phone: str,
+    request: Request,  # Ajouter pour récupérer les paramètres
     db: Session = Depends(get_db)
 ):
     """Vérifie si un numéro existe déjà"""
+    
+    # Récupérer le paramètre phone depuis le body ou query params
+    body = await request.json() if request.method == "POST" else {}
+    phone = body.get("phone") or request.query_params.get("phone")
+    
+    if not phone:
+        raise HTTPException(
+            status_code=400,
+            detail="Le paramètre phone est requis"
+        )
+    
     phone_clean = re.sub(r'\D', '', phone)
     
     tenant = db.query(Tenant).filter(
@@ -1189,7 +1172,6 @@ async def check_phone_exists(
             "Si ce n'est pas votre compte, utilisez un autre numéro"
         ]
     }
-
 
 # =========================
 # ENDPOINTS UTILISATEUR
@@ -1410,9 +1392,11 @@ def create_subscription_payment(
         tenant.current_plan = data.plan
         
         plan_limits = {
-            "starter": {"max_users": 2, "max_products": 500, "max_pharmacies": 1},
-            "professional": {"max_users": 10, "max_products": 0, "max_pharmacies": 3},
-            "enterprise": {"max_users": 0, "max_products": 0, "max_pharmacies": 0}
+            "trial": {"max_users": 5, "max_products": 2000, "max_pharmacies": 1},
+            "starter": {"max_users": 5, "max_products": 1500, "max_pharmacies": 1},
+            "professional": {"max_users": 20, "max_products": 3000, "max_pharmacies": 3},
+            "enterprise": {"max_users": 20, "max_products": 10000, "max_pharmacies": 0},
+            "infinite": {"max_users": 0, "max_products": 0, "max_pharmacies": 0}
         }
         
         limits = plan_limits.get(data.plan)

@@ -45,6 +45,15 @@ class Pharmacy(Base):
     # Pharmacien responsable (pour compatibilité)
     pharmacist_in_charge = Column(String(255), nullable=True)
     pharmacist_license = Column(String(100), nullable=True)
+
+    #abonnement
+    subscription_id = Column(UUID(as_uuid=True), ForeignKey("pharmacy_subscriptions.id", ondelete="SET NULL"), nullable=True)
+    subscription = relationship(
+        "PharmacySubscription", 
+        back_populates="pharmacy", 
+        uselist=False,
+        foreign_keys=[subscription_id]
+    )
     
     # =========================
     # CONFIGURATION COMPLÈTE (harmonisée avec les schémas)
@@ -414,6 +423,11 @@ class Pharmacy(Base):
             "next_service_time": next_service_time
         }
     
+    #gestion abonnement
+    def has_active_subscription(self, db: Session) -> bool:
+        if not self.subscription:
+            return False
+        return self.subscription.is_active()
     # =========================
     # Gestion des succursales
     # =========================
