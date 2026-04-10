@@ -909,6 +909,60 @@ async def manual_activate_subscription(
         )
 
 
+@router.post("/force-sync", response_model=Dict[str, Any])
+async def force_subscription_sync(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Point d'entrée spécial pour forcer la synchronisation de l'abonnement
+    depuis l'application mobile.
+    """
+    logger.info(f"Force sync subscription for {current_user.email}")
+    
+    if not current_user.active_pharmacy_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Aucune pharmacie active sélectionnée."
+        )
+    
+    pharmacy = db.query(Pharmacy).filter(Pharmacy.id == current_user.active_pharmacy_id).first()
+    if not pharmacy or not pharmacy.subscription:
+        return {
+            "success": True,
+            "has_subscription": False,
+            "is_active": False,
+            "message": "Aucun abonnement trouvé",
+            "force_sync": True,
+            "timestamp": utc_now_iso()
+        }
+    
+    subscription = pharmacy.subscription
+    is_active = subscription.is_active()
+    
+    return {
+        "success": True,
+        "has_subscription": True,
+        "is_active": is_active,
+        "access_mode": "full" if is_active else "read_only",
+        "force_sync": True,
+        "subscription": {
+            "plan": subscription.plan,
+            "plan_name": subscription.plan_name,
+            "end_date": subscription.end_date.isoformat() if subscription.end_date else None,
+            "days_remaining": subscription.days_remaining(),
+            "price": subscription.price,
+            "billing_cycle": subscription.billing_cycle
+        },
+        "limits": {
+            "max_products": subscription.max_products if subscription.max_products > 0 else "Illimité",
+            "max_users": subscription.max_users if subscription.max_users > 0 else "Illimité"
+        },
+        "message": "Synchronisation forcée réussie" if is_active else "Abonnement expiré - mode lecture seule",
+        "timestamp": utc_now_iso()
+    }
+
+
 # =============================================================================
 # ENDPOINTS TECHNIQUES
 # =============================================================================
