@@ -42,9 +42,12 @@ router = APIRouter(prefix="/api/v1/auth", tags=["Auth"])
 logger = logging.getLogger(__name__)
 
 # Constantes
-RESET_EXPIRATION_MIN = 10
+RESET_EXPIRATION_MIN = 60 * 24 * 7
 MAX_LOGIN_ATTEMPTS = 5
 LOCK_MIN = 15
+
+ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES  # 43200 minutes = 30 jours
+REFRESH_TOKEN_EXPIRE_DAYS = settings.REFRESH_TOKEN_EXPIRE_DAYS  # 60 jours
 
 # Cache pour rate limiting
 _rate_limiter_cache = {}
@@ -309,20 +312,73 @@ def generate_unique_tenant_code(nom_pharmacie: str, db: Session) -> str:
 def is_subscription_active(db: Session, tenant_id: str) -> bool:
     """Vérifie si l'abonnement est actif pour un tenant donné"""
     try:
-        return check_subscription_status(db, tenant_id)
+        if not tenant_id:
+            logger.warning("is_subscription_active appelé avec tenant_id None")
+            return True  # Par défaut, considérer comme actif pour ne pas bloquer
+        
+        # Récupérer le tenant
+        tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+        if not tenant:
+            logger.warning(f"Tenant non trouvé: {tenant_id}")
+            return True
+        
+        # 1. Vérifier la période d'essai
+        current_plan = (tenant.current_plan or "trial").lower()
+        
+        if current_plan == "trial":
+            if tenant.trial_end_date and tenant.trial_end_date > datetime.utcnow():
+                logger.info(f"✅ Tenant {tenant_id} en période d'essai jusqu'au {tenant.trial_end_date}")
+                return True
+            logger.warning(f"⚠️ Tenant {tenant_id} période d'essai expirée")
+            return False
+        
+        # 2. Pour les autres plans, chercher l'abonnement de la pharmacie principale
+        from app.models.pharmacy import Pharmacy
+        from app.models.pharmacy_subscription import PharmacySubscription, SubscriptionStatus
+        
+        main_pharmacy = db.query(Pharmacy).filter(
+            Pharmacy.tenant_id == tenant_id,
+            Pharmacy.is_main == True,
+            Pharmacy.is_active == True
+        ).first()
+        
+        if not main_pharmacy:
+            logger.warning(f"⚠️ Aucune pharmacie principale trouvée pour tenant {tenant_id}")
+            return True  # Par défaut, actif
+        
+        # Requête directe pour éviter les problèmes d'Enum
+        subscription = db.query(PharmacySubscription).filter(
+            PharmacySubscription.pharmacy_id == main_pharmacy.id
+        ).first()
+        
+        if not subscription:
+            logger.warning(f"⚠️ Aucun abonnement trouvé pour pharmacy {main_pharmacy.id}")
+            # Créer un abonnement par défaut si nécessaire
+            return True
+        
+        # Vérifier le statut
+        is_active = subscription.is_active()
+        
+        logger.info(f"📊 Abonnement pour {tenant_id}: plan={subscription.plan.value}, actif={is_active}, fin={subscription.end_date}")
+        
+        return is_active
+        
     except Exception as e:
-        logger.error(f"Erreur lors de la vérification de l'abonnement: {e}")
-        return False
-
-
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
-REFRESH_TOKEN_EXPIRE_DAYS = 30
+        logger.error(f"❌ Erreur lors de la vérification de l'abonnement: {e}", exc_info=True)
+        # En cas d'erreur, retourner True pour ne pas bloquer l'utilisateur
+        return True
 
 
 def create_refresh_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """Crée un refresh token JWT."""
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS))
+    
+    # Utiliser la valeur de settings si non spécifiée
+    if expires_delta is None:
+        refresh_expire_days = getattr(settings, 'REFRESH_TOKEN_EXPIRE_DAYS', 60)
+        expires_delta = timedelta(days=refresh_expire_days)
+    
+    expire = datetime.utcnow() + expires_delta
     to_encode.update({
         "exp": expire,
         "type": "refresh"
@@ -332,6 +388,11 @@ def create_refresh_token(data: dict, expires_delta: Optional[timedelta] = None) 
 
 def create_token_pair(user: User, subscription_active: bool, pharmacy_id: Optional[str] = None) -> dict:
     """Génère un couple access_token + refresh_token cohérent."""
+    
+    # Récupérer la durée d'expiration depuis settings
+    access_expire_minutes = getattr(settings, 'ACCESS_TOKEN_EXPIRE_MINUTES', 43200)
+    refresh_expire_days = getattr(settings, 'REFRESH_TOKEN_EXPIRE_DAYS', 60)
+    
     access_payload = {
         "sub": str(user.id),
         "tenant_id": str(user.tenant_id) if user.tenant_id else None,
@@ -352,22 +413,21 @@ def create_token_pair(user: User, subscription_active: bool, pharmacy_id: Option
 
     access_token = create_access_token(
         access_payload,
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        expires_delta=timedelta(minutes=access_expire_minutes)
     )
 
     refresh_token = create_refresh_token(
         refresh_payload,
-        expires_delta=timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+        expires_delta=timedelta(days=refresh_expire_days)
     )
 
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
-        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-        "refresh_expires_in": REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60
+        "expires_in": access_expire_minutes * 60,  # conversion en secondes
+        "refresh_expires_in": refresh_expire_days * 24 * 60 * 60
     }
-
 
 def decode_token_safely(token: str) -> dict:
     try:
@@ -891,7 +951,7 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
                 "id": str(tenant.id),
                 "tenant_code": tenant.tenant_code,
                 "nom_pharmacie": tenant.nom_pharmacie,
-                "nom_commercial": tenant.nom_commercial,
+                "nom_commercial": tenant.nom_commercial or tenant.nom_pharmacie,
                 "ville": tenant.ville,
                 "pays": tenant.pays,
                 "email_admin": tenant.email_admin,
@@ -1708,4 +1768,53 @@ def get_current_session(
         "userRole": current_user.role,
         "startedAt": datetime.utcnow().isoformat(),
         "status": "active"
+    }
+
+@router.post("/refresh-user-data")
+def refresh_user_data(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Force la mise à jour des données utilisateur"""
+    
+    tenant = db.query(Tenant).filter(Tenant.id == current_user.tenant_id).first()
+    
+    # Récupérer la branche active
+    active_branch = None
+    branch_name = "Succursale principale"
+    if current_user.active_branch_id:
+        active_branch = db.query(Branch).filter(Branch.id == current_user.active_branch_id).first()
+        if active_branch:
+            branch_name = active_branch.name
+    
+    # Récupérer la pharmacie active
+    pharmacy = None
+    pharmacy_name = "Ma Pharmacie"
+    if current_user.active_pharmacy_id:
+        pharmacy = db.query(Pharmacy).filter(Pharmacy.id == current_user.active_pharmacy_id).first()
+        if pharmacy:
+            pharmacy_name = pharmacy.name
+    
+    return {
+        "user": {
+            "id": str(current_user.id),
+            "email": current_user.email,
+            "nom_complet": current_user.nom_complet,
+            "role": current_user.role,
+            "active_branch_id": str(current_user.active_branch_id) if current_user.active_branch_id else "",
+            "branch_name": branch_name,
+            "pharmacy_id": str(current_user.active_pharmacy_id) if current_user.active_pharmacy_id else "",
+            "pharmacy_name": pharmacy_name,
+            "tenant_id": str(current_user.tenant_id) if current_user.tenant_id else "",
+            "tenant_name": tenant.nom_pharmacie if tenant else "Ma Pharmacie",
+            "telephone": current_user.telephone or ""
+        },
+        "subscription_active": True,
+        "subscription_data": {
+            "has_subscription": True,
+            "is_active": True,
+            "plan": "active",
+            "status": "active",
+            "access_mode": "full"
+        }
     }

@@ -225,5 +225,5 @@ include_router_auto(app, capital_router)
 # ROUTERS LEGACY / ADMIN
 # ============================================================================
 
-include_router_auto(app, pharmacies_router, default_prefix=None)
+app.include_router(pharmacies_router, prefix="/api/v1/pharmacies", tags=["Pharmacies"])
 include_router_auto(app, admin_tenants_router, default_prefix=None)

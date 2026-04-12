@@ -16,20 +16,23 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     API_V1_STR: str = "/api/v1"
     
-    # CORRECTION : Ajout de l'annotation de type ': str'
-    INITIAL_SETUP_KEY: str = os.getenv("INITIAL_SETUP_KEY", "MaCleSuperSecrete123!")
+    INITIAL_SETUP_KEY: str = "MaCleSuperSecrete123!"
     
     # =====================================
     # SÉCURITÉ JWT
     # =====================================
     SECRET_KEY: str = "azJ9HfksZRmhOGh5Q0qMOwK81hhoY7UWFFDrK5_Nevw"
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24h
-    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 43200  # 30 jours
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 60       # 60 jours
     
     # =====================================
-    # BASE DE DONNÉES
+    # BASE DE DONNÉES - Configuration directe
     # =====================================
+    # Support pour DATABASE_URL direct (Render.com)
+    DATABASE_URL_DIRECT: Optional[str] = os.getenv("DATABASE_URL", None)
+    
+    # Configuration PostgreSQL individuelle (fallback)
     POSTGRES_USER: str = os.getenv("POSTGRES_USER", "postgres")
     POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD", "postgres")
     POSTGRES_DB: str = os.getenv("POSTGRES_DB", "pharma_saas")
@@ -38,10 +41,39 @@ class Settings(BaseSettings):
     
     @property
     def DATABASE_URL(self) -> str:
-        return (
+        """
+        Retourne l'URL de la base de données avec SSL requis pour Render.com
+        """
+        # Priorité à DATABASE_URL si fourni (Render.com)
+        if self.DATABASE_URL_DIRECT:
+            url = self.DATABASE_URL_DIRECT
+            
+            # Pour Render.com, ajouter sslmode=require
+            if "render.com" in url:
+                # Vérifier si sslmode est déjà présent
+                if "sslmode" not in url.lower():
+                    separator = "?" if "?" not in url else "&"
+                    url = f"{url}{separator}sslmode=require"
+                logger.info(f"🔒 Connexion SSL activée pour Render.com")
+            
+            return url
+        
+        # Fallback sur la configuration individuelle
+        url = (
             f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@"
             f"{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
         )
+        
+        # Ajouter SSL pour Render.com même en configuration individuelle
+        if "render.com" in self.POSTGRES_HOST:
+            url = f"{url}?sslmode=require"
+        
+        return url
+    
+    @property
+    def ASYNC_DATABASE_URL(self) -> str:
+        """Version async de l'URL pour SQLAlchemy async"""
+        return self.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
     
     # =====================================
     # SQLALCHEMY CONFIGURATION
@@ -51,19 +83,35 @@ class Settings(BaseSettings):
     
     @property
     def SQLALCHEMY_ENGINE_OPTIONS(self) -> dict:
-        return {
+        """Options pour le moteur SQLAlchemy avec support SSL"""
+        options = {
             "pool_size": 10,
             "max_overflow": 20,
             "pool_timeout": 30,
             "pool_recycle": 1800,
             "pool_pre_ping": True,
-            "connect_args": {"client_encoding": "utf8", "connect_timeout": 10}
+            "connect_args": {
+                "client_encoding": "utf8",
+                "connect_timeout": 10
+            }
         }
+        
+        # Ajouter les paramètres SSL si nécessaire
+        if "render.com" in self.DATABASE_URL:
+            options["connect_args"]["sslmode"] = "require"
+        
+        return options
     
     # =====================================
     # CORS
     # =====================================
-    CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    CORS_ORIGINS: List[str] = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://*.render.com"
+    ]
     CORS_ALLOW_CREDENTIALS: bool = True
     CORS_ALLOW_METHODS: List[str] = ["*"]
     CORS_ALLOW_HEADERS: List[str] = ["*"]
@@ -118,15 +166,30 @@ class Settings(BaseSettings):
     # =====================================
     # RECEIPT CONFIGURATION
     # =====================================
-    GENERATE_RECEIPTS: bool = os.getenv("GENERATE_RECEIPTS", "true").lower() == "true"
+    GENERATE_RECEIPTS: bool = True
     
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",
         "case_sensitive": False,
-        "extra": "ignore" # Permet d'ignorer les variables en trop dans le .env sans planter
+        "extra": "ignore"
     }
 
 
 # Instance globale des paramètres
 settings = Settings()
+
+# Configuration du logging (après settings pour utiliser LOG_LEVEL)
+import logging
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
+    format=settings.LOG_FORMAT
+)
+logger = logging.getLogger(__name__)
+
+# Log de la configuration DB au démarrage (masquer les secrets)
+logger.info(f"🚀 {settings.APP_NAME} v{settings.APP_VERSION} démarré")
+logger.info(f"📊 Mode debug: {settings.DEBUG}")
+# Masquer le mot de passe dans les logs
+db_url_masked = settings.DATABASE_URL.replace(settings.POSTGRES_PASSWORD, "***") if settings.POSTGRES_PASSWORD in settings.DATABASE_URL else settings.DATABASE_URL
+logger.info(f"🗄️ Base de données: {db_url_masked[:100]}...")

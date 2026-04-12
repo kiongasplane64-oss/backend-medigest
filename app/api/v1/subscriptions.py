@@ -137,49 +137,107 @@ def get_current_pharmacy_subscription(db: Session, user: User) -> Optional[Pharm
     if not user.active_pharmacy_id:
         return None
     
-    pharmacy = db.query(Pharmacy).filter(Pharmacy.id == user.active_pharmacy_id).first()
-    if not pharmacy or not pharmacy.subscription:
-        return None
+    # REQUÊTE DIRECTE au lieu de pharmacy.subscription
+    from app.models.pharmacy_subscription import PharmacySubscription
     
-    return pharmacy.subscription
-
+    subscription = db.query(PharmacySubscription).filter(
+        PharmacySubscription.pharmacy_id == user.active_pharmacy_id
+    ).first()
+    
+    return subscription
 
 def get_pharmacy_limits(db: Session, user: User) -> Dict[str, Any]:
     """Récupère les limites de la pharmacie active."""
-    subscription = get_current_pharmacy_subscription(db, user)
     
-    if not subscription:
+    # Vérifier que user a une pharmacie active
+    if not user or not user.active_pharmacy_id:
         return {
             "has_subscription": False,
+            "is_active": False,
             "plan": "none",
             "plan_name": "Aucun",
             "max_products": 0,
             "max_users": 0,
-            "is_active": False,
             "is_unlimited_products": False,
-            "is_unlimited_users": False
+            "is_unlimited_users": False,
+            "access_mode": "read_only"
         }
     
-    is_active = subscription.is_active()
-    plan_config = get_plan_config(subscription.plan.value if hasattr(subscription.plan, 'value') else subscription.plan)
+    try:
+        # Récupérer la pharmacie
+        pharmacy = db.query(Pharmacy).filter(Pharmacy.id == user.active_pharmacy_id).first()
+        
+        if not pharmacy:
+            return {
+                "has_subscription": False,
+                "is_active": False,
+                "plan": "none",
+                "plan_name": "Aucun",
+                "max_products": 0,
+                "max_users": 0,
+                "is_unlimited_products": False,
+                "is_unlimited_users": False,
+                "access_mode": "read_only"
+            }
+        
+        # REQUÊTE DIRECTE - Éviter l'accès à pharmacy.subscription qui cause l'erreur d'Enum
+        from app.models.pharmacy_subscription import PharmacySubscription, SubscriptionStatus
+        
+        subscription = db.query(PharmacySubscription).filter(
+            PharmacySubscription.pharmacy_id == pharmacy.id
+        ).first()
+        
+        if not subscription:
+            return {
+                "has_subscription": False,
+                "is_active": False,
+                "plan": "none",
+                "plan_name": "Aucun",
+                "max_products": 0,
+                "max_users": 0,
+                "is_unlimited_products": False,
+                "is_unlimited_users": False,
+                "access_mode": "read_only"
+            }
+        
+        # Vérifier si l'abonnement est actif
+        is_active = subscription.status == SubscriptionStatus.ACTIVE and subscription.end_date > datetime.utcnow()
+        
+        # Récupérer le nom du plan en toute sécurité
+        plan_value = subscription.plan.value if hasattr(subscription.plan, 'value') else str(subscription.plan)
+        plan_config = get_plan_config(plan_value)
+        
+        return {
+            "has_subscription": True,
+            "is_active": is_active,
+            "plan": plan_value,
+            "plan_name": subscription.plan_name or plan_config.get("name", plan_value.capitalize()),
+            "max_products": subscription.max_products if subscription.max_products > 0 else 0,
+            "max_users": subscription.max_users if subscription.max_users > 0 else 0,
+            "is_unlimited_products": subscription.max_products == 0,
+            "is_unlimited_users": subscription.max_users == 0,
+            "price": subscription.price,
+            "billing_cycle": subscription.billing_cycle,
+            "end_date": subscription.end_date,
+            "days_remaining": subscription.days_remaining() if subscription.end_date else 0,
+            "features": plan_config.get("features", []),
+            "access_mode": "full" if is_active else "read_only"
+        }
+        
+    except Exception as e:
+        logger.error(f"Erreur dans get_pharmacy_limits: {e}", exc_info=True)
+        return {
+            "has_subscription": False,
+            "is_active": False,
+            "plan": "error",
+            "plan_name": "Erreur",
+            "max_products": 0,
+            "max_users": 0,
+            "is_unlimited_products": False,
+            "is_unlimited_users": False,
+            "access_mode": "read_only"
+        }
     
-    return {
-        "has_subscription": True,
-        "is_active": is_active,
-        "plan": subscription.plan,
-        "plan_name": subscription.plan_name,
-        "max_products": subscription.max_products,
-        "max_users": subscription.max_users,
-        "is_unlimited_products": subscription.max_products == 0,
-        "is_unlimited_users": subscription.max_users == 0,
-        "price": subscription.price,
-        "billing_cycle": subscription.billing_cycle,
-        "end_date": subscription.end_date,
-        "days_remaining": subscription.days_remaining(),
-        "features": plan_config.get("features", [])
-    }
-
-
 def get_current_usage(db: Session, user: User) -> Dict[str, Any]:
     """Récupère l'utilisation actuelle de la pharmacie active."""
     if not user.active_pharmacy_id:
@@ -769,9 +827,7 @@ async def get_subscriptions_overview(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_super_admin_user),
 ) -> Dict[str, Any]:
-    """
-    Vue d'ensemble des abonnements pour le super admin.
-    """
+    """Vue d'ensemble des abonnements pour le super admin."""
     logger.info("Vue d'ensemble abonnements demandée par %s", current_user.email)
     
     query = db.query(PharmacySubscription)
@@ -820,7 +876,6 @@ async def get_subscriptions_overview(
         "requested_at": utc_now_iso(),
         "filter": {"tenant_id": tenant_id} if tenant_id else None
     }
-
 
 @router.post("/admin/manual-activation", response_model=Dict[str, Any])
 async def manual_activate_subscription(
