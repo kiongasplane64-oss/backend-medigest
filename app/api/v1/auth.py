@@ -1576,6 +1576,150 @@ def verify_super_admin_key(data: dict, db: Session = Depends(get_db)):
     logger.warning(f"❌ Clé invalide: {key[:5]}...")
     return {"valid": False, "message": "Clé d'accès invalide"}
 
+# =========================
+# ENDPOINTS SUPER ADMIN LOGIN (TOKEN 100 ANS)
+# =========================
+@router.post("/super-admin/login")
+def super_admin_login(data: dict, db: Session = Depends(get_db)):
+    """Login super admin avec clé spéciale - Génère un token valable 100 ans"""
+    key = data.get("key", "")
+    
+    if not key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Clé d'accès requise"
+        )
+    
+    # Vérifier la clé depuis les variables d'environnement
+    master_key = os.getenv("SUPER_ADMIN_ACCESS_KEY")
+    create_key = os.getenv("SUPER_ADMIN_CREATE_KEY")
+    
+    is_valid = False
+    access_type = None
+    
+    if master_key and key == master_key:
+        is_valid = True
+        access_type = "full"
+        logger.info(f"✅ Authentification super admin avec clé maître")
+    
+    elif create_key and key == create_key:
+        is_valid = True
+        access_type = "setup"
+        logger.info(f"✅ Authentification super admin avec clé de création")
+    
+    if not is_valid:
+        logger.warning(f"❌ Tentative d'authentification super admin avec clé invalide")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Clé d'accès invalide"
+        )
+    
+    # Trouver ou créer un super_admin
+    super_admin = db.query(User).filter(
+        User.role == "super_admin",
+        User.actif == True
+    ).first()
+    
+    is_newly_created = False
+    permanent_password = None
+    
+    if not super_admin:
+        # Créer un super_admin permanent
+        import secrets
+        
+        permanent_email = "admin@medigest.com"
+        permanent_password = secrets.token_urlsafe(16)  # 16 caractères sécurisés
+        
+        # Vérifier si l'email existe déjà
+        existing_user = db.query(User).filter(User.email == permanent_email).first()
+        if existing_user:
+            # Si l'email existe mais n'est pas super_admin, le mettre à jour
+            if existing_user.role != "super_admin":
+                existing_user.role = "super_admin"
+                existing_user.actif = True
+                existing_user.password_hash = get_password_hash(permanent_password)
+                super_admin = existing_user
+                logger.info(f"✅ Utilisateur existant promu super_admin: {permanent_email}")
+            else:
+                super_admin = existing_user
+        else:
+            # Créer un nouveau super_admin
+            super_admin = User(
+                tenant_id=None,
+                email=permanent_email,
+                password_hash=get_password_hash(permanent_password),
+                nom_complet="System Administrator",
+                actif=True,
+                role="super_admin",
+                created_at=datetime.utcnow(),
+            )
+            db.add(super_admin)
+            logger.info(f"✅ Nouveau super_admin créé: {permanent_email}")
+        
+        db.commit()
+        db.refresh(super_admin)
+        is_newly_created = True
+        
+        logger.info(f"✅ Super admin configuré avec succès")
+    
+    # 100 ANS D'EXPIRATION (pratiquement illimité)
+    NEVER_EXPIRE_DAYS = 365 * 100  # 36,500 jours
+    
+    # Créer un access token avec expiration 100 ans
+    access_payload = {
+        "sub": str(super_admin.id),
+        "tenant_id": None,
+        "role": super_admin.role,
+        "email": super_admin.email,
+        "subscription_active": True,
+        "type": "access"
+    }
+    
+    long_lived_access = create_access_token(
+        access_payload,
+        expires_delta=timedelta(days=NEVER_EXPIRE_DAYS)
+    )
+    
+    # Créer un refresh token avec expiration 100 ans
+    refresh_payload = {
+        "sub": str(super_admin.id),
+        "tenant_id": None,
+        "role": super_admin.role,
+        "email": super_admin.email,
+        "type": "refresh"
+    }
+    
+    long_lived_refresh = create_refresh_token(
+        refresh_payload,
+        expires_delta=timedelta(days=NEVER_EXPIRE_DAYS)
+    )
+    
+    # Préparer la réponse
+    response_data = {
+        "access_token": long_lived_access,
+        "refresh_token": long_lived_refresh,
+        "token_type": "bearer",
+        "expires_in": NEVER_EXPIRE_DAYS * 24 * 60 * 60,  # en secondes
+        "refresh_expires_in": NEVER_EXPIRE_DAYS * 24 * 60 * 60,
+        "access_type": access_type,
+        "user": {
+            "id": str(super_admin.id),
+            "email": super_admin.email,
+            "nom_complet": super_admin.nom_complet,
+            "role": super_admin.role,
+            "is_newly_created": is_newly_created
+        }
+    }
+    
+    # Si nouveau compte créé, inclure le mot de passe temporaire
+    if is_newly_created and permanent_password:
+        response_data["temp_password"] = permanent_password
+        response_data["message"] = "Super admin créé automatiquement. Veuillez sauvegarder ce mot de passe temporaire !"
+        logger.info(f"⚠️ Nouveau super admin créé avec mot de passe temporaire")
+    
+    logger.info(f"✅ Token super admin généré (valide 100 ans) pour: {super_admin.email}")
+    
+    return response_data
 
 @router.post("/super-admin/setup", status_code=status.HTTP_201_CREATED)
 async def setup_super_admin(data: SuperAdminSetup, db: Session = Depends(get_db)):

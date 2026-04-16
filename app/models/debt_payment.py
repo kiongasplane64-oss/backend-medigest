@@ -27,7 +27,7 @@ class DebtPayment(Base):
     reference = Column(String(50), nullable=False, unique=True)
 
     # Liens
-    client_id = Column(UUID(as_uuid=True), ForeignKey("clients.id"), nullable=False)
+    customer_id = Column(UUID(as_uuid=True), ForeignKey("customers.id"), nullable=False)  # Changé: client_id -> customer_id
     debt_id = Column(UUID(as_uuid=True), ForeignKey("debts.id"), nullable=False)
     sale_id = Column(UUID(as_uuid=True), ForeignKey("sales.id"), nullable=True)
 
@@ -55,7 +55,6 @@ class DebtPayment(Base):
     )
     failure_reason = Column(Text)
 
-    # IMPORTANT: Utilisez 'processed_by' (pas 'received_by')
     processed_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
 
     notes = Column(Text)
@@ -65,17 +64,17 @@ class DebtPayment(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # =======================
-    # Relations (utilisez des chaînes pour éviter les imports circulaires)
+    # Relations
     # =======================
     tenant = relationship("Tenant")
-    client = relationship("Client", back_populates="debt_payments")
+    customer = relationship("Customer", back_populates="debt_payments")  # Changé: client -> customer
     debt = relationship("Debt", back_populates="payments")
     sale = relationship("Sale")
     processor = relationship("User", backref="payments_processed", overlaps="processed_debt_payments")
 
     __table_args__ = (
         Index("ix_debt_payments_tenant_date", "tenant_id", "created_at"),
-        Index("ix_debt_payments_client", "tenant_id", "client_id"),
+        Index("ix_debt_payments_customer", "tenant_id", "customer_id"),  # Changé: client -> customer
         Index("ix_debt_payments_reference", "reference"),
         Index("ix_debt_payments_debt", "tenant_id", "debt_id"),
         Index("ix_debt_payments_sale", "tenant_id", "sale_id"),

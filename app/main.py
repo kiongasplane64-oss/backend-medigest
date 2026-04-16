@@ -20,7 +20,7 @@ from app.api.v1.payments import router as payment_router
 from app.api.v1.superadmin import router as superadmin_router
 from app.api.v1.sync import router as sync_router
 from app.api.v1.sales import router as sales_router
-from app.api.v1.clients import router as clients_router
+from app.api.v1.customers import router as customers_router
 from app.api.v1.reports import router as reports_router
 from app.api.v1.payments_saas import router as saas_payments_router
 from app.api.v1.endpoints.stock import router as stock_router
@@ -205,7 +205,7 @@ include_router_auto(app, subscriptions_router)
 include_router_auto(app, payment_router)
 include_router_auto(app, sync_router)
 include_router_auto(app, sales_router)
-include_router_auto(app, clients_router)
+include_router_auto(app, customers_router)
 include_router_auto(app, reports_router)
 include_router_auto(app, saas_payments_router)
 include_router_auto(app, superadmin_router)

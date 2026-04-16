@@ -168,7 +168,7 @@ class Tenant(Base):
     capitals = relationship("Capital", back_populates="tenant")
     expenses = relationship("Expense", back_populates="tenant")
 
-    clients = relationship("Client", back_populates="tenant")
+    customers = relationship("Customer", back_populates="tenant")
     invoices = relationship("Invoice", back_populates="tenant", cascade="all, delete-orphan")
     invoice_payments = relationship("InvoicePayment", back_populates="tenant", cascade="all, delete-orphan")
 

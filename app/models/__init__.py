@@ -19,7 +19,6 @@ from .sync_log import SyncLog
 # =========================
 # Gestion / Business
 # =========================
-from .client import Client
 from .product import Product, ProductStock
 from .sale import Sale
 
@@ -61,7 +60,6 @@ __all__ = [
     "UserPharmacy",
     "SyncLog",
     # Business
-    "Client",
     "Product",
     "Sale",
     "Invoice",

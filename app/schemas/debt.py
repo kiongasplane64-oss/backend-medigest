@@ -18,7 +18,7 @@ class PaymentMethod(str, Enum):
     CHECK = "check"
 
 class DebtBase(BaseModel):
-    client_id: UUID
+    customer_id: UUID  # Changé: client_id -> customer_id
     total_amount: float = Field(..., gt=0)
     due_date: date
     description: Optional[str] = None
@@ -44,7 +44,7 @@ class DebtInDB(DebtBase):
     total_paid: float
     status: DebtStatus
     is_overdue: bool
-    client_name: str
+    customer_name: str  # Changé: client_name -> customer_name
     
     # Dates
     paid_at: Optional[datetime] = None
@@ -80,7 +80,7 @@ class DebtSummary(BaseModel):
     total_amount: float
     total_received: float
     total_overdue: float
-    total_clients: int
+    total_customers: int  # Changé: total_clients -> total_customers
     status_summary: Dict[str, Dict[str, Any]]
 
 class DebtAnalytics(BaseModel):

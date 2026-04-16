@@ -105,7 +105,7 @@ class Project(Base):
     # =====================================
     manager_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     department_id = Column(UUID(as_uuid=True), ForeignKey("departments.id"), nullable=True)
-    client_id = Column(UUID(as_uuid=True), ForeignKey("clients.id"), nullable=True)
+    customer_id = Column(UUID(as_uuid=True), ForeignKey("customers.id"), nullable=True)
     
     # =====================================
     # STATUT ET PRIORITÉ
@@ -176,7 +176,7 @@ class Project(Base):
     tenant = relationship("Tenant", back_populates="projects")
     manager = relationship("User", foreign_keys=[manager_id], back_populates="managed_projects")
     department = relationship("Department", back_populates="projects")
-    client = relationship("Client", back_populates="projects")
+    customer = relationship("Customer", back_populates="projects")
     team_members = relationship("ProjectMember", back_populates="project")
     tasks = relationship("ProjectTask", back_populates="project")
     milestones = relationship("ProjectMilestone", back_populates="project")
@@ -191,7 +191,7 @@ class Project(Base):
         Index('ix_projects_tenant_status', 'tenant_id', 'status'),
         Index('ix_projects_tenant_manager', 'tenant_id', 'manager_id'),
         Index('ix_projects_tenant_department', 'tenant_id', 'department_id'),
-        Index('ix_projects_tenant_client', 'tenant_id', 'client_id'),
+        Index('ix_projects_tenant_customer', 'tenant_id', 'customer_id'),
         Index('ix_projects_tenant_dates', 'tenant_id', 'start_date', 'end_date'),
         Index('ix_projects_tenant_priority', 'tenant_id', 'priority'),
         CheckConstraint('budget_allocated >= 0', name='check_budget_positive'),

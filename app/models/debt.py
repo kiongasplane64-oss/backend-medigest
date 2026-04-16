@@ -17,8 +17,8 @@ class Debt(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
     
-    # Client
-    client_id = Column(UUID(as_uuid=True), ForeignKey("clients.id"), nullable=False)
+    # Customer (anciennement client)
+    customer_id = Column(UUID(as_uuid=True), ForeignKey("customers.id"), nullable=False)
     
     # Vente associée
     sale_id = Column(UUID(as_uuid=True), ForeignKey("sales.id"), nullable=True)
@@ -54,7 +54,7 @@ class Debt(Base):
     # Relations
     # =======================
     tenant = relationship("Tenant")
-    client = relationship("Client", back_populates="debts")
+    customer = relationship("Customer", back_populates="debts")  # Changé: client -> customer
     sale = relationship("Sale", back_populates="debts")
     payments = relationship("DebtPayment", back_populates="debt")
     
@@ -62,7 +62,7 @@ class Debt(Base):
     # Indexes
     # =======================
     __table_args__ = (
-        Index("ix_debts_tenant_client", "tenant_id", "client_id"),
+        Index("ix_debts_tenant_customer", "tenant_id", "customer_id"),  # Changé: client -> customer
         Index("ix_debts_tenant_status", "tenant_id", "status"),
         Index("ix_debts_tenant_due_date", "tenant_id", "due_date"),
         Index("ix_debts_tenant_sale", "tenant_id", "sale_id"),
@@ -135,4 +135,4 @@ class Debt(Base):
         return self
     
     def __repr__(self):
-        return f"<Debt Client:{self.client_id} Amount:{self.remaining_amount}/{self.initial_amount} Status:{self.status}>"
+        return f"<Debt Customer:{self.customer_id} Amount:{self.remaining_amount}/{self.initial_amount} Status:{self.status}>"  # Changé: client -> customer

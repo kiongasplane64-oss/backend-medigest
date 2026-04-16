@@ -19,7 +19,7 @@ def create_all_tables():
         # Importez TOUS les modèles pour qu'ils soient enregistrés
         # Utilisez le fichier __init__.py des modèles
         from app.models import (
-            Tenant, User, Client, Cost, Budget, Supplier,
+            Tenant, User, Customer, Cost, Budget, Supplier,
             Invoice, InvoiceItem, InvoicePayment,
             PhysicalInventory, InventoryItem, InventorySchedule,
             Debt, DebtPayment,
