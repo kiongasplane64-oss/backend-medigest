@@ -6,7 +6,7 @@ from fastapi import APIRouter
 
 from app.api.v1 import auth, users, tenants, superadmin, subscriptions, orders
 from .sales import router as sales_router
-from .clients import router as clients_router
+from .customers import router as customers_router
 from app.api.v1.endpoints.stock import router as stock_router 
 from app.api.v1.subscription_codes import router as subscription_codes_router
 from app.api.v1 import sales, categories
@@ -25,7 +25,7 @@ api_router.include_router(tenants.router)
 api_router.include_router(superadmin.router)
 api_router.include_router(subscriptions.router)
 api_router.include_router(sales_router)
-api_router.include_router(clients_router)
+api_router.include_router(customers_router)
 api_router.include_router(stock_router)
 api_router.include_router(subscription_codes_router)
 api_router.include_router(auth.router, prefix="/auth", tags=["Authentication"])
