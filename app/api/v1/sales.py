@@ -16,7 +16,7 @@ from http import HTTPStatus
 from app.db.session import get_db
 from app.models.sale import Sale, SaleItem
 from app.models.product import Product, ProductStock
-from app.models.client import Client
+from app.models.customer import Customer
 from app.models.user import User
 from app.models.pharmacy import Pharmacy
 from app.models.user_pharmacy import UserPharmacy
@@ -30,7 +30,7 @@ from app.schemas.sale import (
     SaleExportResponse, UserPharmacyAccess, SaleValidationRequest, 
     SaleItemResponse, SaleImpactResponse, PeriodStatsResponse
 )
-from app.schemas.client import ClientCreate, ClientInDB
+from app.schemas.customer import CustomerCreate, CustomerInDB
 from app.api.deps import (
     get_current_tenant, 
     get_current_user, 
@@ -261,10 +261,10 @@ async def create_sale(
         # Vérification client
         client = None
         if sale_data.client_id:
-            client = db.query(Client).filter(
-                Client.id == sale_data.client_id,
-                Client.tenant_id == tenant_id,
-                Client.is_active == True
+            client = db.query(Customer).filter(
+                Customer.id == sale_data.customer_id,
+                Customer.tenant_id == tenant_id,
+                Customer.is_active == True
             ).first()
             
             if not client:
