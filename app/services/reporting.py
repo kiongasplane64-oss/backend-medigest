@@ -10,7 +10,7 @@ from sqlalchemy import func, desc
 from app.models.sale import Sale, SaleItem
 from app.models.product import Product
 from app.models.stock_movement import StockMovement
-from app.models.client import Client
+from app.models.customer import Customer
 # Supprimer l'import de Purchase qui n'existe pas encore
 # from app.models.purchase import Purchase  # Supprimé
 from app.models.tenant import Tenant

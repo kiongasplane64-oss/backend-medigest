@@ -10,7 +10,7 @@ from fastapi import BackgroundTasks
 from app.tasks.debts import send_debt_reminders_task  
 from app.db.session import get_db
 from app.models.debt import Debt, DebtPayment
-from app.models.client import Client
+from app.models.customer import Customer
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.schemas.debt import (
@@ -242,14 +242,14 @@ def get_debt_analytics(
     
     # Clients avec les plus grandes dettes
     top_debtors = db.query(
-        Client,
+        Customer,
         func.sum(Debt.remaining_amount).label('total_debt')
     ).join(
-        Debt, Client.id == Debt.client_id
+        Debt, Customer.id == Debt.client_id
     ).filter(
         Debt.tenant_id == current_tenant.id,
         Debt.remaining_amount > 0
-    ).group_by(Client.id).order_by(
+    ).group_by(Customer.id).order_by(
         func.sum(Debt.remaining_amount).desc()
     ).limit(limit).all()
     
@@ -283,7 +283,7 @@ def send_debt_reminders(
     today = date.today()
     
     # Trouver les dettes en retard
-    overdue_debts = db.query(Debt).join(Client).filter(
+    overdue_debts = db.query(Debt).join(Customer).filter(
         Debt.tenant_id == current_tenant.id,
         Debt.due_date < today,
         Debt.remaining_amount > 0,

@@ -43,7 +43,7 @@ def init_db():
     from app.models.payment import Payment
     from app.models.refund import Refund
     from app.models.invoice import Invoice
-    from app.models.client import Client
+    from app.models.customer import Customer
     from app.models.product import Product
     from app.models.subscription import Subscription
     from app.models.sync_log import SyncLog

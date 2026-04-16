@@ -16,7 +16,7 @@ from app.models.user import User
 from app.models.tenant import Tenant
 from app.schemas.report import (
     SalesReportRequest, InventoryReportRequest, FinancialReportRequest,
-    ClientReportRequest, ReportResponse, ReportType, ExportFormat
+    CustomerReportRequest, ReportResponse, ReportType, ExportFormat
 )
 from app.api.deps import get_current_tenant, get_current_user
 from app.core.security import require_permission
@@ -476,102 +476,100 @@ def get_financial_summary(
 
 
 # ============================================================================
-# RAPPORTS CLIENTS
+# RAPPORTS CLIENTS (CUSTOMERS)
 # ============================================================================
 
-@router.post("/clients", response_model=ReportResponse)
+@router.post("/customers", response_model=ReportResponse)
 @require_permission("report_view")
-def generate_client_report(
-    report_data: ClientReportRequest,
+def generate_customer_report(
+    report_data: CustomerReportRequest,
     db: Session = Depends(get_db),
     current_tenant: Tenant = Depends(get_current_tenant),
     current_user: User = Depends(get_current_user)
 ):
     """
-    Génère un rapport clients
+    Génère un rapport clients (customers)
     """
     try:
-        # Pour l'instant, générer un rapport simplifié
-        # Vous pourriez ajouter un service ClientReportService plus tard
-        
         from sqlalchemy import func
+        from app.models.customer import Customer
         
         # Statistiques clients de base
-        from app.models.client import Client
-        
-        total_clients = db.query(func.count(Client.id)).filter(
-            Client.tenant_id == current_tenant.id,
-            Client.is_active == True
+        total_customers = db.query(func.count(Customer.id)).filter(
+            Customer.tenant_id == current_tenant.id,
+            Customer.is_active == True
         ).scalar()
         
-        clients_with_credit = db.query(func.count(Client.id)).filter(
-            Client.tenant_id == current_tenant.id,
-            Client.is_active == True,
-            Client.eligible_credit == True
+        customers_with_credit = db.query(func.count(Customer.id)).filter(
+            Customer.tenant_id == current_tenant.id,
+            Customer.is_active == True,
+            Customer.eligible_credit == True
         ).scalar()
         
-        blacklisted_clients = db.query(func.count(Client.id)).filter(
-            Client.tenant_id == current_tenant.id,
-            Client.is_active == True,
-            Client.blacklisted == True
+        blacklisted_customers = db.query(func.count(Customer.id)).filter(
+            Customer.tenant_id == current_tenant.id,
+            Customer.is_active == True,
+            Customer.blacklisted == True
         ).scalar()
         
-        total_debt = db.query(func.coalesce(func.sum(Client.dette_actuelle), 0)).filter(
-            Client.tenant_id == current_tenant.id,
-            Client.is_active == True
+        total_debt = db.query(func.coalesce(func.sum(Customer.dette_actuelle), 0)).filter(
+            Customer.tenant_id == current_tenant.id,
+            Customer.is_active == True
         ).scalar()
         
-        total_sales = db.query(func.coalesce(func.sum(Client.total_achats), 0)).filter(
-            Client.tenant_id == current_tenant.id,
-            Client.is_active == True
+        total_sales = db.query(func.coalesce(func.sum(Customer.total_achats), 0)).filter(
+            Customer.tenant_id == current_tenant.id,
+            Customer.is_active == True
         ).scalar()
         
         # Clients par type
-        clients_by_type = db.query(
-            Client.type_client,
-            func.count(Client.id).label("count")
+        customers_by_type = db.query(
+            Customer.type_client,
+            func.count(Customer.id).label("count")
         ).filter(
-            Client.tenant_id == current_tenant.id,
-            Client.is_active == True
-        ).group_by(Client.type_client).all()
+            Customer.tenant_id == current_tenant.id,
+            Customer.is_active == True
+        ).group_by(Customer.type_client).all()
         
         # Top clients par chiffre d'affaires
-        top_clients = db.query(Client).filter(
-            Client.tenant_id == current_tenant.id,
-            Client.is_active == True
-        ).order_by(Client.total_achats.desc()).limit(10).all()
+        top_customers = db.query(Customer).filter(
+            Customer.tenant_id == current_tenant.id,
+            Customer.is_active == True
+        ).order_by(Customer.total_achats.desc()).limit(10).all()
         
         report = {
             "summary": {
-                "total_clients": total_clients,
-                "clients_with_credit": clients_with_credit,
-                "blacklisted_clients": blacklisted_clients,
+                "total_customers": total_customers,
+                "customers_with_credit": customers_with_credit,
+                "blacklisted_customers": blacklisted_customers,
                 "total_debt": float(total_debt),
                 "total_sales": float(total_sales),
-                "average_sales_per_client": float(total_sales / total_clients if total_clients > 0 else 0)
+                "average_sales_per_customer": float(total_sales / total_customers if total_customers > 0 else 0)
             },
             "distribution_by_type": [
                 {"type": type_client, "count": count}
-                for type_client, count in clients_by_type
+                for type_client, count in customers_by_type if type_client
             ],
-            "top_clients": [
+            "top_customers": [
                 {
-                    "id": str(client.id),
-                    "nom": client.nom,
-                    "type": client.type_client,
-                    "total_achats": float(client.total_achats),
-                    "nombre_achats": client.nombre_achats,
-                    "dette_actuelle": float(client.dette_actuelle),
-                    "dernier_achat": client.dernier_achat.isoformat() if client.dernier_achat else None
+                    "id": str(customer.id),
+                    "nom": customer.nom,
+                    "prenom": customer.prenom,
+                    "full_name": customer.full_name,
+                    "type": customer.type_client,
+                    "total_achats": float(customer.total_achats),
+                    "nombre_achats": customer.nombre_achats,
+                    "dette_actuelle": float(customer.dette_actuelle),
+                    "dernier_achat": customer.dernier_achat.isoformat() if customer.dernier_achat else None
                 }
-                for client in top_clients
+                for customer in top_customers
             ]
         }
         
         logger.info(f"Rapport clients généré pour le tenant {current_tenant.id}")
         
         return ReportResponse(
-            type=ReportType.CLIENTS,
+            type=ReportType.CUSTOMERS,
             period_start=date.today(),
             period_end=date.today(),
             generated_at=datetime.utcnow(),
@@ -586,7 +584,7 @@ def generate_client_report(
         )
 
 
-@router.get("/clients/debtors")
+@router.get("/customers/debtors")
 @require_permission("report_view")
 def get_debtors_report(
     min_debt: float = Query(0, ge=0, description="Dette minimale"),
@@ -598,15 +596,15 @@ def get_debtors_report(
     Récupère le rapport des clients débiteurs
     """
     try:
-        from app.models.client import Client
+        from app.models.customer import Customer
         
-        debtors = db.query(Client).filter(
-            Client.tenant_id == current_tenant.id,
-            Client.is_active == True,
-            Client.dette_actuelle > min_debt
-        ).order_by(Client.dette_actuelle.desc()).all()
+        debtors = db.query(Customer).filter(
+            Customer.tenant_id == current_tenant.id,
+            Customer.is_active == True,
+            Customer.dette_actuelle > min_debt
+        ).order_by(Customer.dette_actuelle.desc()).all()
         
-        total_debt = sum(client.dette_actuelle for client in debtors)
+        total_debt = sum(customer.dette_actuelle for customer in debtors)
         
         return {
             "generated_at": datetime.utcnow().isoformat(),
@@ -615,15 +613,17 @@ def get_debtors_report(
             "total_debt": float(total_debt),
             "debtors": [
                 {
-                    "id": str(client.id),
-                    "nom": client.nom,
-                    "telephone": client.telephone,
-                    "dette_actuelle": float(client.dette_actuelle),
-                    "credit_limit": float(client.credit_limit),
-                    "dernier_achat": client.dernier_achat.isoformat() if client.dernier_achat else None,
-                    "date_dernier_paiement": client.date_dernier_paiement.isoformat() if client.date_dernier_paiement else None
+                    "id": str(customer.id),
+                    "nom": customer.nom,
+                    "prenom": customer.prenom,
+                    "full_name": customer.full_name,
+                    "telephone": customer.telephone,
+                    "dette_actuelle": float(customer.dette_actuelle),
+                    "credit_limit": float(customer.credit_limit),
+                    "dernier_achat": customer.dernier_achat.isoformat() if customer.dernier_achat else None,
+                    "date_dernier_paiement": customer.date_dernier_paiement.isoformat() if customer.date_dernier_paiement else None
                 }
-                for client in debtors
+                for customer in debtors
             ]
         }
         
@@ -678,7 +678,6 @@ def export_report(
             }
         
         # Pour les petits rapports, export synchrone
-        # (implémentation simplifiée - à adapter selon vos besoins)
         if report_type == ReportType.SALES:
             report_service = ReportService(db)
             report_data = report_service.generate_sales_report(
@@ -742,7 +741,7 @@ def get_report_types():
                 ReportType.SALES: "Rapport des ventes par période",
                 ReportType.INVENTORY: "État des stocks et inventaire",
                 ReportType.FINANCIAL: "Rapport financier et comptable",
-                ReportType.CLIENTS: "Rapport clients et statistiques",
+                ReportType.CUSTOMERS: "Rapport clients et statistiques",
                 ReportType.STOCK_MOVEMENTS: "Mouvements de stock",
                 ReportType.PURCHASES: "Rapport des achats (à venir)",
                 ReportType.TAX: "Rapport fiscal (à venir)"
@@ -780,13 +779,13 @@ def report_health_check():
     """
     return {
         "status": "healthy",
-        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "timestamp": datetime.utcnow().isoformat(),
         "version": "1.0.0",
         "services": {
             "sales_reports": "available",
             "inventory_reports": "available",
             "financial_reports": "available",
-            "client_reports": "available",
+            "customer_reports": "available",
             "export_service": "available"
         }
     }
@@ -805,7 +804,7 @@ def test_reports():
             "/reports/sales",
             "/reports/inventory",
             "/reports/financial",
-            "/reports/clients",
+            "/reports/customers",
             "/reports/export",
             "/reports/types",
             "/reports/available-formats"

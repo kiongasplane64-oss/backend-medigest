@@ -15,7 +15,7 @@ import logging
 
 from app.db.session import get_db
 from app.models.user import User
-from app.models.client import Client
+from app.models.customer import Customer
 from app.models.sale import Sale, SaleItem
 from app.models.cost import Cost
 from app.models.product import Product, ProductStock
@@ -411,7 +411,7 @@ def get_dashboard_stats(
         Debt.due_date,
         Debt.status
     ).join(
-        Client, Client.id == Debt.client_id
+        Customer, Customer.id == Debt.customer_id
     ).filter(
         Debt.tenant_id == tenant_id,
         Debt.status.in_(["pending", "partially_paid", "overdue", "defaulted"])
@@ -419,7 +419,7 @@ def get_dashboard_stats(
     
     debt_list_result = []
     for d in debt_list:
-        client = db.query(Client).filter(Client.id == d.client_id).first()
+        client = db.query(Customer).filter(Customer.id == d.client_id).first()
         debt_list_result.append({
             "customer_name": client.name if client else "Client inconnu",
             "amount": float(d.remaining_amount),
