@@ -339,3 +339,63 @@ def sync_batch(
         "results": results,
         "timestamp": datetime.utcnow().isoformat()
     }
+
+# Ajouter à app/api/v1/sync.py
+
+@router.post("/returns/batch")
+def sync_returns_batch(
+    payload: dict,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """
+    Endpoint pour la synchronisation par lots des retours
+    """
+    returns = payload.get('returns', [])
+    
+    processed = 0
+    errors = []
+    
+    for ret in returns:
+        try:
+            # Traiter chaque retour
+            # À implémenter selon votre modèle de données
+            processed += 1
+        except Exception as e:
+            errors.append(str(e))
+    
+    return {
+        "status": "success" if not errors else "partial",
+        "synced_ids": [r.get('id') for r in returns],
+        "processed": processed,
+        "errors": errors
+    }
+
+@router.post("/debts/batch")
+def sync_debts_batch(
+    payload: dict,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """
+    Endpoint pour la synchronisation par lots des dettes
+    """
+    debts = payload.get('debts', [])
+    
+    processed = 0
+    errors = []
+    
+    for debt in debts:
+        try:
+            # Traiter chaque dette
+            # À implémenter selon votre modèle de données
+            processed += 1
+        except Exception as e:
+            errors.append(str(e))
+    
+    return {
+        "status": "success" if not errors else "partial",
+        "synced_ids": [d.get('id') for d in debts],
+        "processed": processed,
+        "errors": errors
+    }

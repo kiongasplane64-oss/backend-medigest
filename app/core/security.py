@@ -167,10 +167,16 @@ async def get_current_user(
     token: str = Depends(oauth2_scheme),
     db: Session = Depends(get_db)
 ) -> User:
-    """Récupère l'utilisateur courant depuis le token"""
+    """Récupère l'utilisateur courant depuis le token avec vérification d'abonnement"""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Impossible de valider les informations d'identification",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    subscription_expired_exception = HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Votre abonnement a expiré. Veuillez renouveler votre abonnement.",
         headers={"WWW-Authenticate": "Bearer"},
     )
     
@@ -198,6 +204,26 @@ async def get_current_user(
 
     if user is None:
         raise credentials_exception
+    
+    # ===========================================
+    # NOUVEAU : VÉRIFICATION DE L'ABONNEMENT
+    # ===========================================
+    if user.tenant_id:
+        from app.models.tenant import Tenant
+        from datetime import datetime
+        
+        tenant = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
+        
+        if tenant:
+            # Vérifier la période d'essai
+            if tenant.current_plan == "trial" and tenant.trial_end_date:
+                if tenant.trial_end_date < datetime.utcnow():
+                    raise subscription_expired_exception
+            
+            # Vérifier l'abonnement actif via le service
+            from app.api.v1.auth import is_subscription_active
+            if not is_subscription_active(db, str(user.tenant_id)):
+                raise subscription_expired_exception
     
     return user
 
@@ -496,6 +522,89 @@ async def login_for_access_token(
             "tenant_id": str(user.tenant_id) if user.tenant_id else None
         }
     }
+
+def require_active_subscription(func: Callable) -> Callable:
+    """
+    Décorateur pour vérifier que l'abonnement est actif
+    """
+    @wraps(func)
+    async def async_wrapper(*args, **kwargs):
+        current_user = kwargs.get('current_user')
+        
+        if not current_user:
+            for arg in args:
+                if isinstance(arg, User):
+                    current_user = arg
+                    break
+        
+        if not current_user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Utilisateur non authentifié"
+            )
+        
+        if current_user.tenant_id:
+            from app.db.session import SessionLocal
+            from app.api.v1.auth import is_subscription_active
+            
+            db = SessionLocal()
+            try:
+                subscription_active = is_subscription_active(db, str(current_user.tenant_id))
+                if not subscription_active:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail={
+                            "error": "subscription_expired",
+                            "message": "Votre abonnement a expiré. Veuillez renouveler votre abonnement.",
+                            "requires_relogin": True
+                        }
+                    )
+            finally:
+                db.close()
+        
+        return await func(*args, **kwargs)
+    
+    @wraps(func)
+    def sync_wrapper(*args, **kwargs):
+        current_user = kwargs.get('current_user')
+        
+        if not current_user:
+            for arg in args:
+                if isinstance(arg, User):
+                    current_user = arg
+                    break
+        
+        if not current_user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Utilisateur non authentifié"
+            )
+        
+        if current_user.tenant_id:
+            from app.db.session import SessionLocal
+            from app.api.v1.auth import is_subscription_active
+            
+            db = SessionLocal()
+            try:
+                subscription_active = is_subscription_active(db, str(current_user.tenant_id))
+                if not subscription_active:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail={
+                            "error": "subscription_expired",
+                            "message": "Votre abonnement a expiré. Veuillez renouveler votre abonnement.",
+                            "requires_relogin": True
+                        }
+                    )
+            finally:
+                db.close()
+        
+        return func(*args, **kwargs)
+    
+    if inspect.iscoroutinefunction(func):
+        return async_wrapper
+    else:
+        return sync_wrapper
 
 # ===========================================
 # UTILITAIRES

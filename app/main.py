@@ -44,6 +44,7 @@ from app.middleware.tenant_context import TenantContextMiddleware
 from app.middleware.rate_limit_middleware import RateLimitMiddleware
 from app.middleware.audit_middleware import AuditMiddleware
 from app.middleware.auth_middleware import AuthMiddleware
+from app.middleware.middleware import SubscriptionCheckMiddleware
 
 
 def utc_iso() -> str:
@@ -219,6 +220,7 @@ include_router_auto(app, orders_router, tags=["orders"])
 include_router_auto(app, transfers_router, tags=["transfers"])
 include_router_auto(app, dashboard_router)
 include_router_auto(app, capital_router)
+app.add_middleware(SubscriptionCheckMiddleware)
 
 
 # ============================================================================

@@ -308,7 +308,6 @@ def generate_unique_tenant_code(nom_pharmacie: str, db: Session) -> str:
         if counter > 10:
             return f"PH{str(uuid.uuid4())[:8].upper()}"
 
-
 def is_subscription_active(db: Session, tenant_id: str) -> bool:
     """Vérifie si l'abonnement est actif pour un tenant donné"""
     try:
@@ -836,6 +835,43 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
     }
     
     return response
+
+@router.post("/verify-subscription")
+def verify_subscription(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Vérifie si l'abonnement est actif.
+    Si l'abonnement est expiré, l'utilisateur doit se reconnecter.
+    """
+    if not current_user.tenant_id:
+        return {
+            "subscription_active": True,
+            "message": "Compte sans abonnement requis"
+        }
+    
+    subscription_active = is_subscription_active(db, str(current_user.tenant_id))
+    
+    if not subscription_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "subscription_expired",
+                "message": "Votre abonnement a expiré",
+                "requires_relogin": True,
+                "action": "Veuillez renouveler votre abonnement et vous reconnecter"
+            }
+        )
+    
+    # Récupérer le tenant pour plus d'informations
+    tenant = db.query(Tenant).filter(Tenant.id == current_user.tenant_id).first()
+    
+    return {
+        "subscription_active": True,
+        "current_plan": tenant.current_plan if tenant else None,
+        "trial_end_date": tenant.trial_end_date.isoformat() if tenant and tenant.trial_end_date else None
+    }
 
 # =========================
 # ENDPOINTS DE CONNEXION (SANS OTP)
@@ -1638,16 +1674,33 @@ def refresh_token(data: TokenRefreshSchema, db: Session = Depends(get_db)):
             detail="Compte inactif"
         )
 
-    main_pharmacy = None
-    subscription_active = True
+    # ===========================================
+    # NOUVEAU : VÉRIFIER L'ABONNEMENT AVANT DE RAFRAÎCHIR
+    # ===========================================
+    if user.tenant_id:
+        subscription_active = is_subscription_active(db, str(user.tenant_id))
+        
+        # Si l'abonnement est inactif, ne PAS permettre le refresh
+        if not subscription_active:
+            logger.warning(f"Tentative de refresh token pour abonnement expiré: {user.email}")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": "subscription_expired",
+                    "message": "Votre abonnement a expiré. Veuillez vous reconnecter après renouvellement.",
+                    "requires_relogin": True
+                }
+            )
+    else:
+        subscription_active = True
 
+    main_pharmacy = None
     if user.tenant_id:
         main_pharmacy = db.query(Pharmacy).filter(
             Pharmacy.tenant_id == user.tenant_id,
             Pharmacy.is_main == True,
             Pharmacy.is_active == True
         ).first()
-        subscription_active = is_subscription_active(db, str(user.tenant_id))
 
     token_pair = create_token_pair(
         user=user,
@@ -1657,7 +1710,6 @@ def refresh_token(data: TokenRefreshSchema, db: Session = Depends(get_db)):
 
     logger.info(f"Refresh token réussi pour {user.email}")
     return token_pair
-
 
 # =========================
 # ENDPOINTS DE SANTÉ
