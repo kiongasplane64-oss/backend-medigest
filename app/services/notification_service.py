@@ -14,7 +14,7 @@ from email.mime.multipart import MIMEMultipart
 from app.core.config import settings
 from app.models.sale import Sale
 from twilio.rest import Client as TwilioClient
-from app.models.client import Client as ClientModel
+from app.models.customer import Customer as CustomerModel
 from app.models.user import User
 
 logger = logging.getLogger(__name__)
@@ -472,7 +472,7 @@ class NotificationService:
             logger.error(f"❌ Erreur envoi alerte péremption: {e}")
             return {"error": str(e)}
     
-    async def send_credit_payment_reminder(self, client: ClientModel) -> Dict[str, Any]:
+    async def send_credit_payment_reminder(self, client: CustomerModel) -> Dict[str, Any]:
         """
         Envoie un rappel de paiement crédit
         """
