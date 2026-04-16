@@ -27,7 +27,7 @@ class DebtPayment(Base):
     reference = Column(String(50), nullable=False, unique=True)
 
     # Liens
-    customer_id = Column(UUID(as_uuid=True), ForeignKey("customers.id"), nullable=False)  # Changé: client_id -> customer_id
+    customer_id = Column(UUID(as_uuid=True), ForeignKey("customers.id"), nullable=False)  
     debt_id = Column(UUID(as_uuid=True), ForeignKey("debts.id"), nullable=False)
     sale_id = Column(UUID(as_uuid=True), ForeignKey("sales.id"), nullable=True)
 

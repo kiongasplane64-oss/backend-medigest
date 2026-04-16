@@ -31,7 +31,7 @@ def list_debts(
     current_user: User = Depends(get_current_user),
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
-    client_id: Optional[UUID] = None,
+    customer_id: Optional[UUID] = None,
     status: Optional[str] = None,
     overdue_only: bool = Query(False, description="Afficher uniquement les dettes en retard"),
     min_amount: Optional[float] = Query(None, ge=0),
@@ -45,8 +45,8 @@ def list_debts(
     query = db.query(Debt).filter(Debt.tenant_id == current_tenant.id)
     
     # Appliquer les filtres
-    if client_id:
-        query = query.filter(Debt.client_id == client_id)
+    if customer_id:
+        query = query.filter(Debt.customer_id == customer_id)
     
     if status:
         query = query.filter(Debt.status == status)
@@ -186,7 +186,7 @@ def get_debt_summary(
         Debt.remaining_amount > 0
     ).scalar() or 0.0
     
-    total_clients = db.query(func.count(func.distinct(Debt.client_id))).filter(
+    total_clients = db.query(func.count(func.distinct(Debt.customer_id))).filter(
         Debt.tenant_id == current_tenant.id,
         Debt.remaining_amount > 0
     ).scalar() or 0
@@ -245,7 +245,7 @@ def get_debt_analytics(
         Customer,
         func.sum(Debt.remaining_amount).label('total_debt')
     ).join(
-        Debt, Customer.id == Debt.client_id
+        Debt, Customer.id == Debt.customer_id
     ).filter(
         Debt.tenant_id == current_tenant.id,
         Debt.remaining_amount > 0

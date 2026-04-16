@@ -1,4 +1,6 @@
 # app/services/analytics.py
+from uuid import UUID
+
 class InventoryAnalytics:
     def calculate_turnover_rate(self, product_id: UUID):
         """
@@ -13,7 +15,7 @@ class InventoryAnalytics:
         pass
 
 class DebtAnalytics:
-    def calculate_client_credit_score(self, client_id: UUID):
+    def calculate_client_credit_score(self, customer_id: UUID):
         """
         Calcule un score de crédit pour le client
         """

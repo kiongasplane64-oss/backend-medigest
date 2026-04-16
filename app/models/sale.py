@@ -111,10 +111,10 @@ class Sale(Base):
         uselist=False,
     )
 
-    # CORRECTION: Index mis à jour pour utiliser customer_id au lieu de client_id
+    # CORRECTION: Index mis à jour pour utiliser customer_id 
     __table_args__ = (
         Index("ix_sales_tenant_created", "tenant_id", "created_at"),
-        Index("ix_sales_tenant_customer", "tenant_id", "customer_id"),  # Changé client_id → customer_id
+        Index("ix_sales_tenant_customer", "tenant_id", "customer_id"),  
         Index("ix_sales_tenant_status", "tenant_id", "status"),
         Index("ix_sales_tenant_credit", "tenant_id", "is_credit"),
         Index("ix_sales_tenant_payment", "tenant_id", "payment_method"),

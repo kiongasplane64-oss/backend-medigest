@@ -260,7 +260,7 @@ async def create_sale(
 
         # Vérification client
         client = None
-        if sale_data.client_id:
+        if sale_data.customer_id:
             client = db.query(Customer).filter(
                 Customer.id == sale_data.customer_id,
                 Customer.tenant_id == tenant_id,
@@ -371,9 +371,9 @@ async def create_sale(
             tenant_id=tenant_id,
             pharmacy_id=pharmacy.id,
             reference=reference,
-            client_id=sale_data.client_id,
-            client_name=client.nom_complet if client else sale_data.client_name,
-            client_phone=client.telephone if client else sale_data.client_phone,
+            customer_id=sale_data.customer_id,
+            customer_name=client.nom_complet if client else sale_data.customer_name,
+            customer_phone=client.telephone if client else sale_data.customer_phone,
             created_by=current_user.id,
             seller_name=getattr(current_user, 'nom_complet', current_user.email),
             payment_method=sale_data.payment_method.value,
@@ -1129,7 +1129,7 @@ async def get_sales(
     user_id: Optional[UUID] = Query(None, description="Filtrer par utilisateur (caissier)"),
     payment_method: Optional[str] = Query(None, description="Filtrer par méthode de paiement"),
     status: Optional[str] = Query(None, description="Filtrer par statut (completed, pending, cancelled)"),
-    client_id: Optional[UUID] = Query(None, description="Filtrer par client"),
+    customer_id: Optional[UUID] = Query(None, description="Filtrer par client"),
     search: Optional[str] = Query(None, description="Recherche par référence, client, vendeur"),
     # Tri
     sort_by: str = Query("created_at", description="Champ de tri (created_at, total_amount, reference)"),
@@ -1203,8 +1203,8 @@ async def get_sales(
         if status:
             query = query.filter(Sale.status == status)
         
-        if client_id:
-            query = query.filter(Sale.client_id == client_id)
+        if customer_id:
+            query = query.filter(Sale.customer_id == customer_id)
         
         if search:
             search_term = f"%{search}%"
@@ -1245,9 +1245,9 @@ async def get_sales(
                 pharmacy_id=sale.pharmacy_id,
                 pharmacy_name=pharmacy.name if pharmacy else None,
                 reference=sale.reference,
-                client_id=sale.client_id,
-                client_name=sale.client_name,
-                client_phone=sale.client_phone,
+                customer_id=sale.customer_id,
+                customer_name=sale.customer_name,
+                customer_phone=sale.customer_phone,
                 created_by=sale.created_by,
                 seller_name=sale.seller_name,
                 created_at=sale.created_at,
@@ -1366,9 +1366,9 @@ async def get_sale_by_id(
             pharmacy_id=sale.pharmacy_id,
             pharmacy_name=pharmacy.name if pharmacy else None,
             reference=sale.reference,
-            client_id=sale.client_id,
-            client_name=sale.client_name,
-            client_phone=sale.client_phone,
+            customer_id=sale.customer_id,
+            customer_name=sale.customer_name,
+            customer_phone=sale.customer_phone,
             created_by=sale.created_by,
             seller_name=sale.seller_name,
             created_at=sale.created_at,

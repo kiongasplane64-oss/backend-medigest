@@ -18,7 +18,7 @@ class PaymentMethod(str, Enum):
     CHECK = "check"
 
 class DebtBase(BaseModel):
-    customer_id: UUID  # Changé: client_id -> customer_id
+    customer_id: UUID  
     total_amount: float = Field(..., gt=0)
     due_date: date
     description: Optional[str] = None

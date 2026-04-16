@@ -108,9 +108,9 @@ class SaleItemResponse(BaseModel):
 # ============================
 class SaleCreate(BaseModel):
     pharmacy_id: Optional[UUID] = Field(None, description="ID de la pharmacie (optionnel, utilise la pharmacie par défaut)")
-    client_id: Optional[UUID] = None
-    client_name: Optional[str] = Field("Client Générique", max_length=100)
-    client_phone: Optional[str] = Field(None, max_length=20)
+    customer_id: Optional[UUID] = None
+    customer_name: Optional[str] = Field("Client Générique", max_length=100)
+    customer_phone: Optional[str] = Field(None, max_length=20)
     payment_method: PaymentMethod
     reference_payment: Optional[str] = Field(None, max_length=100, description="Référence du paiement (numéro de chèque, transaction, etc.)")
     is_credit: bool = False
@@ -166,7 +166,7 @@ class SaleFilter(BaseModel):
     is_credit: Optional[bool] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
-    client_id: Optional[UUID] = None
+    customer_id: Optional[UUID] = None
     seller_id: Optional[UUID] = None
     search: Optional[str] = None
     
@@ -217,9 +217,9 @@ class SaleInDB(BaseModel):
     pharmacy_name: Optional[str] = None
     pharmacy_code: Optional[str] = None
     reference: str
-    client_id: Optional[UUID]
-    client_name: str
-    client_phone: Optional[str]
+    customer_id: Optional[UUID]
+    customer_name: str
+    customer_phone: Optional[str]
     created_by: UUID
     seller_name: str
     payment_method: str
