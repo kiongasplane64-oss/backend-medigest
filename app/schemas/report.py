@@ -154,3 +154,14 @@ class ReportSummary(BaseModel):
             datetime: lambda v: v.isoformat() if v else None,
             date: lambda v: v.isoformat()
         }
+
+class CustomerReportRequest(BaseModel):
+    """Requête pour rapport clients"""
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    include_inactive: bool = False
+    customer_type: Optional[str] = None
+    category: Optional[str] = None
+    min_purchase_amount: Optional[float] = None
+    max_debt_ratio: Optional[float] = None
+    group_by: Optional[str] = "category"
