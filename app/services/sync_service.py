@@ -1,12 +1,11 @@
-# app/services/sync_service.py - Service de synchronisation complet
+# app/services/sync_service.py - Service de synchronisation complet unifié
 
+from sqlalchemy.orm import Session, joinedload
 from typing import List, Dict, Any, Optional
-from datetime import datetime
-from sqlalchemy.orm import Session
-from sqlalchemy.exc import SQLAlchemyError
+from datetime import datetime, date
+from decimal import Decimal
+from uuid import UUID
 import logging
-
-from app.models.sync_log import SyncLog
 
 logger = logging.getLogger(__name__)
 
@@ -17,250 +16,501 @@ logger = logging.getLogger(__name__)
 
 def process_sync(
     db: Session,
-    tenant_id: str,
+    tenant_id: UUID,
     items: List[Any],
 ) -> Dict[str, Any]:
     """
     Traite les données de synchronisation envoyées par un client mobile.
+    Supporte: products, categories, customers, sales, debts, users, branches, 
+              pharmacies, subscriptions, stock_movements
     
     Args:
         db: Session SQLAlchemy
         tenant_id: Identifiant du tenant
-        items: Liste des items à synchroniser (objets ou dictionnaires)
+        items: Liste des items à synchroniser
         
     Returns:
         Dict contenant le statut, le nombre d'items traités et les erreurs
     """
     processed = 0
     errors = []
+    results_by_table = {}
     
-    try:
-        for item in items:
-            # Gestion des objets et dictionnaires
-            if hasattr(item, 'table_name'):
-                table_name = item.table_name
-                action = item.action
-                data = item.data if hasattr(item, 'data') else {}
-            else:
-                table_name = item.get("table_name")
-                action = item.get("action")
-                data = item.get("data", {})
-            
-            # ---- Validation minimale ----
-            if not table_name or not action:
-                errors.append({
-                    "item": item,
-                    "error": "table_name ou action manquant",
-                })
-                continue
-            
-            # ---- Enregistrement du log de synchronisation ----
-            log = SyncLog(
-                tenant_id=tenant_id,
-                table_name=table_name,
-                action=action,
-                data=data,
-                created_at=datetime.utcnow(),
-            )
-            db.add(log)
-            
-            # ---- Application sur les tables métier ----
-            logger.info(f"Traitement de {table_name} - {action} pour tenant {tenant_id}")
-            
-            if table_name == 'products':
-                process_product_sync(db, tenant_id, action, data)
-            elif table_name == 'categories':
-                process_category_sync(db, tenant_id, action, data)
-            elif table_name == 'customers':
-                process_customer_sync(db, tenant_id, action, data)
-            elif table_name == 'orders':
-                process_order_sync(db, tenant_id, action, data)
-            else:
-                errors.append({
-                    "item": item,
-                    "error": f"Table inconnue: {table_name}",
-                })
-                continue
-            
-            processed += 1
+    for item in items:
+        # Gestion des objets et dictionnaires
+        if hasattr(item, 'table_name'):
+            table_name = item.table_name
+            action = item.action
+            data = item.data if hasattr(item, 'data') else {}
+        else:
+            table_name = item.get("table_name")
+            action = item.get("action")
+            data = item.get("data", {})
         
+        # Validation minimale
+        if not table_name or not action:
+            errors.append({
+                "item": item,
+                "error": "table_name ou action manquant",
+            })
+            continue
+        
+        logger.info(f"Traitement de {table_name} - {action} pour tenant {tenant_id}")
+        
+        try:
+            result = None
+            
+            # Dispatch vers le handler approprié
+            if table_name in ['products', 'produits', 'produit']:
+                result = _sync_product(db, tenant_id, action, data)
+            elif table_name in ['categories', 'categories', 'categorie']:
+                result = _sync_category(db, tenant_id, action, data)
+            elif table_name in ['customers', 'clients', 'client']:
+                result = _sync_customer(db, tenant_id, action, data)
+            elif table_name in ['sales', 'ventes', 'vente', 'orders', 'commandes', 'commande']:
+                result = _sync_sale(db, tenant_id, action, data)
+            elif table_name in ['debts', 'dettes', 'dette']:
+                result = _sync_debt(db, tenant_id, action, data)
+            elif table_name in ['debt_payments', 'paiements_dette']:
+                result = _sync_debt_payment(db, tenant_id, action, data)
+            elif table_name in ['users', 'utilisateurs', 'utilisateur']:
+                result = _sync_user(db, tenant_id, action, data)
+            elif table_name in ['branches', 'succursales', 'succursale']:
+                result = _sync_branch(db, tenant_id, action, data)
+            elif table_name in ['pharmacies', 'pharmacie']:
+                result = _sync_pharmacy(db, tenant_id, action, data)
+            elif table_name in ['subscriptions', 'abonnements', 'abonnement']:
+                result = _sync_subscription(db, tenant_id, action, data)
+            elif table_name in ['stock_movements', 'mouvements_stock']:
+                result = _sync_stock_movement(db, tenant_id, action, data)
+            else:
+                logger.warning(f"Table non supportée: {table_name}")
+                errors.append({
+                    "table": table_name,
+                    "action": action,
+                    "error": f"Table non supportée: {table_name}"
+                })
+                continue
+            
+            if result and result.get('success'):
+                processed += 1
+                if table_name not in results_by_table:
+                    results_by_table[table_name] = []
+                results_by_table[table_name].append(result)
+            elif result and not result.get('success'):
+                errors.append({
+                    "table": table_name,
+                    "action": action,
+                    "error": result.get('error', 'Erreur inconnue'),
+                    "data": data.get('id') if data else None
+                })
+                
+        except Exception as e:
+            logger.error(f"Erreur lors du traitement de {table_name}: {str(e)}", exc_info=True)
+            errors.append({
+                "table": table_name,
+                "action": action,
+                "error": str(e),
+                "data": data.get('id') if data else None
+            })
+            db.rollback()
+    
+    if processed > 0:
         db.commit()
-        logger.info(f"Synchronisation terminée pour tenant {tenant_id}: {processed} items traités")
-        
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.error(f"Erreur SQL lors de la synchronisation: {str(e)}")
-        return {
-            "status": "error",
-            "message": str(e),
-            "processed": processed,
-            "errors": errors,
-        }
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Erreur lors de la synchronisation: {str(e)}")
-        return {
-            "status": "error",
-            "message": str(e),
-            "processed": processed,
-            "errors": errors,
-        }
     
     return {
-        "status": "success",
+        "status": "success" if not errors else "partial",
         "processed": processed,
         "errors": errors,
+        "results_by_table": results_by_table,
         "synced_at": datetime.utcnow().isoformat(),
     }
 
+
 def get_changes_since(
     db: Session,
-    tenant_id: str,
-    last_sync: Optional[datetime] = None
-) -> List[Dict[str, Any]]:
+    tenant_id: UUID,
+    since: Optional[datetime] = None
+) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Récupère les changements depuis la dernière synchronisation.
+    Récupère tous les changements depuis une date pour toutes les entités.
     
     Args:
         db: Session SQLAlchemy
         tenant_id: Identifiant du tenant
-        last_sync: Date de dernière synchronisation
+        since: Date de dernière synchronisation (optionnel)
         
     Returns:
-        Liste des changements
+        Dictionnaire contenant les changements par table
     """
-    changes = []
+    changes = {
+        'products': [],
+        'categories': [],
+        'customers': [],
+        'sales': [],
+        'debts': [],
+        'debt_payments': [],
+        'users': [],
+        'branches': [],
+        'pharmacies': [],
+        'subscriptions': [],
+        'stock_movements': []
+    }
     
     try:
-        # Importer les modèles ici pour éviter les imports circulaires
+        # 1. Produits
         from app.models.product import Product
+        query = db.query(Product).filter(Product.tenant_id == tenant_id)
+        if since:
+            query = query.filter(
+                (Product.updated_at >= since) | (Product.created_at >= since)
+            )
+        
+        for product in query.all():
+            changes['products'].append({
+                'id': str(product.id),
+                'action': 'update' if (product.updated_at and since and product.updated_at >= since) else 'create',
+                'data': product.to_dict(include_details=True) if hasattr(product, 'to_dict') else _serialize_product(product),
+                'timestamp': (product.updated_at or product.created_at).isoformat() if (product.updated_at or product.created_at) else None
+            })
+        
+        # 2. Catégories
         from app.models.category import Category
+        query = db.query(Category).filter(Category.tenant_id == tenant_id)
+        if since:
+            query = query.filter(
+                (Category.updated_at >= since) | (Category.created_at >= since)
+            )
+        
+        for category in query.all():
+            changes['categories'].append({
+                'id': str(category.id),
+                'action': 'update' if (category.updated_at and since and category.updated_at >= since) else 'create',
+                'data': {
+                    'id': str(category.id),
+                    'name': category.name,
+                    'description': category.description,
+                    'parent_id': str(category.parent_id) if category.parent_id else None,
+                    'is_active': category.is_active
+                },
+                'timestamp': (category.updated_at or category.created_at).isoformat() if (category.updated_at or category.created_at) else None
+            })
+        
+        # 3. Clients
         from app.models.customer import Customer
-        from app.models.order import Order
-        
-        # Récupérer les produits modifiés
-        query_products = db.query(Product).filter(Product.tenant_id == tenant_id)
-        if last_sync:
-            query_products = query_products.filter(
-                (Product.updated_at > last_sync) | (Product.created_at > last_sync)
+        query = db.query(Customer).filter(Customer.tenant_id == tenant_id)
+        if since:
+            query = query.filter(
+                (Customer.updated_at >= since) | (Customer.created_at >= since)
             )
         
-        for product in query_products.all():
-            # CORRECTION: Vérifier si last_sync existe avant comparaison
-            if last_sync and product.updated_at:
-                action = "update" if product.updated_at > last_sync else "create"
-            elif last_sync and product.created_at:
-                action = "create" if product.created_at > last_sync else "update"
-            else:
-                # Si pas de last_sync, considérer comme création
-                action = "create"
-            
-            changes.append({
-                "table": "products",
-                "action": action,
-                "data": product.to_dict() if hasattr(product, 'to_dict') else {
-                    "id": str(product.id),
-                    "name": product.name,
-                    "price": product.price,
-                    "stock": getattr(product, 'stock', 0),
+        for customer in query.all():
+            changes['customers'].append({
+                'id': str(customer.id),
+                'action': 'update' if (customer.updated_at and since and customer.updated_at >= since) else 'create',
+                'data': {
+                    'id': str(customer.id),
+                    'name': customer.name,
+                    'email': customer.email,
+                    'phone': customer.phone,
+                    'address': customer.address,
+                    'city': customer.city,
+                    'type': getattr(customer, 'type', 'regular'),
+                    'total_debt': float(getattr(customer, 'total_debt', 0)),
+                    'total_purchases': float(getattr(customer, 'total_purchases', 0)),
+                    'is_active': customer.is_active,
+                    'branch_id': str(customer.branch_id) if customer.branch_id else None,
+                    'pharmacy_id': str(customer.pharmacy_id) if customer.pharmacy_id else None
                 },
-                "timestamp": (product.updated_at or product.created_at).isoformat() if (product.updated_at or product.created_at) else None
+                'timestamp': (customer.updated_at or customer.created_at).isoformat() if (customer.updated_at or customer.created_at) else None
             })
         
-        # Récupérer les catégories modifiées
-        query_categories = db.query(Category).filter(Category.tenant_id == tenant_id)
-        if last_sync:
-            query_categories = query_categories.filter(
-                (Category.updated_at > last_sync) | (Category.created_at > last_sync)
+        # 4. Ventes
+        from app.models.sale import Sale, SaleItem
+        query = db.query(Sale).filter(Sale.tenant_id == tenant_id)
+        if since:
+            query = query.filter(
+                (Sale.updated_at >= since) | (Sale.created_at >= since)
             )
         
-        for category in query_categories.all():
-            # CORRECTION: Vérifier si last_sync existe avant comparaison
-            if last_sync and category.updated_at:
-                action = "update" if category.updated_at > last_sync else "create"
-            elif last_sync and category.created_at:
-                action = "create" if category.created_at > last_sync else "update"
-            else:
-                action = "create"
-            
-            changes.append({
-                "table": "categories",
-                "action": action,
-                "data": {
-                    "id": str(category.id),
-                    "name": category.name,
-                    "description": getattr(category, 'description', ''),
+        for sale in query.all():
+            changes['sales'].append({
+                'id': str(sale.id),
+                'action': 'update' if (sale.updated_at and since and sale.updated_at >= since) else 'create',
+                'data': {
+                    'id': str(sale.id),
+                    'reference': sale.reference,
+                    'total_amount': float(sale.total_amount),
+                    'customer_name': sale.customer_name,
+                    'customer_phone': sale.customer_phone,
+                    'customer_email': sale.customer_email,
+                    'payment_method': sale.payment_method,
+                    'is_credit': sale.is_credit,
+                    'status': sale.status,
+                    'branch_id': str(sale.branch_id) if sale.branch_id else None,
+                    'pharmacy_id': str(sale.pharmacy_id) if sale.pharmacy_id else None,
+                    'created_by': str(sale.created_by) if sale.created_by else None,
+                    'seller_name': sale.seller_name,
+                    'global_discount': float(sale.global_discount) if sale.global_discount else 0,
+                    'notes': sale.notes,
+                    'created_at': sale.created_at.isoformat() if sale.created_at else None,
+                    'updated_at': sale.updated_at.isoformat() if sale.updated_at else None,
+                    'items': [
+                        {
+                            'id': str(item.id),
+                            'product_id': str(item.product_id),
+                            'product_name': item.product_name,
+                            'product_code': item.product_code,
+                            'quantity': float(item.quantity),
+                            'unit_price': float(item.unit_price),
+                            'discount_percent': float(item.discount_percent) if item.discount_percent else 0,
+                            'discount_amount': float(item.discount_amount) if item.discount_amount else 0,
+                            'tva_rate': float(item.tva_rate) if item.tva_rate else 0,
+                            'tva_amount': float(item.tva_amount) if item.tva_amount else 0,
+                            'subtotal': float(item.subtotal) if item.subtotal else 0,
+                            'total': float(item.total) if item.total else 0
+                        }
+                        for item in sale.items
+                    ]
                 },
-                "timestamp": (category.updated_at or category.created_at).isoformat() if (category.updated_at or category.created_at) else None
+                'timestamp': (sale.updated_at or sale.created_at).isoformat() if (sale.updated_at or sale.created_at) else None
             })
         
-        # Récupérer les clients modifiés
-        query_customers = db.query(Customer).filter(Customer.tenant_id == tenant_id)
-        if last_sync:
-            query_customers = query_customers.filter(
-                (Customer.updated_at > last_sync) | (Customer.created_at > last_sync)
+        # 5. Dettes
+        from app.models.debt import Debt
+        query = db.query(Debt).filter(Debt.tenant_id == tenant_id)
+        if since:
+            query = query.filter(
+                (Debt.updated_at >= since) | (Debt.created_at >= since)
             )
         
-        for customer in query_customers.all():
-            # CORRECTION: Vérifier si last_sync existe avant comparaison
-            if last_sync and customer.updated_at:
-                action = "update" if customer.updated_at > last_sync else "create"
-            elif last_sync and customer.created_at:
-                action = "create" if customer.created_at > last_sync else "update"
-            else:
-                action = "create"
-            
-            changes.append({
-                "table": "customers",
-                "action": action,
-                "data": {
-                    "id": str(customer.id),
-                    "name": customer.name,
-                    "email": getattr(customer, 'email', ''),
-                    "phone": getattr(customer, 'phone', ''),
-                    "address": getattr(customer, 'address', ''),
+        for debt in query.all():
+            changes['debts'].append({
+                'id': str(debt.id),
+                'action': 'update' if (debt.updated_at and since and debt.updated_at >= since) else 'create',
+                'data': {
+                    'id': str(debt.id),
+                    'customer_id': str(debt.customer_id) if debt.customer_id else None,
+                    'customer_name': debt.customer.name if debt.customer else None,
+                    'sale_id': str(debt.sale_id) if debt.sale_id else None,
+                    'debt_number': getattr(debt, 'debt_number', f"DEBT-{debt.created_at.strftime('%Y%m%d')}" if debt.created_at else None),
+                    'initial_amount': float(debt.initial_amount),
+                    'total_amount': float(debt.total_amount) if hasattr(debt, 'total_amount') else float(debt.initial_amount),
+                    'paid_amount': float(debt.paid_amount),
+                    'remaining_amount': float(debt.remaining_amount),
+                    'interest_rate': float(debt.interest_rate) if debt.interest_rate else 0,
+                    'interest_amount': float(debt.interest_amount) if debt.interest_amount else 0,
+                    'issue_date': debt.issue_date.isoformat() if debt.issue_date else None,
+                    'due_date': debt.due_date.isoformat() if debt.due_date else None,
+                    'status': debt.status,
+                    'is_overdue': debt.days_overdue > 0 if hasattr(debt, 'days_overdue') else False,
+                    'notes': debt.notes,
+                    'is_active': debt.is_active,
+                    'branch_id': str(debt.branch_id) if hasattr(debt, 'branch_id') and debt.branch_id else None,
+                    'pharmacy_id': str(debt.pharmacy_id) if hasattr(debt, 'pharmacy_id') and debt.pharmacy_id else None,
+                    'created_at': debt.created_at.isoformat() if debt.created_at else None,
+                    'updated_at': debt.updated_at.isoformat() if debt.updated_at else None
                 },
-                "timestamp": (customer.updated_at or customer.created_at).isoformat() if (customer.updated_at or customer.created_at) else None
+                'timestamp': (debt.updated_at or debt.created_at).isoformat() if (debt.updated_at or debt.created_at) else None
             })
         
-        # Récupérer les commandes modifiées
-        query_orders = db.query(Order).filter(Order.tenant_id == tenant_id)
-        if last_sync:
-            query_orders = query_orders.filter(
-                (Order.updated_at > last_sync) | (Order.created_at > last_sync)
+        # 6. Paiements de dettes
+        from app.models.debt_payment import DebtPayment
+        query = db.query(DebtPayment).filter(DebtPayment.tenant_id == tenant_id)
+        if since:
+            query = query.filter(DebtPayment.created_at >= since)
+        
+        for payment in query.all():
+            changes['debt_payments'].append({
+                'id': str(payment.id),
+                'action': 'create',
+                'data': {
+                    'id': str(payment.id),
+                    'debt_id': str(payment.debt_id),
+                    'customer_id': str(payment.customer_id) if payment.customer_id else None,
+                    'amount': float(payment.amount),
+                    'payment_method': payment.payment_method,
+                    'payment_date': payment.payment_date.isoformat() if hasattr(payment, 'payment_date') and payment.payment_date else payment.created_at.isoformat(),
+                    'reference': payment.reference,
+                    'notes': payment.notes,
+                    'processed_by': str(payment.processed_by) if payment.processed_by else None,
+                    'created_at': payment.created_at.isoformat() if payment.created_at else None
+                },
+                'timestamp': payment.created_at.isoformat() if payment.created_at else None
+            })
+        
+        # 7. Utilisateurs
+        from app.models.user import User
+        query = db.query(User).filter(User.tenant_id == tenant_id)
+        if since:
+            query = query.filter(
+                (User.updated_at >= since) | (User.created_at >= since)
             )
         
-        for order in query_orders.all():
-            # CORRECTION: Vérifier si last_sync existe avant comparaison
-            if last_sync and order.updated_at:
-                action = "update" if order.updated_at > last_sync else "create"
-            elif last_sync and order.created_at:
-                action = "create" if order.created_at > last_sync else "update"
-            else:
-                action = "create"
-            
-            changes.append({
-                "table": "orders",
-                "action": action,
-                "data": {
-                    "id": str(order.id),
-                    "total": getattr(order, 'total', 0),
-                    "status": getattr(order, 'status', 'pending'),
+        for user in query.all():
+            changes['users'].append({
+                'id': str(user.id),
+                'action': 'update' if (user.updated_at and since and user.updated_at >= since) else 'create',
+                'data': {
+                    'id': str(user.id),
+                    'email': user.email,
+                    'nom_complet': user.nom_complet,
+                    'role': user.role,
+                    'telephone': user.telephone,
+                    'adresse': user.adresse,
+                    'actif': user.actif,
+                    'active_pharmacy_id': str(user.active_pharmacy_id) if user.active_pharmacy_id else None,
+                    'active_branch_id': str(user.active_branch_id) if user.active_branch_id else None,
+                    'permissions': user.permissions,
+                    'last_login': user.last_login.isoformat() if user.last_login else None,
+                    'created_at': user.created_at.isoformat() if user.created_at else None,
+                    'updated_at': user.updated_at.isoformat() if user.updated_at else None
                 },
-                "timestamp": (order.updated_at or order.created_at).isoformat() if (order.updated_at or order.created_at) else None
+                'timestamp': (user.updated_at or user.created_at).isoformat() if (user.updated_at or user.created_at) else None
             })
         
-        logger.info(f"Récupéré {len(changes)} changements pour tenant {tenant_id}")
+        # 8. Branches
+        from app.models.branch import Branch
+        query = db.query(Branch).filter(Branch.tenant_id == tenant_id)
+        if since:
+            query = query.filter(
+                (Branch.updated_at >= since) | (Branch.created_at >= since)
+            )
+        
+        for branch in query.all():
+            changes['branches'].append({
+                'id': str(branch.id),
+                'action': 'update' if (branch.updated_at and since and branch.updated_at >= since) else 'create',
+                'data': {
+                    'id': str(branch.id),
+                    'name': branch.name,
+                    'code': branch.code,
+                    'address': branch.address,
+                    'city': branch.city,
+                    'country': branch.country,
+                    'phone': branch.phone,
+                    'email': branch.email,
+                    'latitude': float(branch.latitude) if branch.latitude else None,
+                    'longitude': float(branch.longitude) if branch.longitude else None,
+                    'manager_name': branch.manager_name,
+                    'manager_id': str(branch.manager_id) if branch.manager_id else None,
+                    'opening_hours': branch.opening_hours,
+                    'config': branch.config,
+                    'is_active': branch.is_active,
+                    'is_main_branch': branch.is_main_branch,
+                    'parent_pharmacy_id': str(branch.parent_pharmacy_id) if branch.parent_pharmacy_id else None,
+                    'created_at': branch.created_at.isoformat() if branch.created_at else None,
+                    'updated_at': branch.updated_at.isoformat() if branch.updated_at else None
+                },
+                'timestamp': (branch.updated_at or branch.created_at).isoformat() if (branch.updated_at or branch.created_at) else None
+            })
+        
+        # 9. Pharmacies
+        from app.models.pharmacy import Pharmacy
+        query = db.query(Pharmacy).filter(Pharmacy.tenant_id == tenant_id)
+        if since:
+            query = query.filter(
+                (Pharmacy.updated_at >= since) | (Pharmacy.created_at >= since)
+            )
+        
+        for pharmacy in query.all():
+            changes['pharmacies'].append({
+                'id': str(pharmacy.id),
+                'action': 'update' if (pharmacy.updated_at and since and pharmacy.updated_at >= since) else 'create',
+                'data': {
+                    'id': str(pharmacy.id),
+                    'name': pharmacy.name,
+                    'license_number': pharmacy.license_number,
+                    'address': pharmacy.address,
+                    'city': pharmacy.city,
+                    'country': pharmacy.country,
+                    'phone': pharmacy.phone,
+                    'email': pharmacy.email,
+                    'is_active': pharmacy.is_active,
+                    'opening_hours': pharmacy.opening_hours,
+                    'pharmacist_in_charge': pharmacy.pharmacist_in_charge,
+                    'pharmacist_license': pharmacy.pharmacist_license,
+                    'config': pharmacy.config,
+                    'created_at': pharmacy.created_at.isoformat() if pharmacy.created_at else None,
+                    'updated_at': pharmacy.updated_at.isoformat() if pharmacy.updated_at else None
+                },
+                'timestamp': (pharmacy.updated_at or pharmacy.created_at).isoformat() if (pharmacy.updated_at or pharmacy.created_at) else None
+            })
+        
+        # 10. Abonnements
+        from app.models.tenant import Subscription
+        query = db.query(Subscription).filter(Subscription.tenant_id == tenant_id)
+        if since:
+            query = query.filter(
+                (Subscription.updated_at >= since) | (Subscription.created_at >= since)
+            )
+        
+        for sub in query.all():
+            changes['subscriptions'].append({
+                'id': str(sub.id),
+                'action': 'update' if (sub.updated_at and since and sub.updated_at >= since) else 'create',
+                'data': {
+                    'id': str(sub.id),
+                    'tenant_id': str(sub.tenant_id),
+                    'plan_name': sub.plan_name,
+                    'plan_type': sub.plan_type,
+                    'status': sub.status,
+                    'max_users': sub.max_users,
+                    'max_products': sub.max_products,
+                    'max_branches': getattr(sub, 'max_branches', 0),
+                    'features': sub.features,
+                    'billing_cycle': sub.billing_cycle,
+                    'price': float(sub.price) if sub.price else 0,
+                    'currency': sub.currency,
+                    'current_period_start': sub.current_period_start.isoformat() if sub.current_period_start else None,
+                    'current_period_end': sub.current_period_end.isoformat() if sub.current_period_end else None,
+                    'cancel_at_period_end': sub.cancel_at_period_end,
+                    'is_active': sub.is_active,
+                    'created_at': sub.created_at.isoformat() if sub.created_at else None,
+                    'updated_at': sub.updated_at.isoformat() if sub.updated_at else None
+                },
+                'timestamp': (sub.updated_at or sub.created_at).isoformat() if (sub.updated_at or sub.created_at) else None
+            })
+        
+        # 11. Mouvements de stock
+        from app.models.stock_movement import StockMovement
+        query = db.query(StockMovement).filter(StockMovement.tenant_id == tenant_id)
+        if since:
+            query = query.filter(StockMovement.created_at >= since)
+        
+        for movement in query.order_by(StockMovement.created_at.desc()).limit(500).all():
+            changes['stock_movements'].append({
+                'id': str(movement.id),
+                'action': 'create',
+                'data': {
+                    'id': str(movement.id),
+                    'product_id': str(movement.product_id),
+                    'product_name': getattr(movement.product, 'name', None),
+                    'quantity_before': float(movement.quantity_before or 0),
+                    'quantity_after': float(movement.quantity_after or 0),
+                    'quantity_change': float(movement.quantity_change or 0),
+                    'movement_type': movement.movement_type,
+                    'reason': movement.reason,
+                    'reference': movement.reference,
+                    'branch_id': str(movement.branch_id) if movement.branch_id else None,
+                    'pharmacy_id': str(movement.pharmacy_id) if movement.pharmacy_id else None,
+                    'created_at': movement.created_at.isoformat() if movement.created_at else None
+                },
+                'timestamp': movement.created_at.isoformat() if movement.created_at else None
+            })
+        
+        logger.info(f"Récupéré {sum(len(v) for v in changes.values())} changements pour tenant {tenant_id}")
         
     except Exception as e:
-        logger.error(f"Erreur lors de la récupération des changements: {str(e)}")
+        logger.error(f"Erreur lors de la récupération des changements: {str(e)}", exc_info=True)
         raise
     
     return changes
 
-def get_sync_status(db: Session, tenant_id: str) -> Dict[str, Any]:
+
+def get_sync_status(db: Session, tenant_id: UUID) -> Dict[str, Any]:
     """
-    Récupère le statut de synchronisation.
+    Récupère le statut de synchronisation pour un tenant.
     
     Args:
         db: Session SQLAlchemy
@@ -269,327 +519,820 @@ def get_sync_status(db: Session, tenant_id: str) -> Dict[str, Any]:
     Returns:
         Dict contenant le statut de synchronisation
     """
-    try:
-        # Récupérer la dernière synchronisation
-        last_sync = db.query(SyncLog).filter(
-            SyncLog.tenant_id == tenant_id
-        ).order_by(SyncLog.created_at.desc()).first()
-        
-        # Compter les changements en attente
-        pending_changes = get_pending_changes_count(db, tenant_id, last_sync.created_at if last_sync else None)
-        
-        return {
-            "last_sync": last_sync.created_at.isoformat() if last_sync else None,
-            "status": "active",
-            "pending_changes": pending_changes,
-            "tenant_id": tenant_id,
-            "last_sync_count": get_last_sync_count(db, tenant_id),
-        }
-    except Exception as e:
-        logger.error(f"Erreur lors de la récupération du statut: {str(e)}")
-        return {
-            "last_sync": None,
-            "status": "unknown",
-            "error": str(e),
-            "tenant_id": tenant_id,
-            "pending_changes": 0,
-        }
-
-
-def get_pending_changes_count(db: Session, tenant_id: str, last_sync: Optional[datetime] = None) -> int:
-    """
-    Compte le nombre de changements en attente de synchronisation.
+    from app.models.sale import Sale
+    from app.models.product import Product
+    from app.models.user import User
+    from app.models.branch import Branch
+    from app.models.debt import Debt
+    from app.models.customer import Customer
     
-    Args:
-        db: Session SQLAlchemy
-        tenant_id: Identifiant du tenant
-        last_sync: Date de dernière synchronisation
-        
-    Returns:
-        Nombre de changements en attente
-    """
-    try:
-        from app.models.product import Product
-        from app.models.category import Category
-        from app.models.customer import Customer
-        from app.models.order import Order
-        
-        count = 0
-        
-        if not last_sync:
-            # Si jamais synchronisé, compter tous les enregistrements
-            count += db.query(Product).filter(Product.tenant_id == tenant_id).count()
-            count += db.query(Category).filter(Category.tenant_id == tenant_id).count()
-            count += db.query(Customer).filter(Customer.tenant_id == tenant_id).count()
-            count += db.query(Order).filter(Order.tenant_id == tenant_id).count()
-        else:
-            # Compter uniquement les modifications depuis last_sync
-            count += db.query(Product).filter(
-                Product.tenant_id == tenant_id,
-                (Product.updated_at > last_sync) | (Product.created_at > last_sync)
-            ).count()
-            count += db.query(Category).filter(
-                Category.tenant_id == tenant_id,
-                (Category.updated_at > last_sync) | (Category.created_at > last_sync)
-            ).count()
-            count += db.query(Customer).filter(
-                Customer.tenant_id == tenant_id,
-                (Customer.updated_at > last_sync) | (Customer.created_at > last_sync)
-            ).count()
-            count += db.query(Order).filter(
-                Order.tenant_id == tenant_id,
-                (Order.updated_at > last_sync) | (Order.created_at > last_sync)
-            ).count()
-        
-        return count
-    except Exception as e:
-        logger.error(f"Erreur lors du comptage des changements: {str(e)}")
-        return 0
-
-
-def get_last_sync_count(db: Session, tenant_id: str) -> int:
-    """
-    Récupère le nombre d'items synchronisés lors de la dernière sync.
+    last_sale = db.query(Sale).filter(Sale.tenant_id == tenant_id).order_by(Sale.updated_at.desc()).first()
+    last_product = db.query(Product).filter(Product.tenant_id == tenant_id).order_by(Product.updated_at.desc()).first()
+    last_user = db.query(User).filter(User.tenant_id == tenant_id).order_by(User.updated_at.desc()).first()
+    last_branch = db.query(Branch).filter(Branch.tenant_id == tenant_id).order_by(Branch.updated_at.desc()).first()
+    last_debt = db.query(Debt).filter(Debt.tenant_id == tenant_id).order_by(Debt.updated_at.desc()).first()
+    last_customer = db.query(Customer).filter(Customer.tenant_id == tenant_id).order_by(Customer.updated_at.desc()).first()
     
-    Args:
-        db: Session SQLAlchemy
-        tenant_id: Identifiant du tenant
-        
-    Returns:
-        Nombre d'items synchronisés
-    """
-    try:
-        last_sync = db.query(SyncLog).filter(
-            SyncLog.tenant_id == tenant_id
-        ).order_by(SyncLog.created_at.desc()).first()
-        
-        if last_sync:
-            # Compter les logs de la même date
-            return db.query(SyncLog).filter(
-                SyncLog.tenant_id == tenant_id,
-                SyncLog.created_at >= last_sync.created_at.replace(hour=0, minute=0, second=0),
-                SyncLog.created_at <= last_sync.created_at.replace(hour=23, minute=59, second=59)
-            ).count()
-        
-        return 0
-    except Exception as e:
-        logger.error(f"Erreur lors de la récupération du dernier comptage: {str(e)}")
-        return 0
+    counts = {
+        'sales': db.query(Sale).filter(Sale.tenant_id == tenant_id).count(),
+        'products': db.query(Product).filter(Product.tenant_id == tenant_id).count(),
+        'users': db.query(User).filter(User.tenant_id == tenant_id).count(),
+        'branches': db.query(Branch).filter(Branch.tenant_id == tenant_id).count(),
+        'debts': db.query(Debt).filter(Debt.tenant_id == tenant_id).count(),
+        'customers': db.query(Customer).filter(Customer.tenant_id == tenant_id).count(),
+    }
+    
+    total_pending_debts = db.query(Debt).filter(
+        Debt.tenant_id == tenant_id,
+        Debt.remaining_amount > 0,
+        Debt.status.in_(["pending", "partial", "overdue"])
+    ).count()
+    
+    total_overdue_amount = db.query(Debt).filter(
+        Debt.tenant_id == tenant_id,
+        Debt.due_date < date.today(),
+        Debt.remaining_amount > 0
+    ).with_entities(Debt.remaining_amount).all()
+    
+    total_overdue = sum(float(d[0]) for d in total_overdue_amount) if total_overdue_amount else 0
+    
+    return {
+        'last_sync': None,
+        'status': 'active',
+        'tenant_id': str(tenant_id),
+        'last_update': {
+            'sales': last_sale.updated_at.isoformat() if last_sale else None,
+            'products': last_product.updated_at.isoformat() if last_product else None,
+            'users': last_user.updated_at.isoformat() if last_user else None,
+            'branches': last_branch.updated_at.isoformat() if last_branch else None,
+            'debts': last_debt.updated_at.isoformat() if last_debt else None,
+            'customers': last_customer.updated_at.isoformat() if last_customer else None
+        },
+        'counts': counts,
+        'debts_summary': {
+            'total_pending_debts': total_pending_debts,
+            'total_overdue_amount': total_overdue
+        }
+    }
 
 
 # ==========================================================
 # HANDLERS PAR TABLE
 # ==========================================================
 
-def process_product_sync(db: Session, tenant_id: str, action: str, data: Dict[str, Any]):
-    """
-    Traite la synchronisation des produits.
-    
-    Args:
-        db: Session SQLAlchemy
-        tenant_id: Identifiant du tenant
-        action: CREATE, UPDATE, DELETE
-        data: Données du produit
-    """
+def _sync_product(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Synchronise un produit"""
     from app.models.product import Product
+    from uuid import UUID as UUIDType
     
-    action_upper = action.upper()
-    
-    if action_upper == 'CREATE':
-        product = Product(
-            tenant_id=tenant_id,
-            name=data.get('name'),
-            price=data.get('price'),
-            stock=data.get('stock', 0),
-            description=data.get('description', ''),
-            # ... autres champs
-        )
-        db.add(product)
-        
-    elif action_upper == 'UPDATE':
+    try:
         product_id = data.get('id')
-        if not product_id:
-            logger.warning(f"ID manquant pour la mise à jour du produit")
-            return
-            
-        product = db.query(Product).filter(
-            Product.id == product_id,
-            Product.tenant_id == tenant_id
-        ).first()
+        if product_id and isinstance(product_id, str):
+            product_id = UUIDType(product_id)
         
-        if product:
-            for key, value in data.items():
-                if hasattr(product, key) and key not in ['id', 'tenant_id', 'created_at']:
-                    setattr(product, key, value)
-            product.updated_at = datetime.utcnow()
-        else:
-            logger.warning(f"Produit {product_id} non trouvé pour la mise à jour")
-                    
-    elif action_upper == 'DELETE':
-        product_id = data.get('id')
+        existing = None
         if product_id:
-            db.query(Product).filter(
+            existing = db.query(Product).filter(
                 Product.id == product_id,
                 Product.tenant_id == tenant_id
-            ).delete()
-        else:
-            logger.warning(f"ID manquant pour la suppression du produit")
+            ).first()
+        
+        action_upper = action.upper()
+        
+        if action_upper == 'DELETE':
+            if existing:
+                existing.is_active = False
+                existing.deleted_at = datetime.utcnow()
+                db.flush()
+                return {'success': True, 'id': str(product_id), 'action': 'deleted'}
+            return {'success': False, 'error': 'Produit non trouvé'}
+        
+        if existing and action_upper in ['UPDATE', 'UPSERT']:
+            for field, value in data.items():
+                if field != 'id' and hasattr(existing, field):
+                    setattr(existing, field, value)
+            existing.updated_at = datetime.utcnow()
+            if hasattr(existing, 'refresh_statuses'):
+                existing.refresh_statuses()
+            db.flush()
+            return {'success': True, 'id': str(existing.id), 'action': 'updated'}
+        
+        elif action_upper in ['CREATE', 'UPSERT']:
+            data.pop('id', None)
+            product = Product(
+                tenant_id=tenant_id,
+                **{k: v for k, v in data.items() if hasattr(Product, k)}
+            )
+            if hasattr(product, 'refresh_statuses'):
+                product.refresh_statuses()
+            db.add(product)
+            db.flush()
+            return {'success': True, 'id': str(product.id), 'action': 'created'}
+        
+        return {'success': False, 'error': f'Action non supportée: {action}'}
+        
+    except Exception as e:
+        logger.error(f"Erreur sync product: {e}", exc_info=True)
+        return {'success': False, 'error': str(e)}
 
 
-def process_category_sync(db: Session, tenant_id: str, action: str, data: Dict[str, Any]):
-    """
-    Traite la synchronisation des catégories.
-    
-    Args:
-        db: Session SQLAlchemy
-        tenant_id: Identifiant du tenant
-        action: CREATE, UPDATE, DELETE
-        data: Données de la catégorie
-    """
+def _sync_category(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Synchronise une catégorie"""
     from app.models.category import Category
+    from uuid import UUID as UUIDType
     
-    action_upper = action.upper()
-    
-    if action_upper == 'CREATE':
-        category = Category(
-            tenant_id=tenant_id,
-            name=data.get('name'),
-            description=data.get('description', '')
-        )
-        db.add(category)
-        
-    elif action_upper == 'UPDATE':
+    try:
         category_id = data.get('id')
-        if not category_id:
-            logger.warning(f"ID manquant pour la mise à jour de la catégorie")
-            return
-            
-        category = db.query(Category).filter(
-            Category.id == category_id,
-            Category.tenant_id == tenant_id
-        ).first()
+        if category_id and isinstance(category_id, str):
+            category_id = UUIDType(category_id)
         
-        if category:
-            category.name = data.get('name', category.name)
-            category.description = data.get('description', category.description)
-            category.updated_at = datetime.utcnow()
-        else:
-            logger.warning(f"Catégorie {category_id} non trouvée pour la mise à jour")
-            
-    elif action_upper == 'DELETE':
-        category_id = data.get('id')
+        existing = None
         if category_id:
-            db.query(Category).filter(
+            existing = db.query(Category).filter(
                 Category.id == category_id,
                 Category.tenant_id == tenant_id
-            ).delete()
-        else:
-            logger.warning(f"ID manquant pour la suppression de la catégorie")
+            ).first()
+        
+        action_upper = action.upper()
+        
+        if action_upper == 'DELETE':
+            if existing:
+                existing.is_active = False
+                db.flush()
+                return {'success': True, 'id': str(category_id), 'action': 'deactivated'}
+            return {'success': False, 'error': 'Catégorie non trouvée'}
+        
+        if existing and action_upper in ['UPDATE', 'UPSERT']:
+            for field, value in data.items():
+                if field != 'id' and hasattr(existing, field):
+                    setattr(existing, field, value)
+            existing.updated_at = datetime.utcnow()
+            db.flush()
+            return {'success': True, 'id': str(existing.id), 'action': 'updated'}
+        
+        elif action_upper in ['CREATE', 'UPSERT']:
+            data.pop('id', None)
+            category = Category(
+                tenant_id=tenant_id,
+                **{k: v for k, v in data.items() if hasattr(Category, k)}
+            )
+            db.add(category)
+            db.flush()
+            return {'success': True, 'id': str(category.id), 'action': 'created'}
+        
+        return {'success': False, 'error': f'Action non supportée: {action}'}
+        
+    except Exception as e:
+        logger.error(f"Erreur sync category: {e}", exc_info=True)
+        return {'success': False, 'error': str(e)}
 
 
-def process_customer_sync(db: Session, tenant_id: str, action: str, data: Dict[str, Any]):
-    """
-    Traite la synchronisation des clients.
-    
-    Args:
-        db: Session SQLAlchemy
-        tenant_id: Identifiant du tenant
-        action: CREATE, UPDATE, DELETE
-        data: Données du client
-    """
+def _sync_customer(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Synchronise un client"""
     from app.models.customer import Customer
+    from uuid import UUID as UUIDType
     
-    action_upper = action.upper()
-    
-    if action_upper == 'CREATE':
-        customer = Customer(
-            tenant_id=tenant_id,
-            name=data.get('name'),
-            email=data.get('email'),
-            phone=data.get('phone'),
-            address=data.get('address', '')
-        )
-        db.add(customer)
-        
-    elif action_upper == 'UPDATE':
+    try:
         customer_id = data.get('id')
-        if not customer_id:
-            logger.warning(f"ID manquant pour la mise à jour du client")
-            return
-            
-        customer = db.query(Customer).filter(
-            Customer.id == customer_id,
-            Customer.tenant_id == tenant_id
-        ).first()
+        if customer_id and isinstance(customer_id, str):
+            customer_id = UUIDType(customer_id)
         
-        if customer:
-            for key, value in data.items():
-                if hasattr(customer, key) and key not in ['id', 'tenant_id', 'created_at']:
-                    setattr(customer, key, value)
-            customer.updated_at = datetime.utcnow()
-        else:
-            logger.warning(f"Client {customer_id} non trouvé pour la mise à jour")
-                    
-    elif action_upper == 'DELETE':
-        customer_id = data.get('id')
+        existing = None
         if customer_id:
-            db.query(Customer).filter(
+            existing = db.query(Customer).filter(
                 Customer.id == customer_id,
                 Customer.tenant_id == tenant_id
-            ).delete()
-        else:
-            logger.warning(f"ID manquant pour la suppression du client")
-
-
-def process_order_sync(db: Session, tenant_id: str, action: str, data: Dict[str, Any]):
-    """
-    Traite la synchronisation des commandes.
-    
-    Args:
-        db: Session SQLAlchemy
-        tenant_id: Identifiant du tenant
-        action: CREATE, UPDATE, DELETE
-        data: Données de la commande
-    """
-    from app.models.order import Order
-    
-    action_upper = action.upper()
-    
-    if action_upper == 'CREATE':
-        order = Order(
-            tenant_id=tenant_id,
-            customer_id=data.get('customer_id'),
-            total=data.get('total', 0),
-            status=data.get('status', 'pending'),
-            items=data.get('items', [])
-        )
-        db.add(order)
+            ).first()
         
-    elif action_upper == 'UPDATE':
-        order_id = data.get('id')
-        if not order_id:
-            logger.warning(f"ID manquant pour la mise à jour de la commande")
-            return
+        action_upper = action.upper()
+        
+        if action_upper == 'DELETE':
+            if existing:
+                existing.is_active = False
+                db.flush()
+                return {'success': True, 'id': str(customer_id), 'action': 'deactivated'}
+            return {'success': False, 'error': 'Client non trouvé'}
+        
+        if existing and action_upper in ['UPDATE', 'UPSERT']:
+            for field, value in data.items():
+                if field != 'id' and hasattr(existing, field):
+                    setattr(existing, field, value)
+            existing.updated_at = datetime.utcnow()
+            db.flush()
+            return {'success': True, 'id': str(existing.id), 'action': 'updated'}
+        
+        elif action_upper in ['CREATE', 'UPSERT']:
+            data.pop('id', None)
+            customer = Customer(
+                tenant_id=tenant_id,
+                **{k: v for k, v in data.items() if hasattr(Customer, k)}
+            )
+            db.add(customer)
+            db.flush()
+            return {'success': True, 'id': str(customer.id), 'action': 'created'}
+        
+        return {'success': False, 'error': f'Action non supportée: {action}'}
+        
+    except Exception as e:
+        logger.error(f"Erreur sync customer: {e}", exc_info=True)
+        return {'success': False, 'error': str(e)}
+
+
+def _sync_sale(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Synchronise une vente"""
+    from app.models.sale import Sale, SaleItem
+    from app.models.product import Product
+    from app.models.stock_movement import StockMovement
+    from uuid import UUID as UUIDType
+    from decimal import Decimal
+    
+    try:
+        sale_id = data.get('id')
+        if sale_id and isinstance(sale_id, str):
+            sale_id = UUIDType(sale_id)
+        
+        existing = None
+        if sale_id:
+            existing = db.query(Sale).filter(
+                Sale.id == sale_id,
+                Sale.tenant_id == tenant_id
+            ).first()
+        
+        action_upper = action.upper()
+        
+        if action_upper == 'DELETE':
+            if existing:
+                existing.status = "cancelled"
+                db.flush()
+                return {'success': True, 'id': str(sale_id), 'action': 'cancelled'}
+            return {'success': False, 'error': 'Vente non trouvée'}
+        
+        if existing and action_upper in ['UPDATE', 'UPSERT']:
+            items_data = data.pop('items', [])
+            for field, value in data.items():
+                if field != 'id' and hasattr(existing, field):
+                    setattr(existing, field, value)
+            existing.updated_at = datetime.utcnow()
+            db.flush()
+            return {'success': True, 'id': str(existing.id), 'action': 'updated'}
+        
+        elif action_upper in ['CREATE', 'UPSERT']:
+            items_data = data.pop('items', [])
+            data.pop('id', None)
             
-        order = db.query(Order).filter(
-            Order.id == order_id,
-            Order.tenant_id == tenant_id
-        ).first()
-        
-        if order:
-            for key, value in data.items():
-                if hasattr(order, key) and key not in ['id', 'tenant_id', 'created_at']:
-                    setattr(order, key, value)
-            order.updated_at = datetime.utcnow()
-        else:
-            logger.warning(f"Commande {order_id} non trouvée pour la mise à jour")
+            # Créer la vente
+            sale = Sale(
+                tenant_id=tenant_id,
+                **{k: v for k, v in data.items() if hasattr(Sale, k)}
+            )
+            db.add(sale)
+            db.flush()
+            
+            # Créer les items et gérer le stock
+            for item_data in items_data:
+                item_data.pop('id', None)
+                
+                # Récupérer le produit pour la gestion du stock
+                product_id = item_data.get('product_id')
+                if product_id and isinstance(product_id, str):
+                    product_id = UUIDType(product_id)
+                
+                product = None
+                if product_id:
+                    product = db.query(Product).filter(
+                        Product.id == product_id,
+                        Product.tenant_id == tenant_id
+                    ).first()
+                
+                quantity = Decimal(str(item_data.get('quantity', 1)))
+                
+                sale_item = SaleItem(
+                    tenant_id=tenant_id,
+                    sale_id=sale.id,
+                    **{k: v for k, v in item_data.items() if hasattr(SaleItem, k)}
+                )
+                db.add(sale_item)
+                db.flush()
+                
+                # Mettre à jour le stock si nécessaire
+                if product and sale.status == "completed":
+                    old_quantity = product.quantity or 0
+                    new_quantity = max(0, old_quantity - int(quantity))
+                    product.quantity = new_quantity
+                    if hasattr(product, 'available_quantity'):
+                        product.available_quantity = max(0, new_quantity - (product.reserved_quantity or 0))
+                    if hasattr(product, 'refresh_statuses'):
+                        product.refresh_statuses()
                     
-    elif action_upper == 'DELETE':
-        order_id = data.get('id')
-        if order_id:
-            db.query(Order).filter(
-                Order.id == order_id,
-                Order.tenant_id == tenant_id
-            ).delete()
+                    # Mouvement de stock
+                    movement = StockMovement(
+                        tenant_id=tenant_id,
+                        product_id=product.id,
+                        pharmacy_id=sale.pharmacy_id,
+                        branch_id=sale.branch_id,
+                        quantity_before=old_quantity,
+                        quantity_after=new_quantity,
+                        quantity_change=-int(quantity),
+                        movement_type="sale",
+                        reason=f"Vente #{sale.reference}",
+                        reference=sale.reference,
+                        sale_id=sale.id,
+                        sale_item_id=sale_item.id,
+                        created_by=sale.created_by
+                    )
+                    db.add(movement)
+            
+            db.flush()
+            return {'success': True, 'id': str(sale.id), 'action': 'created'}
+        
+        return {'success': False, 'error': f'Action non supportée: {action}'}
+        
+    except Exception as e:
+        logger.error(f"Erreur sync sale: {e}", exc_info=True)
+        return {'success': False, 'error': str(e)}
+
+
+def _sync_debt(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Synchronise une dette"""
+    from app.models.debt import Debt
+    from app.models.customer import Customer
+    from uuid import UUID as UUIDType
+    from decimal import Decimal
+    
+    try:
+        debt_id = data.get('id')
+        if debt_id and isinstance(debt_id, str):
+            debt_id = UUIDType(debt_id)
+        
+        existing = None
+        if debt_id:
+            existing = db.query(Debt).filter(
+                Debt.id == debt_id,
+                Debt.tenant_id == tenant_id
+            ).first()
+        
+        action_upper = action.upper()
+        
+        if action_upper == 'DELETE':
+            if existing:
+                db.delete(existing)
+                db.flush()
+                return {'success': True, 'id': str(debt_id), 'action': 'deleted'}
+            return {'success': False, 'error': 'Dette non trouvée'}
+        
+        if existing and action_upper in ['UPDATE', 'UPSERT']:
+            for field, value in data.items():
+                if field != 'id' and hasattr(existing, field):
+                    # Gérer les conversions Decimal
+                    if field in ['initial_amount', 'paid_amount', 'remaining_amount', 'interest_rate', 'interest_amount']:
+                        value = Decimal(str(value)) if value else Decimal('0')
+                    setattr(existing, field, value)
+            existing.updated_at = datetime.utcnow()
+            
+            # Mettre à jour le statut automatiquement
+            if hasattr(existing, 'update_status'):
+                existing.update_status()
+            
+            db.flush()
+            return {'success': True, 'id': str(existing.id), 'action': 'updated'}
+        
+        elif action_upper in ['CREATE', 'UPSERT']:
+            # S'assurer que le client existe
+            customer_id = data.get('customer_id')
+            if customer_id:
+                if isinstance(customer_id, str):
+                    customer_id = UUIDType(customer_id)
+                
+                customer = db.query(Customer).filter(
+                    Customer.id == customer_id,
+                    Customer.tenant_id == tenant_id
+                ).first()
+                
+                if not customer and data.get('customer_name'):
+                    # Créer le client s'il n'existe pas
+                    customer = Customer(
+                        tenant_id=tenant_id,
+                        id=customer_id,
+                        name=data.get('customer_name'),
+                        phone=data.get('customer_phone'),
+                        email=data.get('customer_email')
+                    )
+                    db.add(customer)
+                    db.flush()
+            
+            data.pop('id', None)
+            
+            # Convertir les valeurs Decimal
+            for field in ['initial_amount', 'paid_amount', 'remaining_amount', 'interest_rate', 'interest_amount']:
+                if field in data and data[field] is not None:
+                    data[field] = Decimal(str(data[field]))
+            
+            debt = Debt(
+                tenant_id=tenant_id,
+                **{k: v for k, v in data.items() if hasattr(Debt, k)}
+            )
+            db.add(debt)
+            db.flush()
+            
+            # Mettre à jour le total des dettes du client
+            if debt.customer_id:
+                total_debt = db.query(Debt).filter(
+                    Debt.customer_id == debt.customer_id,
+                    Debt.remaining_amount > 0
+                ).with_entities(Debt.remaining_amount).all()
+                total = sum(float(d[0]) for d in total_debt) if total_debt else 0
+                
+                customer = db.query(Customer).filter(Customer.id == debt.customer_id).first()
+                if customer:
+                    customer.total_debt = total
+                    db.flush()
+            
+            return {'success': True, 'id': str(debt.id), 'action': 'created'}
+        
+        return {'success': False, 'error': f'Action non supportée: {action}'}
+        
+    except Exception as e:
+        logger.error(f"Erreur sync debt: {e}", exc_info=True)
+        return {'success': False, 'error': str(e)}
+
+
+def _sync_debt_payment(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Synchronise un paiement de dette"""
+    from app.models.debt import Debt, DebtPayment
+    from app.models.customer import Customer
+    from uuid import UUID as UUIDType
+    from decimal import Decimal
+    
+    try:
+        payment_id = data.get('id')
+        if payment_id and isinstance(payment_id, str):
+            payment_id = UUIDType(payment_id)
+        
+        existing = None
+        if payment_id:
+            existing = db.query(DebtPayment).filter(
+                DebtPayment.id == payment_id,
+                DebtPayment.tenant_id == tenant_id
+            ).first()
+        
+        action_upper = action.upper()
+        
+        if action_upper == 'DELETE':
+            if existing:
+                # Rembourser le paiement
+                debt = db.query(Debt).filter(Debt.id == existing.debt_id).first()
+                if debt:
+                    debt.remaining_amount += existing.amount
+                    debt.paid_amount -= existing.amount
+                    if debt.remaining_amount > 0:
+                        debt.status = "partial" if debt.paid_amount > 0 else "pending"
+                    if hasattr(debt, 'update_status'):
+                        debt.update_status()
+                
+                db.delete(existing)
+                db.flush()
+                return {'success': True, 'id': str(payment_id), 'action': 'deleted'}
+            return {'success': False, 'error': 'Paiement non trouvé'}
+        
+        if existing and action_upper in ['UPDATE', 'UPSERT']:
+            return {'success': True, 'id': str(existing.id), 'action': 'ignored', 'reason': 'Debt payments are immutable'}
+        
+        elif action_upper in ['CREATE', 'UPSERT']:
+            debt_id = data.get('debt_id')
+            if debt_id and isinstance(debt_id, str):
+                debt_id = UUIDType(debt_id)
+            
+            debt = db.query(Debt).filter(
+                Debt.id == debt_id,
+                Debt.tenant_id == tenant_id
+            ).first()
+            
+            if not debt:
+                return {'success': False, 'error': f'Dette {debt_id} non trouvée'}
+            
+            amount = Decimal(str(data.get('amount', 0)))
+            
+            if amount > debt.remaining_amount:
+                return {'success': False, 'error': f'Le paiement ({amount}) dépasse le solde restant ({debt.remaining_amount})'}
+            
+            data.pop('id', None)
+            data['tenant_id'] = tenant_id
+            data['debt_id'] = debt.id
+            
+            payment = DebtPayment(
+                **{k: v for k, v in data.items() if hasattr(DebtPayment, k)}
+            )
+            db.add(payment)
+            db.flush()
+            
+            # Mettre à jour la dette
+            debt.remaining_amount -= amount
+            debt.paid_amount += amount
+            
+            if debt.remaining_amount <= 0:
+                debt.status = "paid"
+            elif debt.paid_amount > 0:
+                debt.status = "partial"
+            
+            if hasattr(debt, 'update_status'):
+                debt.update_status()
+            
+            db.flush()
+            
+            return {'success': True, 'id': str(payment.id), 'action': 'created'}
+        
+        return {'success': False, 'error': f'Action non supportée: {action}'}
+        
+    except Exception as e:
+        logger.error(f"Erreur sync debt payment: {e}", exc_info=True)
+        return {'success': False, 'error': str(e)}
+
+
+def _sync_user(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Synchronise un utilisateur"""
+    from app.models.user import User
+    from app.core.security import hash_password
+    from uuid import UUID as UUIDType
+    
+    try:
+        user_id = data.get('id')
+        if user_id and isinstance(user_id, str):
+            user_id = UUIDType(user_id)
+        
+        existing = None
+        if user_id:
+            existing = db.query(User).filter(
+                User.id == user_id,
+                User.tenant_id == tenant_id
+            ).first()
+        
+        action_upper = action.upper()
+        
+        if action_upper == 'DELETE':
+            if existing:
+                existing.actif = False
+                db.flush()
+                return {'success': True, 'id': str(user_id), 'action': 'deactivated'}
+            return {'success': False, 'error': 'Utilisateur non trouvé'}
+        
+        if existing and action_upper in ['UPDATE', 'UPSERT']:
+            for field, value in data.items():
+                if field != 'id' and field != 'password' and hasattr(existing, field):
+                    setattr(existing, field, value)
+            if data.get('password'):
+                existing.password_hash = hash_password(data['password'])
+            existing.updated_at = datetime.utcnow()
+            db.flush()
+            return {'success': True, 'id': str(existing.id), 'action': 'updated'}
+        
+        elif action_upper in ['CREATE', 'UPSERT']:
+            data.pop('id', None)
+            password = data.pop('password', None)
+            user = User(
+                tenant_id=tenant_id,
+                **{k: v for k, v in data.items() if hasattr(User, k)}
+            )
+            if password:
+                user.password_hash = hash_password(password)
+            db.add(user)
+            db.flush()
+            return {'success': True, 'id': str(user.id), 'action': 'created'}
+        
+        return {'success': False, 'error': f'Action non supportée: {action}'}
+        
+    except Exception as e:
+        logger.error(f"Erreur sync user: {e}", exc_info=True)
+        return {'success': False, 'error': str(e)}
+
+
+def _sync_branch(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Synchronise une branche/succursale"""
+    from app.models.branch import Branch
+    from uuid import UUID as UUIDType
+    
+    try:
+        branch_id = data.get('id')
+        if branch_id and isinstance(branch_id, str):
+            branch_id = UUIDType(branch_id)
+        
+        existing = None
+        if branch_id:
+            existing = db.query(Branch).filter(
+                Branch.id == branch_id,
+                Branch.tenant_id == tenant_id
+            ).first()
+        
+        action_upper = action.upper()
+        
+        if action_upper == 'DELETE':
+            if existing:
+                existing.is_active = False
+                db.flush()
+                return {'success': True, 'id': str(branch_id), 'action': 'deactivated'}
+            return {'success': False, 'error': 'Branche non trouvée'}
+        
+        if existing and action_upper in ['UPDATE', 'UPSERT']:
+            for field, value in data.items():
+                if field != 'id' and hasattr(existing, field):
+                    setattr(existing, field, value)
+            existing.updated_at = datetime.utcnow()
+            db.flush()
+            return {'success': True, 'id': str(existing.id), 'action': 'updated'}
+        
+        elif action_upper in ['CREATE', 'UPSERT']:
+            data.pop('id', None)
+            branch = Branch(
+                tenant_id=tenant_id,
+                **{k: v for k, v in data.items() if hasattr(Branch, k)}
+            )
+            db.add(branch)
+            db.flush()
+            return {'success': True, 'id': str(branch.id), 'action': 'created'}
+        
+        return {'success': False, 'error': f'Action non supportée: {action}'}
+        
+    except Exception as e:
+        logger.error(f"Erreur sync branch: {e}", exc_info=True)
+        return {'success': False, 'error': str(e)}
+
+
+def _sync_pharmacy(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Synchronise une pharmacie"""
+    from app.models.pharmacy import Pharmacy
+    from uuid import UUID as UUIDType
+    
+    try:
+        pharmacy_id = data.get('id')
+        if pharmacy_id and isinstance(pharmacy_id, str):
+            pharmacy_id = UUIDType(pharmacy_id)
+        
+        existing = None
+        if pharmacy_id:
+            existing = db.query(Pharmacy).filter(
+                Pharmacy.id == pharmacy_id,
+                Pharmacy.tenant_id == tenant_id
+            ).first()
+        
+        action_upper = action.upper()
+        
+        if action_upper == 'DELETE':
+            if existing:
+                existing.is_active = False
+                db.flush()
+                return {'success': True, 'id': str(pharmacy_id), 'action': 'deactivated'}
+            return {'success': False, 'error': 'Pharmacie non trouvée'}
+        
+        if existing and action_upper in ['UPDATE', 'UPSERT']:
+            for field, value in data.items():
+                if field != 'id' and hasattr(existing, field):
+                    setattr(existing, field, value)
+            existing.updated_at = datetime.utcnow()
+            db.flush()
+            return {'success': True, 'id': str(existing.id), 'action': 'updated'}
+        
+        elif action_upper in ['CREATE', 'UPSERT']:
+            data.pop('id', None)
+            pharmacy = Pharmacy(
+                tenant_id=tenant_id,
+                **{k: v for k, v in data.items() if hasattr(Pharmacy, k)}
+            )
+            db.add(pharmacy)
+            db.flush()
+            return {'success': True, 'id': str(pharmacy.id), 'action': 'created'}
+        
+        return {'success': False, 'error': f'Action non supportée: {action}'}
+        
+    except Exception as e:
+        logger.error(f"Erreur sync pharmacy: {e}", exc_info=True)
+        return {'success': False, 'error': str(e)}
+
+
+def _sync_subscription(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Synchronise un abonnement"""
+    from app.models.tenant import Subscription
+    from uuid import UUID as UUIDType
+    
+    try:
+        sub_id = data.get('id')
+        if sub_id and isinstance(sub_id, str):
+            sub_id = UUIDType(sub_id)
+        
+        existing = None
+        if sub_id:
+            existing = db.query(Subscription).filter(
+                Subscription.id == sub_id,
+                Subscription.tenant_id == tenant_id
+            ).first()
         else:
-            logger.warning(f"ID manquant pour la suppression de la commande")
+            existing = db.query(Subscription).filter(
+                Subscription.tenant_id == tenant_id
+            ).first()
+        
+        action_upper = action.upper()
+        
+        if action_upper == 'DELETE':
+            if existing:
+                existing.is_active = False
+                db.flush()
+                return {'success': True, 'id': str(sub_id) if sub_id else str(existing.id), 'action': 'deactivated'}
+            return {'success': False, 'error': 'Abonnement non trouvé'}
+        
+        data['tenant_id'] = tenant_id
+        data.pop('id', None)
+        
+        if existing and action_upper in ['UPDATE', 'UPSERT']:
+            for field, value in data.items():
+                if hasattr(existing, field):
+                    setattr(existing, field, value)
+            existing.updated_at = datetime.utcnow()
+            db.flush()
+            return {'success': True, 'id': str(existing.id), 'action': 'updated'}
+        
+        elif action_upper in ['CREATE', 'UPSERT']:
+            subscription = Subscription(**data)
+            db.add(subscription)
+            db.flush()
+            return {'success': True, 'id': str(subscription.id), 'action': 'created'}
+        
+        return {'success': False, 'error': f'Action non supportée: {action}'}
+        
+    except Exception as e:
+        logger.error(f"Erreur sync subscription: {e}", exc_info=True)
+        return {'success': False, 'error': str(e)}
+
+
+def _sync_stock_movement(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Synchronise un mouvement de stock"""
+    from app.models.stock_movement import StockMovement
+    from uuid import UUID as UUIDType
+    
+    try:
+        movement_id = data.get('id')
+        if movement_id and isinstance(movement_id, str):
+            movement_id = UUIDType(movement_id)
+        
+        existing = None
+        if movement_id:
+            existing = db.query(StockMovement).filter(
+                StockMovement.id == movement_id,
+                StockMovement.tenant_id == tenant_id
+            ).first()
+        
+        action_upper = action.upper()
+        
+        # Les mouvements de stock sont généralement en lecture seule côté offline
+        if not existing and action_upper in ['CREATE', 'UPSERT']:
+            data.pop('id', None)
+            movement = StockMovement(
+                tenant_id=tenant_id,
+                **{k: v for k, v in data.items() if hasattr(StockMovement, k)}
+            )
+            db.add(movement)
+            db.flush()
+            return {'success': True, 'id': str(movement.id), 'action': 'created'}
+        
+        return {'success': True, 'action': 'ignored', 'reason': 'Stock movements are read-only'}
+        
+    except Exception as e:
+        logger.error(f"Erreur sync stock movement: {e}", exc_info=True)
+        return {'success': False, 'error': str(e)}
+
+
+# ==========================================================
+# FONCTIONS UTILITAIRES
+# ==========================================================
+
+def _serialize_product(product) -> Dict[str, Any]:
+    """Sérialise un produit en dictionnaire"""
+    return {
+        'id': str(product.id),
+        'code': product.code,
+        'name': product.name,
+        'commercial_name': product.commercial_name,
+        'barcode': product.barcode,
+        'quantity': product.quantity or 0,
+        'available_quantity': getattr(product, 'available_quantity', product.quantity or 0),
+        'purchase_price': float(product.purchase_price or 0),
+        'selling_price': float(product.selling_price or 0),
+        'category': product.category,
+        'category_id': str(product.category_id) if product.category_id else None,
+        'product_type': product.product_type,
+        'unit': product.unit,
+        'alert_threshold': product.alert_threshold,
+        'minimum_stock': product.minimum_stock,
+        'maximum_stock': product.maximum_stock,
+        'expiry_date': product.expiry_date.isoformat() if product.expiry_date else None,
+        'batch_number': product.batch_number,
+        'location': product.location,
+        'main_supplier': product.main_supplier,
+        'has_tva': product.has_tva,
+        'tva_rate': product.tva_rate,
+        'prescription_required': product.prescription_required,
+        'stock_status': product.stock_status,
+        'expiry_status': product.expiry_status,
+        'is_active': product.is_active,
+        'branch_id': str(product.branch_id) if product.branch_id else None,
+        'pharmacy_id': str(product.pharmacy_id) if product.pharmacy_id else None,
+        'created_at': product.created_at.isoformat() if product.created_at else None,
+        'updated_at': product.updated_at.isoformat() if product.updated_at else None
+    }

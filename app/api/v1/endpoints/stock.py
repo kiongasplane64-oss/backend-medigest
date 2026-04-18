@@ -2799,14 +2799,13 @@ async def preview_import_products(
         logger.exception("Erreur preview import")
         raise HTTPException(status_code=500, detail=f"Erreur preview import: {exc}")
 
-
-
-
 @router.post("/import", summary="Importer des produits")
 async def import_products(
     file: UploadFile = File(...),
-    mode: str = Form("add"),  # ← Utiliser Form au lieu de Query
+    mode: str = Form("add"),  # add, update, replace
     duplicate_actions: Optional[str] = Form(None),
+    preserve_prices: bool = Form(False),  # Nouveau: conserver les prix du fichier
+    preserve_quantities: bool = Form(False),  # Nouveau: conserver les quantités du fichier
     db: Session = Depends(get_db),
     current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
@@ -2820,6 +2819,10 @@ async def import_products(
     - add: Ignore les doublons, n'ajoute que les nouveaux
     - update: Met à jour les produits existants
     - replace: Remplace complètement les produits existants (désactive les anciens)
+    
+    Options:
+    - preserve_prices: Si True, conserve les prix exacts du fichier sans recalcul
+    - preserve_quantities: Si True, conserve les quantités exactes du fichier
     """
     try:
         _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant", "pharmacien"])
@@ -2853,7 +2856,7 @@ async def import_products(
         if df.empty:
             raise HTTPException(status_code=400, detail="Le fichier est vide")
         
-        # Normaliser les noms de colonnes (comme dans preview)
+        # Normaliser les noms de colonnes
         column_mapping = {
             'nom': 'name', 'name': 'name', 'produit': 'name',
             'code': 'code', 'code-barres': 'barcode', 'barcode': 'barcode',
@@ -2917,8 +2920,8 @@ async def import_products(
         updated_count = 0
         skipped_count = 0
         
-        # Configuration des prix
-        calcul_auto_prix = bool(_tenant_get_config(current_tenant, "calcul_auto_prix", True))
+        # Configuration des prix (uniquement si preservation_prices est False)
+        calcul_auto_prix = bool(_tenant_get_config(current_tenant, "calcul_auto_prix", True)) if not preserve_prices else False
         marge_par_defaut = _to_float(_tenant_get_config(current_tenant, "marge_par_defaut", 30.0), 30.0)
         taux_tva = _to_float(_tenant_get_config(current_tenant, "taux_tva", 0.0), 0.0)
         
@@ -2929,9 +2932,24 @@ async def import_products(
                     skipped_count += 1
                     continue
                 
-                quantity = int(float(row.get('quantity', 0)))
-                purchase_price = float(row.get('purchase_price', 0))
-                selling_price = float(row.get('selling_price', 0))
+                # Récupérer les valeurs du fichier
+                file_quantity = int(float(row.get('quantity', 0)))
+                file_purchase_price = float(row.get('purchase_price', 0))
+                file_selling_price = float(row.get('selling_price', 0))
+                
+                # Déterminer les valeurs finales selon preserve_* flags
+                if preserve_quantities:
+                    quantity = file_quantity
+                else:
+                    quantity = file_quantity  # Par défaut, utiliser la valeur du fichier
+                
+                if preserve_prices:
+                    purchase_price = file_purchase_price
+                    selling_price = file_selling_price
+                else:
+                    purchase_price = file_purchase_price
+                    selling_price = file_selling_price
+                
                 code = str(row.get('code', '')).strip() if pd.notna(row.get('code')) else None
                 barcode = str(row.get('barcode', '')).strip() if pd.notna(row.get('barcode')) else None
                 expiry_date = row.get('expiry_date')
@@ -2978,10 +2996,21 @@ async def import_products(
                     elif action == "update":
                         # Mettre à jour le produit existant
                         old_quantity = existing.quantity
-                        existing.purchase_price = purchase_price
-                        existing.selling_price = selling_price
-                        existing.quantity = quantity
-                        existing.available_quantity = max(0, quantity - (existing.reserved_quantity or 0))
+                        
+                        # Appliquer les valeurs selon les flags
+                        if not preserve_prices:
+                            existing.purchase_price = purchase_price
+                            existing.selling_price = selling_price
+                        else:
+                            # Si preserve_prices est True, on garde les prix existants
+                            pass
+                        
+                        if preserve_quantities:
+                            existing.quantity = quantity
+                            existing.available_quantity = max(0, quantity - (existing.reserved_quantity or 0))
+                        else:
+                            existing.quantity = quantity
+                            existing.available_quantity = max(0, quantity - (existing.reserved_quantity or 0))
                         
                         if expiry_date_obj:
                             existing.expiry_date = expiry_date_obj
@@ -2996,7 +3025,7 @@ async def import_products(
                         
                         existing.refresh_statuses()
                         
-                        # Créer un mouvement de stock
+                        # Créer un mouvement de stock si la quantité a changé
                         if quantity != old_quantity:
                             movement = StockMovement(
                                 tenant_id=tenant_id,
@@ -3021,10 +3050,11 @@ async def import_products(
                         existing.quantity = new_quantity
                         existing.available_quantity = max(0, new_quantity - (existing.reserved_quantity or 0))
                         
-                        if purchase_price:
-                            existing.purchase_price = purchase_price
-                        if selling_price:
-                            existing.selling_price = selling_price
+                        if not preserve_prices:
+                            if purchase_price:
+                                existing.purchase_price = purchase_price
+                            if selling_price:
+                                existing.selling_price = selling_price
                         
                         existing.refresh_statuses()
                         
@@ -3071,8 +3101,8 @@ async def import_products(
                         is_active=True
                     )
                     
-                    # Calcul automatique des prix si nécessaire
-                    if calcul_auto_prix and purchase_price > 0:
+                    # Calcul automatique des prix UNIQUEMENT si preserve_prices est False
+                    if not preserve_prices and calcul_auto_prix and purchase_price > 0:
                         _safe_calculate_prices(product, marge_par_defaut, taux_tva)
                     
                     product.refresh_statuses()
@@ -3123,7 +3153,9 @@ async def import_products(
             "updated": updated_count,
             "skipped": skipped_count,
             "total_processed": created_count + updated_count + skipped_count,
-            "mode": mode
+            "mode": mode,
+            "preserve_prices": preserve_prices,
+            "preserve_quantities": preserve_quantities
         }
         
     except HTTPException:
@@ -3133,7 +3165,6 @@ async def import_products(
         db.rollback()
         logger.exception("Erreur import produits")
         raise HTTPException(status_code=500, detail=f"Erreur import produits: {exc}")
-
 
 @router.get("/import/template", summary="Télécharger le template d'import")
 async def download_import_template(

@@ -18,6 +18,12 @@ from app.models.stock_movement import StockMovement
 from app.models.debt import Debt
 from app.models.debt_payment import DebtPayment
 from app.models.branch import Branch
+from app.models.category import Category
+from app.models.user import User
+from app.models.pharmacy import Pharmacy
+from app.models.subscription import Subscription
+from app.models.customer import Customer
+
 
 router = APIRouter(prefix="/sync", tags=["Sync"])
 logger = logging.getLogger(__name__)
@@ -53,22 +59,30 @@ def sync_data(
         # Validation du nom de table (supporte les alias français)
         if item.table_name:
             table_mapping = {
-                'produits': 'products', 'produit': 'products',
-                'catégories': 'categories', 'categorie': 'categories', 'categories': 'categories',
-                'commandes': 'orders', 'commande': 'orders',
-                'clients': 'customers', 'client': 'customers',
-                'factures': 'invoices', 'facture': 'invoices',
-                'utilisateurs': 'users', 'utilisateur': 'users',
-                'tenants': 'tenants', 'tenant': 'tenants',
-                'subscriptions': 'subscriptions', 'abonnements': 'subscriptions', 'abonnement': 'subscriptions',
-                'ventes': 'sales', 'vente': 'sales', 'sales': 'sales',
-                'dettes': 'debts', 'dette': 'debts', 'debts': 'debts',
-                'retours': 'returns', 'retour': 'returns', 'returns': 'returns'
+                    # Français -> Anglais
+                    'produits': 'products', 'produit': 'products',
+                    'catégories': 'categories', 'categorie': 'categories', 'categories': 'categories',
+                    'commandes': 'sales', 'commande': 'sales',  # Changé de orders à sales
+                    'clients': 'customers', 'client': 'customers',
+                    'factures': 'invoices', 'facture': 'invoices',
+                    'utilisateurs': 'users', 'utilisateur': 'users',
+                    'tenants': 'tenants', 'tenant': 'tenants',
+                    'subscriptions': 'subscriptions', 'abonnements': 'subscriptions', 'abonnement': 'subscriptions',
+                    'ventes': 'sales', 'vente': 'sales', 'sales': 'sales',
+                    'dettes': 'debts', 'dette': 'debts', 'debts': 'debts',
+                    'retours': 'returns', 'retour': 'returns', 'returns': 'returns',
+                    'branches': 'branches', 'succursales': 'branches', 'succursale': 'branches',
+                    'pharmacies': 'pharmacies', 'pharmacie': 'pharmacies',
+                    'mouvements_stock': 'stock_movements', 'mouvement_stock': 'stock_movements',
+                    'paiements_dette': 'debt_payments', 'paiement_dette': 'debt_payments',
             }
-            
-            allowed_tables = ['products', 'categories', 'orders', 'customers', 
-                             'invoices', 'users', 'tenants', 'subscriptions',
-                             'sales', 'debts', 'returns']
+
+            allowed_tables = [
+                    'products', 'categories', 'sales', 'customers', 
+                    'invoices', 'users', 'tenants', 'subscriptions',
+                    'debts', 'returns', 'branches', 'pharmacies', 
+                    'stock_movements', 'debt_payments'
+                ]
             
             normalized = table_mapping.get(item.table_name.lower(), item.table_name.lower())
             if normalized not in allowed_tables:
@@ -1239,3 +1253,608 @@ def get_pending_debts(
         ]
     }
 
+def get_changes_since(db: Session, tenant_id: UUID, since: Optional[datetime] = None) -> Dict[str, List]:
+    """Récupère tous les changements depuis une date pour toutes les entités"""
+    changes = {
+        'sales': [],
+        'debts': [],
+        'products': [],
+        'users': [],
+        'branches': [],
+        'pharmacies': [],
+        'subscriptions': [],
+        'customers': [],
+        'categories': [],
+        'stock_movements': []
+    }
+    
+    # 1. Ventes
+    sales_query = db.query(Sale).filter(Sale.tenant_id == tenant_id)
+    if since:
+        sales_query = sales_query.filter(Sale.updated_at >= since)
+    for sale in sales_query.all():
+        changes['sales'].append({
+            'id': str(sale.id),
+            'reference': sale.reference,
+            'total_amount': float(sale.total_amount),
+            'customer_name': sale.customer_name,
+            'customer_phone': sale.customer_phone,
+            'payment_method': sale.payment_method,
+            'is_credit': sale.is_credit,
+            'status': sale.status,
+            'branch_id': str(sale.branch_id) if sale.branch_id else None,
+            'pharmacy_id': str(sale.pharmacy_id) if sale.pharmacy_id else None,
+            'created_at': sale.created_at.isoformat(),
+            'updated_at': sale.updated_at.isoformat() if sale.updated_at else None,
+            'items': [
+                {
+                    'id': str(item.id),
+                    'product_id': str(item.product_id),
+                    'product_name': item.product_name,
+                    'quantity': float(item.quantity),
+                    'unit_price': float(item.unit_price),
+                    'total': float(item.total)
+                }
+                for item in sale.items
+            ]
+        })
+    
+    # 2. Produits
+    products_query = db.query(Product).filter(Product.tenant_id == tenant_id)
+    if since:
+        products_query = products_query.filter(Product.updated_at >= since)
+    for product in products_query.all():
+        changes['products'].append({
+            'id': str(product.id),
+            'code': product.code,
+            'name': product.name,
+            'commercial_name': product.commercial_name,
+            'barcode': product.barcode,
+            'quantity': product.quantity or 0,
+            'available_quantity': product.available_quantity or 0,
+            'purchase_price': float(product.purchase_price or 0),
+            'selling_price': float(product.selling_price or 0),
+            'category': product.category,
+            'category_id': str(product.category_id) if product.category_id else None,
+            'product_type': product.product_type,
+            'unit': product.unit,
+            'alert_threshold': product.alert_threshold,
+            'minimum_stock': product.minimum_stock,
+            'maximum_stock': product.maximum_stock,
+            'expiry_date': product.expiry_date.isoformat() if product.expiry_date else None,
+            'batch_number': product.batch_number,
+            'location': product.location,
+            'main_supplier': product.main_supplier,
+            'has_tva': product.has_tva,
+            'tva_rate': product.tva_rate,
+            'prescription_required': product.prescription_required,
+            'stock_status': product.stock_status,
+            'expiry_status': product.expiry_status,
+            'is_active': product.is_active,
+            'branch_id': str(product.branch_id) if product.branch_id else None,
+            'pharmacy_id': str(product.pharmacy_id) if product.pharmacy_id else None,
+            'created_at': product.created_at.isoformat() if product.created_at else None,
+            'updated_at': product.updated_at.isoformat() if product.updated_at else None
+        })
+    
+    # 3. Utilisateurs
+    users_query = db.query(User).filter(User.tenant_id == tenant_id)
+    if since:
+        users_query = users_query.filter(User.updated_at >= since)
+    for user in users_query.all():
+        changes['users'].append({
+            'id': str(user.id),
+            'email': user.email,
+            'nom_complet': user.nom_complet,
+            'role': user.role,
+            'telephone': user.telephone,
+            'adresse': user.adresse,
+            'actif': user.actif,
+            'active_pharmacy_id': str(user.active_pharmacy_id) if user.active_pharmacy_id else None,
+            'active_branch_id': str(user.active_branch_id) if user.active_branch_id else None,
+            'permissions': user.permissions,
+            'last_login': user.last_login.isoformat() if user.last_login else None,
+            'created_at': user.created_at.isoformat() if user.created_at else None,
+            'updated_at': user.updated_at.isoformat() if user.updated_at else None
+        })
+    
+    # 4. Branches
+    branches_query = db.query(Branch).filter(Branch.tenant_id == tenant_id)
+    if since:
+        branches_query = branches_query.filter(Branch.updated_at >= since)
+    for branch in branches_query.all():
+        changes['branches'].append({
+            'id': str(branch.id),
+            'name': branch.name,
+            'code': branch.code,
+            'address': branch.address,
+            'city': branch.city,
+            'country': branch.country,
+            'phone': branch.phone,
+            'email': branch.email,
+            'latitude': float(branch.latitude) if branch.latitude else None,
+            'longitude': float(branch.longitude) if branch.longitude else None,
+            'manager_name': branch.manager_name,
+            'manager_id': str(branch.manager_id) if branch.manager_id else None,
+            'opening_hours': branch.opening_hours,
+            'config': branch.config,
+            'is_active': branch.is_active,
+            'is_main_branch': branch.is_main_branch,
+            'parent_pharmacy_id': str(branch.parent_pharmacy_id) if branch.parent_pharmacy_id else None,
+            'created_at': branch.created_at.isoformat() if branch.created_at else None,
+            'updated_at': branch.updated_at.isoformat() if branch.updated_at else None
+        })
+    
+    # 5. Pharmacies
+    pharmacies_query = db.query(Pharmacy).filter(Pharmacy.tenant_id == tenant_id)
+    if since:
+        pharmacies_query = pharmacies_query.filter(Pharmacy.updated_at >= since)
+    for pharmacy in pharmacies_query.all():
+        changes['pharmacies'].append({
+            'id': str(pharmacy.id),
+            'name': pharmacy.name,
+            'license_number': pharmacy.license_number,
+            'address': pharmacy.address,
+            'city': pharmacy.city,
+            'country': pharmacy.country,
+            'phone': pharmacy.phone,
+            'email': pharmacy.email,
+            'is_active': pharmacy.is_active,
+            'opening_hours': pharmacy.opening_hours,
+            'pharmacist_in_charge': pharmacy.pharmacist_in_charge,
+            'pharmacist_license': pharmacy.pharmacist_license,
+            'config': pharmacy.config,
+            'created_at': pharmacy.created_at.isoformat() if pharmacy.created_at else None,
+            'updated_at': pharmacy.updated_at.isoformat() if pharmacy.updated_at else None
+        })
+    
+    # 6. Abonnements
+    subscriptions_query = db.query(Subscription).filter(Subscription.tenant_id == tenant_id)
+    if since:
+        subscriptions_query = subscriptions_query.filter(Subscription.updated_at >= since)
+    for sub in subscriptions_query.all():
+        changes['subscriptions'].append({
+            'id': str(sub.id),
+            'tenant_id': str(sub.tenant_id),
+            'plan_name': sub.plan_name,
+            'plan_type': sub.plan_type,
+            'status': sub.status,
+            'max_users': sub.max_users,
+            'max_products': sub.max_products,
+            'max_branches': getattr(sub, 'max_branches', 0),
+            'features': sub.features,
+            'billing_cycle': sub.billing_cycle,
+            'price': float(sub.price) if sub.price else 0,
+            'currency': sub.currency,
+            'current_period_start': sub.current_period_start.isoformat() if sub.current_period_start else None,
+            'current_period_end': sub.current_period_end.isoformat() if sub.current_period_end else None,
+            'cancel_at_period_end': sub.cancel_at_period_end,
+            'is_active': sub.is_active,
+            'created_at': sub.created_at.isoformat() if sub.created_at else None,
+            'updated_at': sub.updated_at.isoformat() if sub.updated_at else None
+        })
+    
+    # 7. Clients
+    from app.models.customer import Customer
+    customers_query = db.query(Customer).filter(Customer.tenant_id == tenant_id)
+    if since:
+        customers_query = customers_query.filter(Customer.updated_at >= since)
+    for customer in customers_query.all():
+        changes['customers'].append({
+            'id': str(customer.id),
+            'name': customer.name,
+            'phone': customer.phone,
+            'email': customer.email,
+            'address': customer.address,
+            'city': customer.city,
+            'type': getattr(customer, 'type', 'regular'),
+            'total_debt': float(customer.total_debt) if hasattr(customer, 'total_debt') else 0,
+            'total_purchases': float(customer.total_purchases) if hasattr(customer, 'total_purchases') else 0,
+            'is_active': customer.is_active,
+            'branch_id': str(customer.branch_id) if customer.branch_id else None,
+            'pharmacy_id': str(customer.pharmacy_id) if customer.pharmacy_id else None,
+            'created_at': customer.created_at.isoformat() if customer.created_at else None,
+            'updated_at': customer.updated_at.isoformat() if customer.updated_at else None
+        })
+    
+    # 8. Catégories
+    categories_query = db.query(Category).filter(Category.tenant_id == tenant_id)
+    if since:
+        categories_query = categories_query.filter(Category.updated_at >= since)
+    for category in categories_query.all():
+        changes['categories'].append({
+            'id': str(category.id),
+            'name': category.name,
+            'description': category.description,
+            'parent_id': str(category.parent_id) if category.parent_id else None,
+            'is_active': category.is_active,
+            'created_at': category.created_at.isoformat() if category.created_at else None,
+            'updated_at': category.updated_at.isoformat() if category.updated_at else None
+        })
+    
+    # 9. Mouvements de stock récents
+    movements_query = db.query(StockMovement).filter(StockMovement.tenant_id == tenant_id)
+    if since:
+        movements_query = movements_query.filter(StockMovement.created_at >= since)
+    for movement in movements_query.order_by(StockMovement.created_at.desc()).limit(500).all():
+        changes['stock_movements'].append({
+            'id': str(movement.id),
+            'product_id': str(movement.product_id),
+            'product_name': getattr(movement.product, 'name', None),
+            'quantity_before': float(movement.quantity_before or 0),
+            'quantity_after': float(movement.quantity_after or 0),
+            'quantity_change': float(movement.quantity_change or 0),
+            'movement_type': movement.movement_type,
+            'reason': movement.reason,
+            'reference': movement.reference,
+            'branch_id': str(movement.branch_id) if movement.branch_id else None,
+            'pharmacy_id': str(movement.pharmacy_id) if movement.pharmacy_id else None,
+            'created_at': movement.created_at.isoformat() if movement.created_at else None
+        })
+    
+    return changes
+
+# ============================================================
+# ENDPOINTS POUR LA SYNCHRONISATION DES CATÉGORIES
+# ============================================================
+
+@router.post("/categories/sync")
+def sync_categories(
+    payload: dict,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """Endpoint pour la synchronisation des catégories"""
+    categories = payload.get('categories', [])
+    action = payload.get('action', 'upsert')
+    
+    if not categories:
+        return {"status": "success", "message": "Aucune catégorie à synchroniser", "processed": 0}
+    
+    processed = 0
+    failed = 0
+    synced_ids = []
+    errors = []
+    
+    for category_data in categories:
+        try:
+            category_id = category_data.get('id')
+            if isinstance(category_id, str) and category_id:
+                try:
+                    category_id = UUID(category_id)
+                except:
+                    pass
+            
+            existing = None
+            if category_id:
+                existing = db.query(Category).filter(
+                    Category.id == category_id,
+                    Category.tenant_id == user.tenant_id
+                ).first()
+            
+            if action == "delete" and existing:
+                existing.is_active = False
+                processed += 1
+                synced_ids.append(str(category_id))
+                continue
+            
+            if existing and action in ["update", "upsert"]:
+                existing.name = category_data.get('name', existing.name)
+                existing.description = category_data.get('description', existing.description)
+                existing.parent_id = category_data.get('parent_id', existing.parent_id)
+                existing.updated_at = datetime.utcnow()
+                processed += 1
+                synced_ids.append(str(existing.id))
+                
+            elif action in ["create", "upsert"]:
+                new_category = Category(
+                    tenant_id=user.tenant_id,
+                    name=category_data.get('name'),
+                    description=category_data.get('description'),
+                    parent_id=category_data.get('parent_id'),
+                    is_active=True
+                )
+                if category_id:
+                    new_category.id = category_id if isinstance(category_id, UUID) else UUID(category_id)
+                
+                db.add(new_category)
+                processed += 1
+                synced_ids.append(str(new_category.id))
+            
+            db.commit()
+            
+        except Exception as e:
+            db.rollback()
+            failed += 1
+            errors.append({"id": category_data.get('id'), "error": str(e)})
+            logger.error(f"Erreur synchronisation catégorie {category_data.get('id')}: {str(e)}")
+    
+    return {
+        "status": "success" if failed == 0 else "partial",
+        "message": f"{processed} catégories synchronisées, {failed} échecs",
+        "processed": processed,
+        "synced_ids": synced_ids,
+        "errors": errors
+    }
+
+
+@router.post("/products/sync")
+def sync_products(
+    payload: dict,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """Endpoint pour la synchronisation des produits"""
+    products = payload.get('products', [])
+    action = payload.get('action', 'upsert')
+    
+    if not products:
+        return {"status": "success", "message": "Aucun produit à synchroniser", "processed": 0}
+    
+    processed = 0
+    failed = 0
+    synced_ids = []
+    errors = []
+    
+    for product_data in products:
+        try:
+            product_id = product_data.get('id')
+            if isinstance(product_id, str) and product_id:
+                try:
+                    product_id = UUID(product_id)
+                except:
+                    pass
+            
+            existing = None
+            if product_id:
+                existing = db.query(Product).filter(
+                    Product.id == product_id,
+                    Product.tenant_id == user.tenant_id
+                ).first()
+            
+            if action == "delete" and existing:
+                existing.is_active = False
+                existing.deleted_at = datetime.utcnow()
+                processed += 1
+                synced_ids.append(str(product_id))
+                continue
+            
+            if existing and action in ["update", "upsert"]:
+                for field, value in product_data.items():
+                    if field != 'id' and hasattr(existing, field):
+                        setattr(existing, field, value)
+                existing.updated_at = datetime.utcnow()
+                if hasattr(existing, 'refresh_statuses'):
+                    existing.refresh_statuses()
+                processed += 1
+                synced_ids.append(str(existing.id))
+                
+            elif action in ["create", "upsert"]:
+                product_data.pop('id', None)
+                new_product = Product(
+                    tenant_id=user.tenant_id,
+                    **{k: v for k, v in product_data.items() if hasattr(Product, k)}
+                )
+                if product_id:
+                    new_product.id = product_id if isinstance(product_id, UUID) else UUID(product_id)
+                
+                if hasattr(new_product, 'refresh_statuses'):
+                    new_product.refresh_statuses()
+                
+                db.add(new_product)
+                processed += 1
+                synced_ids.append(str(new_product.id))
+            
+            db.commit()
+            
+        except Exception as e:
+            db.rollback()
+            failed += 1
+            errors.append({"id": product_data.get('id'), "error": str(e)})
+            logger.error(f"Erreur synchronisation produit {product_data.get('id')}: {str(e)}")
+    
+    return {
+        "status": "success" if failed == 0 else "partial",
+        "message": f"{processed} produits synchronisés, {failed} échecs",
+        "processed": processed,
+        "synced_ids": synced_ids,
+        "errors": errors
+    }
+
+
+@router.post("/branches/sync")
+def sync_branches(
+    payload: dict,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """Endpoint pour la synchronisation des branches/succursales"""
+    branches = payload.get('branches', [])
+    action = payload.get('action', 'upsert')
+    
+    if not branches:
+        return {"status": "success", "message": "Aucune branche à synchroniser", "processed": 0}
+    
+    processed = 0
+    failed = 0
+    synced_ids = []
+    errors = []
+    
+    for branch_data in branches:
+        try:
+            branch_id = branch_data.get('id')
+            if isinstance(branch_id, str) and branch_id:
+                try:
+                    branch_id = UUID(branch_id)
+                except:
+                    pass
+            
+            existing = None
+            if branch_id:
+                existing = db.query(Branch).filter(
+                    Branch.id == branch_id,
+                    Branch.tenant_id == user.tenant_id
+                ).first()
+            
+            if action == "delete" and existing:
+                existing.is_active = False
+                processed += 1
+                synced_ids.append(str(branch_id))
+                continue
+            
+            if existing and action in ["update", "upsert"]:
+                for field, value in branch_data.items():
+                    if field != 'id' and hasattr(existing, field):
+                        setattr(existing, field, value)
+                existing.updated_at = datetime.utcnow()
+                processed += 1
+                synced_ids.append(str(existing.id))
+                
+            elif action in ["create", "upsert"]:
+                branch_data.pop('id', None)
+                new_branch = Branch(
+                    tenant_id=user.tenant_id,
+                    **{k: v for k, v in branch_data.items() if hasattr(Branch, k)}
+                )
+                if branch_id:
+                    new_branch.id = branch_id if isinstance(branch_id, UUID) else UUID(branch_id)
+                
+                db.add(new_branch)
+                processed += 1
+                synced_ids.append(str(new_branch.id))
+            
+            db.commit()
+            
+        except Exception as e:
+            db.rollback()
+            failed += 1
+            errors.append({"id": branch_data.get('id'), "error": str(e)})
+            logger.error(f"Erreur synchronisation branche {branch_data.get('id')}: {str(e)}")
+    
+    return {
+        "status": "success" if failed == 0 else "partial",
+        "message": f"{processed} branches synchronisées, {failed} échecs",
+        "processed": processed,
+        "synced_ids": synced_ids,
+        "errors": errors
+    }
+
+
+@router.post("/users/sync")
+def sync_users(
+    payload: dict,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """Endpoint pour la synchronisation des utilisateurs"""
+    from app.core.security import hash_password
+    
+    users = payload.get('users', [])
+    action = payload.get('action', 'upsert')
+    
+    if not users:
+        return {"status": "success", "message": "Aucun utilisateur à synchroniser", "processed": 0}
+    
+    processed = 0
+    failed = 0
+    synced_ids = []
+    errors = []
+    
+    for user_data in users:
+        try:
+            user_id = user_data.get('id')
+            if isinstance(user_id, str) and user_id:
+                try:
+                    user_id = UUID(user_id)
+                except:
+                    pass
+            
+            existing = None
+            if user_id:
+                existing = db.query(User).filter(
+                    User.id == user_id,
+                    User.tenant_id == user.tenant_id
+                ).first()
+            
+            if action == "delete" and existing:
+                existing.actif = False
+                processed += 1
+                synced_ids.append(str(user_id))
+                continue
+            
+            if existing and action in ["update", "upsert"]:
+                for field, value in user_data.items():
+                    if field != 'id' and field != 'password' and hasattr(existing, field):
+                        setattr(existing, field, value)
+                if user_data.get('password'):
+                    existing.password_hash = hash_password(user_data['password'])
+                existing.updated_at = datetime.utcnow()
+                processed += 1
+                synced_ids.append(str(existing.id))
+                
+            elif action in ["create", "upsert"]:
+                password = user_data.pop('password', None)
+                user_data.pop('id', None)
+                new_user = User(
+                    tenant_id=user.tenant_id,
+                    **{k: v for k, v in user_data.items() if hasattr(User, k)}
+                )
+                if password:
+                    new_user.password_hash = hash_password(password)
+                if user_id:
+                    new_user.id = user_id if isinstance(user_id, UUID) else UUID(user_id)
+                
+                db.add(new_user)
+                processed += 1
+                synced_ids.append(str(new_user.id))
+            
+            db.commit()
+            
+        except Exception as e:
+            db.rollback()
+            failed += 1
+            errors.append({"id": user_data.get('id'), "error": str(e)})
+            logger.error(f"Erreur synchronisation utilisateur {user_data.get('id')}: {str(e)}")
+    
+    return {
+        "status": "success" if failed == 0 else "partial",
+        "message": f"{processed} utilisateurs synchronisés, {failed} échecs",
+        "processed": processed,
+        "synced_ids": synced_ids,
+        "errors": errors
+    }
+
+@router.get("/health/details")
+def sync_health_details(
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """Vérification détaillée de la santé du service de synchronisation"""
+    from app.models.sale import Sale
+    from app.models.product import Product
+    from app.models.debt import Debt
+    
+    # Compter les entités
+    sales_count = db.query(Sale).filter(Sale.tenant_id == user.tenant_id).count()
+    products_count = db.query(Product).filter(Product.tenant_id == user.tenant_id).count()
+    debts_count = db.query(Debt).filter(Debt.tenant_id == user.tenant_id).count()
+    
+    # Dernière mise à jour
+    last_sale = db.query(Sale).filter(Sale.tenant_id == user.tenant_id).order_by(Sale.updated_at.desc()).first()
+    last_product = db.query(Product).filter(Product.tenant_id == user.tenant_id).order_by(Product.updated_at.desc()).first()
+    
+    return {
+        "status": "healthy",
+        "service": "sync-api",
+        "tenant_id": str(user.tenant_id),
+        "timestamp": datetime.utcnow().isoformat(),
+        "counts": {
+            "sales": sales_count,
+            "products": products_count,
+            "debts": debts_count
+        },
+        "last_updates": {
+            "sale": last_sale.updated_at.isoformat() if last_sale else None,
+            "product": last_product.updated_at.isoformat() if last_product else None
+        }
+    }
