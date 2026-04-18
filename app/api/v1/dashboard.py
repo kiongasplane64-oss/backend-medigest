@@ -290,7 +290,7 @@ def get_dashboard_stats(
     ).scalar() or 0
     
     # === CLIENTS ===
-    total_customers = db.query(func.count(func.distinct(Sale.client_id))).filter(
+    total_customers = db.query(func.count(func.distinct(Sale.customer_id))).filter(
         Sale.tenant_id == tenant_id,
         Sale.status == "completed"
     ).scalar() or 0
@@ -405,7 +405,7 @@ def get_dashboard_stats(
     
     # === LISTE DES DETTES ===
     debt_list = db.query(
-        Debt.client_id,
+        Debt.customer_id,
         Debt.initial_amount,
         Debt.remaining_amount,
         Debt.due_date,
@@ -419,7 +419,7 @@ def get_dashboard_stats(
     
     debt_list_result = []
     for d in debt_list:
-        client = db.query(Customer).filter(Customer.id == d.client_id).first()
+        client = db.query(Customer).filter(Customer.id == d.customer_id).first()
         debt_list_result.append({
             "customer_name": client.name if client else "Client inconnu",
             "amount": float(d.remaining_amount),
@@ -1220,7 +1220,7 @@ def get_performance_indicators(
     net_profit = total_sales - total_costs
     
     # Nombre de clients uniques
-    unique_customers_query = db.query(func.count(func.distinct(Sale.client_id))).filter(
+    unique_customers_query = db.query(func.count(func.distinct(Sale.customer_id))).filter(
         Sale.tenant_id == tenant_id,
         Sale.created_at >= start_date,
         Sale.status == "completed"

@@ -32,40 +32,42 @@ from app.schemas.branch import BranchCreate, BranchUpdate, BranchResponse, Branc
 from app.utils.pharmacy_utils import PharmacyValidator
 from app.schemas.branch import BranchWorkingHoursConfig
 
-router = APIRouter(prefix="/api/v1/pharmacies", tags=["pharmacies"])
-
+router = APIRouter(prefix="", tags=["pharmacies"])
 
 class PharmacyLimits:
     """Définit les limites de pharmacies selon le plan d'abonnement"""
     
     @staticmethod
-    def get_limits_for_plan(plan: str) -> dict:
-        """
-        Retourne les limites selon le plan:
-        - essentiel: 1 pharmacie
-        - professionnel: 2 pharmacies
-        - entreprise: 10 pharmacies (illimité jusqu'à 10)
-        """
+    def get_limits_for_plan(plan: str, subscription=None) -> dict:
+        """Utilise l'abonnement pour déterminer les limites"""
+        # Si on a un abonnement, l'utiliser
+        if subscription:
+            max_branches = subscription.max_branches if hasattr(subscription, 'max_branches') else 0
+            return {
+                "max_pharmacies": 1 if subscription.plan == "trial" else 10,
+                "max_branches_per_pharmacy": max_branches,
+                "description": subscription.plan_name
+            }
+        
+        # Fallback sur les anciennes limites
         limits = {
-            "essentiel": {"max_pharmacies": 1, "max_branches_per_pharmacy": 0, "description": "1 pharmacie"},
-            "starter": {"max_pharmacies": 1, "max_branches_per_pharmacy": 0, "description": "1 pharmacie"},
-            "basic": {"max_pharmacies": 1, "max_branches_per_pharmacy": 0, "description": "1 pharmacie"},
-            "professionnel": {"max_pharmacies": 2, "max_branches_per_pharmacy": 3, "description": "2 pharmacies, 3 succursale"},
-            "professional": {"max_pharmacies": 2, "max_branches_per_pharmacy": 3, "description": "2 pharmacies, 3 succursale"},
-            "entreprise": {"max_pharmacies": 10, "max_branches_per_pharmacy": 5, "description": "10 pharmacies, 5 succursales"},
-            "enterprise": {"max_pharmacies": 10, "max_branches_per_pharmacy": 5, "description": "10 pharmacies, 5 succursales"},
-            "premium": {"max_pharmacies": 10, "max_branches_per_pharmacy": 5, "description": "10 pharmacies, 5 succursales"},
-            "trial": {"max_pharmacies": 1, "max_branches_per_pharmacy": 0, "description": "1 pharmacie (mode essai)"}
+            "essentiel": {"max_pharmacies": 1, "max_branches_per_pharmacy": 0},
+            "starter": {"max_pharmacies": 1, "max_branches_per_pharmacy": 0},
+            "basic": {"max_pharmacies": 1, "max_branches_per_pharmacy": 0},
+            "professionnel": {"max_pharmacies": 2, "max_branches_per_pharmacy": 0},
+            "professional": {"max_pharmacies": 2, "max_branches_per_pharmacy": 0},
+            "entreprise": {"max_pharmacies": 10, "max_branches_per_pharmacy": 0},  # 0 = illimité
+            "enterprise": {"max_pharmacies": 10, "max_branches_per_pharmacy": 0},
+            "premium": {"max_pharmacies": 10, "max_branches_per_pharmacy": 0},
+            "trial": {"max_pharmacies": 1, "max_branches_per_pharmacy": 0}
         }
         
-        # Recherche insensible à la casse
         plan_lower = plan.lower() if plan else "essentiel"
         for key, value in limits.items():
             if key in plan_lower:
                 return value
         
-        # Par défaut
-        return {"max_pharmacies": 1, "max_branches_per_pharmacy": 0, "description": "1 pharmacie"}
+        return {"max_pharmacies": 1, "max_branches_per_pharmacy": 0}
     
     @staticmethod
     def can_create_pharmacy(
@@ -103,20 +105,45 @@ class PharmacyLimits:
     @staticmethod
     def can_create_branch(pharmacy: Pharmacy, tenant: Tenant, db: Session = None) -> dict:
         """Vérifie si une pharmacie peut créer une succursale"""
-        # Compter les branches existantes dans la base de données
-        if db:
-            current_branches = db.query(Branch).filter(
-                Branch.parent_pharmacy_id == pharmacy.id,
-                Branch.is_active == True
-            ).count()
-        else:
-            # Fallback sur la config
-            config = pharmacy.config or {}
-            branch_config = config.get("branchConfig", {})
-            current_branches = branch_config.get("currentBranches", 0)
+        current_branches = db.query(Branch).filter(
+            Branch.parent_pharmacy_id == pharmacy.id,
+            Branch.is_active == True
+        ).count()
         
+        # Vérifier d'abord l'abonnement
+        if pharmacy.subscription:
+            max_branches = pharmacy.subscription.max_branches
+            # 0 = illimité
+            if max_branches == 0:
+                return {
+                    "can_create": True,
+                    "current_branches": current_branches,
+                    "max_branches_allowed": float('inf'),
+                    "remaining": float('inf'),
+                    "reason": ""
+                }
+            can_create = current_branches < max_branches
+            return {
+                "can_create": can_create,
+                "current_branches": current_branches,
+                "max_branches_allowed": max_branches,
+                "remaining": max(0, max_branches - current_branches),
+                "reason": "" if can_create else f"Limite de {max_branches} succursales atteinte pour le plan {pharmacy.subscription.plan_name}"
+            }
+        
+        # Fallback sur les anciennes limites
         limits = PharmacyLimits.get_limits_for_plan(tenant.current_plan or "essentiel")
         max_branches = limits["max_branches_per_pharmacy"]
+        
+        # 0 = illimité
+        if max_branches == 0:
+            return {
+                "can_create": True,
+                "current_branches": current_branches,
+                "max_branches_allowed": float('inf'),
+                "remaining": float('inf'),
+                "reason": ""
+            }
         
         can_create = current_branches < max_branches
         
@@ -127,7 +154,6 @@ class PharmacyLimits:
             "remaining": max(0, max_branches - current_branches),
             "reason": "" if can_create else f"Limite de {max_branches} succursales atteinte"
         }
-
 
 # ==================== PHARMACIES CRUD ====================
 

@@ -47,6 +47,7 @@ class PharmacySubscription(Base):
     # Limites (dénormalisées depuis le plan)
     max_products = Column(Integer, nullable=False)
     max_users = Column(Integer, nullable=False)
+    max_branches = Column(Integer, default=0, comment="0 = illimité")
     
     # Métadonnées
     payment_id = Column(UUID(as_uuid=True), nullable=True)

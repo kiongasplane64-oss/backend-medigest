@@ -13,6 +13,7 @@ PLAN_LIMITS = {
         "name": "Essai",
         "max_products": 2000,
         "max_users": 5,
+        "max_branches": 0, 
         "trial_days": 14,
         "monthly_price": 0,
         "yearly_price": 0
@@ -21,6 +22,7 @@ PLAN_LIMITS = {
         "name": "Starter",
         "max_products": 1500,
         "max_users": 5,
+        "max_branches": 0, 
         "monthly_price": 5,
         "yearly_price": 48
     },
@@ -28,6 +30,7 @@ PLAN_LIMITS = {
         "name": "Professionnel",
         "max_products": 3000,
         "max_users": 20,
+        "max_branches": 0, 
         "monthly_price": 8,
         "yearly_price": 76.8
     },
@@ -35,6 +38,7 @@ PLAN_LIMITS = {
         "name": "Entreprise",
         "max_products": 10000,
         "max_users": 20,
+        "max_branches": 0, 
         "monthly_price": 15,
         "yearly_price": 144
     },
@@ -42,6 +46,7 @@ PLAN_LIMITS = {
         "name": "Infinite",
         "max_products": 0,  # 0 = illimité
         "max_users": 0,    # 0 = illimité
+        "max_branches": 0, 
         "monthly_price": 30,
         "yearly_price": 288
     }
@@ -85,6 +90,7 @@ def create_pharmacy_subscription(
         billing_cycle=billing_cycle,
         price=price,
         max_products=limits["max_products"],
+        max_branches=limits.get("max_branches", 0),
         max_users=limits["max_users"]
     )
     db.add(subscription)
@@ -128,6 +134,27 @@ def check_pharmacy_subscription(
         "billing_cycle": sub.billing_cycle,
         "price": sub.price
     }
+
+def can_add_branch(db: Session, pharmacy_id: UUID) -> bool:
+    """Vérifie si une pharmacie peut ajouter une nouvelle branche"""
+    sub_status = check_pharmacy_subscription(db, pharmacy_id, raise_if_inactive=False)
+    
+    if not sub_status["is_active"]:
+        return False
+    
+    max_branches = sub_status.get("max_branches", 0)
+    
+    # 0 = illimité
+    if max_branches == 0:
+        return True
+    
+    from app.models.branch import Branch
+    current_count = db.query(Branch).filter(
+        Branch.parent_pharmacy_id == pharmacy_id,
+        Branch.is_active == True
+    ).count()
+    
+    return current_count < max_branches
 
 def can_add_product(db: Session, pharmacy_id: UUID) -> bool:
     sub_status = check_pharmacy_subscription(db, pharmacy_id, raise_if_inactive=False)

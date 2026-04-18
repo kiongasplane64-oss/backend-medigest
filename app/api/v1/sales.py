@@ -1424,6 +1424,10 @@ async def get_sale_by_id(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur récupération de la vente: {str(e)}"
         )
+
+@property
+def nom_complet(self):
+    return self.full_name
 # =======================
 # Endpoint: Statistiques par période
 # =======================
