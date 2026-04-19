@@ -178,6 +178,7 @@ class Tenant(Base):
     product_stocks = relationship("ProductStock", back_populates="tenant", cascade="all, delete-orphan")
     transfers = relationship("ProductTransfer", back_populates="tenant", cascade="all, delete-orphan")
     orders = relationship("Order", back_populates="tenant", cascade="all, delete-orphan")
+    user_expenses = relationship("UserExpense", back_populates="tenant")
 
     # =========================
     # INDEXES

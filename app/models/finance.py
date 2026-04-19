@@ -134,6 +134,13 @@ class Expense(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
 
+    # =====================================
+    # NOUVEAUX CHAMPS : BRANCHE ET UTILISATEUR
+    # =====================================
+    branch_id = Column(UUID(as_uuid=True), ForeignKey("branches.id"), nullable=True, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True, 
+                    comment="Utilisateur qui a généré la dépense")
+    
     expense_date = Column(Date, nullable=False, index=True)
     expense_type = Column(String(50), nullable=False)
 
@@ -156,8 +163,22 @@ class Expense(Base):
     recurrence_interval = Column(String(30))
     next_due_date = Column(Date)
 
+    # =====================================
+    # NOUVEAUX CHAMPS POUR LE SUIVI
+    # =====================================
+    approved_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    approval_status = Column(String(20), default="pending", 
+                            comment="pending, approved, rejected")
+    rejection_reason = Column(Text, nullable=True)
+    
+    cost_center = Column(String(100), nullable=True, comment="Centre de coût")
+    project_code = Column(String(50), nullable=True, comment="Code projet si applicable")
+
     # Relations
     tenant = relationship("Tenant", back_populates="expenses")
+    branch = relationship("Branch", foreign_keys=[branch_id], back_populates="expenses")
+    user = relationship("User", foreign_keys=[user_id], back_populates="expenses")
+    approver = relationship("User", foreign_keys=[approved_by])
 
     financial_transaction = relationship(
         "FinancialTransaction",
@@ -167,3 +188,14 @@ class Expense(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # =====================================
+    # INDEXES
+    # =====================================
+    __table_args__ = (
+        Index('ix_expenses_tenant_branch', 'tenant_id', 'branch_id'),
+        Index('ix_expenses_tenant_user', 'tenant_id', 'user_id'),
+        Index('ix_expenses_branch_date', 'branch_id', 'expense_date'),
+        Index('ix_expenses_user_date', 'user_id', 'expense_date'),
+        Index('ix_expenses_approval_status', 'tenant_id', 'approval_status'),
+    )

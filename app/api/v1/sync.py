@@ -75,13 +75,16 @@ def sync_data(
                     'pharmacies': 'pharmacies', 'pharmacie': 'pharmacies',
                     'mouvements_stock': 'stock_movements', 'mouvement_stock': 'stock_movements',
                     'paiements_dette': 'debt_payments', 'paiement_dette': 'debt_payments',
+                    'depenses': 'expenses', 'depense': 'expenses', 'expenses': 'expenses',
+                    'charges': 'expenses', 'charge': 'expenses',
             }
 
             allowed_tables = [
                     'products', 'categories', 'sales', 'customers', 
                     'invoices', 'users', 'tenants', 'subscriptions',
                     'debts', 'returns', 'branches', 'pharmacies', 
-                    'stock_movements', 'debt_payments'
+                    'stock_movements', 'debt_payments',
+                    'expenses'
                 ]
             
             normalized = table_mapping.get(item.table_name.lower(), item.table_name.lower())
@@ -1742,7 +1745,8 @@ def get_changes_since(db: Session, tenant_id: UUID, since: Optional[datetime] = 
         'subscriptions': [],
         'customers': [],
         'categories': [],
-        'stock_movements': []
+        'stock_movements': [],
+        'expenses': []
     }
     
     # 1. Ventes
@@ -1972,6 +1976,42 @@ def get_changes_since(db: Session, tenant_id: UUID, since: Optional[datetime] = 
             'branch_id': str(movement.branch_id) if movement.branch_id else None,
             'pharmacy_id': str(movement.pharmacy_id) if movement.pharmacy_id else None,
             'created_at': movement.created_at.isoformat() if movement.created_at else None
+        })
+    
+    # NOUVEAU: 10. Dépenses
+    from app.models.finance import Expense
+    expenses_query = db.query(Expense).filter(Expense.tenant_id == tenant_id)
+    if since:
+        expenses_query = expenses_query.filter(Expense.updated_at >= since)
+    for expense in expenses_query.all():
+        changes['expenses'].append({
+            'id': str(expense.id),
+            'tenant_id': str(expense.tenant_id),
+            'branch_id': str(expense.branch_id) if expense.branch_id else None,
+            'user_id': str(expense.user_id) if expense.user_id else None,
+            'expense_date': expense.expense_date.isoformat() if expense.expense_date else None,
+            'expense_type': expense.expense_type,
+            'amount': float(expense.amount),
+            'tax_amount': float(expense.tax_amount),
+            'total_amount': float(expense.total_amount),
+            'supplier': expense.supplier,
+            'payee': expense.payee,
+            'payment_method': expense.payment_method,
+            'payment_reference': expense.payment_reference,
+            'description': expense.description,
+            'notes': expense.notes,
+            'invoice_number': expense.invoice_number,
+            'invoice_date': expense.invoice_date.isoformat() if expense.invoice_date else None,
+            'is_recurring': expense.is_recurring,
+            'recurrence_interval': expense.recurrence_interval,
+            'next_due_date': expense.next_due_date.isoformat() if expense.next_due_date else None,
+            'approved_by': str(expense.approved_by) if expense.approved_by else None,
+            'approval_status': expense.approval_status,
+            'rejection_reason': expense.rejection_reason,
+            'cost_center': expense.cost_center,
+            'project_code': expense.project_code,
+            'created_at': expense.created_at.isoformat() if expense.created_at else None,
+            'updated_at': expense.updated_at.isoformat() if expense.updated_at else None
         })
     
     return changes
@@ -2339,4 +2379,452 @@ def sync_health_details(
             "sale": last_sale.updated_at.isoformat() if last_sale else None,
             "product": last_product.updated_at.isoformat() if last_product else None
         }
+    }
+
+# ============================================================
+# ENDPOINTS POUR LA SYNCHRONISATION DES DÉPENSES
+# ============================================================
+
+@router.post("/expenses/sync")
+def sync_expenses(
+    payload: dict,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """
+    Endpoint pour la synchronisation des dépenses
+    Supporte create, update, upsert, delete
+    """
+    from app.models.finance import Expense
+    from app.models.branch import Branch
+    from app.models.user import User
+    
+    expenses = payload.get('expenses', [])
+    action = payload.get('action', 'upsert')
+    validate_branch = payload.get('validate_branch', True)
+    validate_user = payload.get('validate_user', True)
+    
+    if not expenses:
+        return {
+            "status": "success", 
+            "message": "Aucune dépense à synchroniser", 
+            "processed": 0,
+            "synced_ids": []
+        }
+    
+    processed = 0
+    failed = 0
+    synced_ids = []
+    failed_ids = []
+    errors = []
+    branch_warnings = []
+    user_warnings = []
+    
+    for expense_data in expenses:
+        try:
+            expense_id = expense_data.get('id')
+            if isinstance(expense_id, str) and expense_id:
+                try:
+                    expense_id = UUID(expense_id)
+                except:
+                    pass
+            
+            # Valider la branche si nécessaire
+            branch_id = expense_data.get('branch_id')
+            if validate_branch and branch_id:
+                branch = db.query(Branch).filter(
+                    Branch.id == branch_id,
+                    Branch.tenant_id == user.tenant_id,
+                    Branch.is_active == True
+                ).first()
+                if not branch:
+                    branch_warnings.append({
+                        "expense_id": str(expense_id) if expense_id else None,
+                        "branch_id": str(branch_id),
+                        "warning": "Branche non trouvée, la dépense sera créée sans branche"
+                    })
+                    expense_data['branch_id'] = None  # Reset branch_id if not found
+            
+            # Valider l'utilisateur si nécessaire
+            user_id = expense_data.get('user_id')
+            if validate_user and user_id:
+                target_user = db.query(User).filter(
+                    User.id == user_id,
+                    User.tenant_id == user.tenant_id,
+                    User.actif == True
+                ).first()
+                if not target_user:
+                    user_warnings.append({
+                        "expense_id": str(expense_id) if expense_id else None,
+                        "user_id": str(user_id),
+                        "warning": "Utilisateur non trouvé, la dépense sera créée sans utilisateur"
+                    })
+                    expense_data['user_id'] = None  # Reset user_id if not found
+            
+            # Vérifier si la dépense existe déjà
+            existing_expense = None
+            if expense_id:
+                existing_expense = db.query(Expense).filter(
+                    Expense.id == expense_id,
+                    Expense.tenant_id == user.tenant_id
+                ).first()
+            
+            if action == "delete" and existing_expense:
+                # Soft delete - marquer comme inactif ou supprimer
+                if hasattr(existing_expense, 'is_active'):
+                    existing_expense.is_active = False
+                else:
+                    db.delete(existing_expense)
+                processed += 1
+                synced_ids.append(str(expense_id))
+                continue
+            
+            if existing_expense and action in ["update", "upsert"]:
+                # Mettre à jour la dépense existante
+                for field, value in expense_data.items():
+                    if field != 'id' and hasattr(existing_expense, field):
+                        setattr(existing_expense, field, value)
+                
+                # Recalculer le total si nécessaire
+                if 'amount' in expense_data or 'tax_amount' in expense_data:
+                    existing_expense.total_amount = existing_expense.amount + existing_expense.tax_amount
+                
+                existing_expense.updated_at = datetime.utcnow()
+                processed += 1
+                synced_ids.append(str(existing_expense.id))
+                
+            elif action in ["create", "upsert"]:
+                # Créer une nouvelle dépense
+                expense_data.pop('id', None)
+                new_expense = Expense(
+                    tenant_id=user.tenant_id,
+                    user_id=user.id,  # L'utilisateur qui synchronise
+                    **{k: v for k, v in expense_data.items() if hasattr(Expense, k)}
+                )
+                
+                # Recalculer le total
+                new_expense.total_amount = new_expense.amount + (new_expense.tax_amount or 0)
+                
+                if expense_id:
+                    new_expense.id = expense_id if isinstance(expense_id, UUID) else UUID(expense_id)
+                
+                db.add(new_expense)
+                processed += 1
+                synced_ids.append(str(new_expense.id))
+            
+            db.commit()
+            
+        except Exception as e:
+            db.rollback()
+            failed += 1
+            failed_ids.append(expense_data.get('id'))
+            errors.append({
+                "id": expense_data.get('id'), 
+                "error": str(e),
+                "data": expense_data
+            })
+            logger.error(f"Erreur synchronisation dépense {expense_data.get('id')}: {str(e)}")
+    
+    return {
+        "status": "success" if failed == 0 else "partial",
+        "message": f"{processed} dépenses synchronisées, {failed} échecs",
+        "processed": processed,
+        "failed": failed,
+        "synced_ids": synced_ids,
+        "failed_ids": failed_ids,
+        "errors": errors,
+        "warnings": {
+            "branches": branch_warnings,
+            "users": user_warnings
+        } if (branch_warnings or user_warnings) else None
+    }
+
+
+@router.post("/expenses/batch")
+def sync_expenses_batch(
+    payload: dict,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """
+    Endpoint pour la synchronisation par lots des dépenses
+    avec traitement optimisé
+    """
+    from app.models.finance import Expense
+    
+    expenses = payload.get('expenses', [])
+    strategy = payload.get('strategy', 'upsert')  # upsert, merge, replace
+    batch_size = payload.get('batch_size', 100)
+    
+    if not expenses:
+        return {"status": "success", "message": "Aucune dépense à synchroniser", "processed": 0}
+    
+    processed = 0
+    failed = 0
+    synced_ids = []
+    errors = []
+    
+    # Traitement par lots
+    for i in range(0, len(expenses), batch_size):
+        batch = expenses[i:i+batch_size]
+        batch_processed = 0
+        
+        for expense_data in batch:
+            try:
+                expense_id = expense_data.get('id')
+                if isinstance(expense_id, str) and expense_id:
+                    try:
+                        expense_id = UUID(expense_id)
+                    except:
+                        pass
+                
+                if strategy == 'replace' and expense_id:
+                    # Supprimer l'existant et recréer
+                    existing = db.query(Expense).filter(
+                        Expense.id == expense_id,
+                        Expense.tenant_id == user.tenant_id
+                    ).first()
+                    if existing:
+                        db.delete(existing)
+                        db.flush()
+                
+                existing = None
+                if expense_id and strategy != 'replace':
+                    existing = db.query(Expense).filter(
+                        Expense.id == expense_id,
+                        Expense.tenant_id == user.tenant_id
+                    ).first()
+                
+                if existing:
+                    # Mise à jour
+                    for field, value in expense_data.items():
+                        if field != 'id' and hasattr(existing, field):
+                            setattr(existing, field, value)
+                    existing.total_amount = existing.amount + (existing.tax_amount or 0)
+                    existing.updated_at = datetime.utcnow()
+                    synced_ids.append(str(existing.id))
+                else:
+                    # Création
+                    expense_data.pop('id', None)
+                    new_expense = Expense(
+                        tenant_id=user.tenant_id,
+                        user_id=user.id,
+                        **{k: v for k, v in expense_data.items() if hasattr(Expense, k)}
+                    )
+                    new_expense.total_amount = new_expense.amount + (new_expense.tax_amount or 0)
+                    db.add(new_expense)
+                    db.flush()
+                    synced_ids.append(str(new_expense.id))
+                
+                batch_processed += 1
+                
+            except Exception as e:
+                failed += 1
+                errors.append({
+                    "id": expense_data.get('id'),
+                    "error": str(e)
+                })
+                logger.error(f"Erreur lot dépense {expense_data.get('id')}: {str(e)}")
+        
+        processed += batch_processed
+        db.commit()
+        logger.info(f"Lot {i//batch_size + 1}: {batch_processed} dépenses traitées")
+    
+    return {
+        "status": "success" if failed == 0 else "partial",
+        "message": f"{processed} dépenses synchronisées par lots, {failed} échecs",
+        "processed": processed,
+        "failed": failed,
+        "synced_ids": synced_ids,
+        "errors": errors,
+        "strategy": strategy,
+        "batch_size": batch_size
+    }
+
+
+@router.get("/expenses/pending")
+def get_pending_expenses(
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+    branch_id: Optional[str] = None,
+    approval_status: Optional[str] = "pending",
+    limit: int = 100
+):
+    """
+    Récupère les dépenses en attente de synchronisation
+    ou en attente d'approbation
+    """
+    from app.models.finance import Expense
+    
+    query = db.query(Expense).filter(
+        Expense.tenant_id == user.tenant_id
+    )
+    
+    if branch_id:
+        query = query.filter(Expense.branch_id == branch_id)
+    if approval_status:
+        query = query.filter(Expense.approval_status == approval_status)
+    
+    pending_expenses = query.order_by(Expense.expense_date.desc()).limit(limit).all()
+    
+    return {
+        "status": "success",
+        "count": len(pending_expenses),
+        "expenses": [
+            {
+                "id": str(e.id),
+                "expense_date": e.expense_date.isoformat() if e.expense_date else None,
+                "expense_type": e.expense_type,
+                "amount": float(e.amount),
+                "total_amount": float(e.total_amount),
+                "supplier": e.supplier,
+                "description": e.description,
+                "approval_status": e.approval_status,
+                "branch_id": str(e.branch_id) if e.branch_id else None,
+                "user_id": str(e.user_id) if e.user_id else None,
+                "created_at": e.created_at.isoformat() if e.created_at else None
+            }
+            for e in pending_expenses
+        ]
+    }
+
+
+@router.post("/expenses/approve-batch")
+def approve_expenses_batch(
+    payload: dict,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """
+    Approuve ou rejette un lot de dépenses par synchronisation
+    """
+    from app.models.finance import Expense
+    
+    expense_ids = payload.get('expense_ids', [])
+    approved = payload.get('approved', True)
+    rejection_reason = payload.get('rejection_reason', None)
+    
+    if not expense_ids:
+        return {"status": "error", "message": "Aucun ID de dépense fourni"}
+    
+    processed = 0
+    failed = 0
+    results = []
+    
+    for expense_id in expense_ids:
+        try:
+            expense = db.query(Expense).filter(
+                Expense.id == expense_id,
+                Expense.tenant_id == user.tenant_id
+            ).first()
+            
+            if not expense:
+                failed += 1
+                results.append({"id": str(expense_id), "status": "failed", "error": "Dépense non trouvée"})
+                continue
+            
+            if expense.approval_status != "pending":
+                results.append({"id": str(expense_id), "status": "skipped", "reason": f"Déjà {expense.approval_status}"})
+                continue
+            
+            if approved:
+                expense.approval_status = "approved"
+                expense.rejection_reason = None
+            else:
+                if not rejection_reason:
+                    results.append({"id": str(expense_id), "status": "failed", "error": "Raison de rejet requise"})
+                    failed += 1
+                    continue
+                expense.approval_status = "rejected"
+                expense.rejection_reason = rejection_reason
+            
+            expense.approved_by = user.id
+            processed += 1
+            results.append({"id": str(expense_id), "status": "success", "action": "approved" if approved else "rejected"})
+            
+        except Exception as e:
+            failed += 1
+            results.append({"id": str(expense_id), "status": "failed", "error": str(e)})
+    
+    db.commit()
+    
+    return {
+        "status": "success" if failed == 0 else "partial",
+        "message": f"{processed} dépenses traitées, {failed} échecs",
+        "processed": processed,
+        "failed": failed,
+        "results": results
+    }
+
+
+@router.get("/expenses/statistics")
+def get_expenses_sync_statistics(
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+    days: int = 30
+):
+    """
+    Statistiques des dépenses pour la synchronisation
+    """
+    from app.models.finance import Expense
+    from sqlalchemy import func
+    
+    start_date = datetime.utcnow() - timedelta(days=days)
+    
+    # Statistiques générales
+    stats = db.query(
+        func.count(Expense.id).label('total'),
+        func.sum(Expense.total_amount).label('total_amount'),
+        func.avg(Expense.total_amount).label('avg_amount'),
+        func.sum(func.nullif(Expense.tax_amount, 0)).label('total_tax')
+    ).filter(
+        Expense.tenant_id == user.tenant_id,
+        Expense.created_at >= start_date
+    ).first()
+    
+    # Par statut d'approbation
+    by_status = db.query(
+        Expense.approval_status,
+        func.count(Expense.id).label('count'),
+        func.sum(Expense.total_amount).label('amount')
+    ).filter(
+        Expense.tenant_id == user.tenant_id,
+        Expense.created_at >= start_date
+    ).group_by(Expense.approval_status).all()
+    
+    # Par type de dépense
+    by_type = db.query(
+        Expense.expense_type,
+        func.count(Expense.id).label('count'),
+        func.sum(Expense.total_amount).label('amount')
+    ).filter(
+        Expense.tenant_id == user.tenant_id,
+        Expense.created_at >= start_date
+    ).group_by(Expense.expense_type).limit(10).all()
+    
+    return {
+        "status": "success",
+        "period_days": days,
+        "statistics": {
+            "total_expenses": stats.total or 0,
+            "total_amount": float(stats.total_amount or 0),
+            "average_amount": float(stats.avg_amount or 0),
+            "total_tax": float(stats.total_tax or 0)
+        },
+        "by_status": [
+            {
+                "status": s.approval_status,
+                "count": s.count,
+                "amount": float(s.amount or 0)
+            }
+            for s in by_status
+        ],
+        "by_type": [
+            {
+                "type": t.expense_type,
+                "count": t.count,
+                "amount": float(t.amount or 0)
+            }
+            for t in by_type
+        ]
     }

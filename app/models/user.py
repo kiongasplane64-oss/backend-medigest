@@ -112,6 +112,8 @@ class User(Base):
         lazy="noload",
         overlaps="payments_processed"
     )
+    expenses = relationship("Expense", foreign_keys="Expense.user_id", back_populates="user")
+    expenses_approved = relationship("Expense", foreign_keys="Expense.approved_by")
 
     # ========== DÉPRÉCIÉ / À SUPPRIMER (abonnement tenant) ==========
     # tenant_subscription = relationship(

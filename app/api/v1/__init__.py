@@ -15,6 +15,7 @@ from app.api.v1.sync import router as sync_router
 from app.api.v1.dashboard import router as dashboard_router
 from app.api.v1.endpoints.transfers import router as transfers_router
 from app.api.v1.capital import router as capital_router
+from app.api.v1.endpoints import expenses 
 
 
 api_router = APIRouter()
@@ -38,3 +39,8 @@ api_router.include_router(dashboard_router, prefix="/dashboard",tags=["Dashboard
 api_router.include_router(orders.router, prefix="/orders", tags=["Orders"])
 api_router.include_router(transfers_router, prefix="/transfers", tags=["Transfers"])
 api_router.include_router(capital_router)
+api_router.include_router(
+    expenses.router,
+    prefix="/expenses",
+    tags=["Dépenses"]
+)
