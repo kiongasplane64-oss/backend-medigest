@@ -3,6 +3,7 @@
 Endpoints de gestion des abonnements (NOUVELLE VERSION).
 - Abonnement lié à la pharmacie/branche
 - Utilisateur hérite des droits de sa pharmacie active
+- Version utilisant UNIQUEMENT PharmacySubscription (pas de relation pharmacy.subscription)
 """
 
 from __future__ import annotations
@@ -14,12 +15,16 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
-from app.models.invoice import InvoiceStatus, Invoice 
 
 from app.api.deps import get_db, get_current_active_user, get_super_admin_user
 from app.models.user import User
 from app.models.pharmacy import Pharmacy
-from app.models.pharmacy_subscription import PharmacySubscription, SubscriptionPlan, SubscriptionStatus
+from app.models.pharmacy_subscription import (
+    PharmacySubscription, 
+    SubscriptionPlan, 
+    SubscriptionStatus
+)
+from app.models.invoice import InvoiceStatus, Invoice
 from app.schemas.subscription import UpgradeSubscriptionSchema, ManualActivationSchema
 
 logger = logging.getLogger(__name__)
@@ -132,19 +137,12 @@ def format_unlimited(value: int) -> str:
     return str(value)
 
 
-def get_current_pharmacy_subscription(db: Session, user: User) -> Optional[PharmacySubscription]:
-    """Récupère l'abonnement de la pharmacie active de l'utilisateur."""
-    if not user.active_pharmacy_id:
-        return None
-    
-    # REQUÊTE DIRECTE au lieu de pharmacy.subscription
-    from app.models.pharmacy_subscription import PharmacySubscription
-    
-    subscription = db.query(PharmacySubscription).filter(
-        PharmacySubscription.pharmacy_id == user.active_pharmacy_id
+def get_pharmacy_subscription_by_id(db: Session, pharmacy_id: UUID) -> Optional[PharmacySubscription]:
+    """Récupère l'abonnement d'une pharmacie par son ID (requête directe)."""
+    return db.query(PharmacySubscription).filter(
+        PharmacySubscription.pharmacy_id == pharmacy_id
     ).first()
-    
-    return subscription
+
 
 def get_pharmacy_limits(db: Session, user: User) -> Dict[str, Any]:
     """Récupère les limites de la pharmacie active."""
@@ -180,12 +178,8 @@ def get_pharmacy_limits(db: Session, user: User) -> Dict[str, Any]:
                 "access_mode": "read_only"
             }
         
-        # REQUÊTE DIRECTE - Éviter l'accès à pharmacy.subscription qui cause l'erreur d'Enum
-        from app.models.pharmacy_subscription import PharmacySubscription, SubscriptionStatus
-        
-        subscription = db.query(PharmacySubscription).filter(
-            PharmacySubscription.pharmacy_id == pharmacy.id
-        ).first()
+        # REQUÊTE DIRECTE sur PharmacySubscription (pas via pharmacy.subscription)
+        subscription = get_pharmacy_subscription_by_id(db, pharmacy.id)
         
         if not subscription:
             return {
@@ -201,7 +195,7 @@ def get_pharmacy_limits(db: Session, user: User) -> Dict[str, Any]:
             }
         
         # Vérifier si l'abonnement est actif
-        is_active = subscription.status == SubscriptionStatus.ACTIVE and subscription.end_date > datetime.utcnow()
+        is_active = subscription.is_active()
         
         # Récupérer le nom du plan en toute sécurité
         plan_value = subscription.plan.value if hasattr(subscription.plan, 'value') else str(subscription.plan)
@@ -219,7 +213,7 @@ def get_pharmacy_limits(db: Session, user: User) -> Dict[str, Any]:
             "price": subscription.price,
             "billing_cycle": subscription.billing_cycle,
             "end_date": subscription.end_date,
-            "days_remaining": subscription.days_remaining() if subscription.end_date else 0,
+            "days_remaining": subscription.days_remaining(),
             "features": plan_config.get("features", []),
             "access_mode": "full" if is_active else "read_only"
         }
@@ -237,7 +231,8 @@ def get_pharmacy_limits(db: Session, user: User) -> Dict[str, Any]:
             "is_unlimited_users": False,
             "access_mode": "read_only"
         }
-    
+
+
 def get_current_usage(db: Session, user: User) -> Dict[str, Any]:
     """Récupère l'utilisation actuelle de la pharmacie active."""
     if not user.active_pharmacy_id:
@@ -258,6 +253,12 @@ def get_current_usage(db: Session, user: User) -> Dict[str, Any]:
         "products": products_count,
         "users": users_count
     }
+
+
+def update_subscription_limits(subscription: PharmacySubscription, plan_config: Dict[str, Any]) -> None:
+    """Met à jour les limites d'un abonnement selon la config du plan."""
+    subscription.max_products = plan_config["max_products"]
+    subscription.max_users = plan_config["max_users"]
 
 
 # =============================================================================
@@ -553,17 +554,19 @@ async def upgrade_pharmacy_subscription(
             detail="Aucune pharmacie active sélectionnée."
         )
     
-    pharmacy = db.query(Pharmacy).filter(Pharmacy.id == current_user.active_pharmacy_id).first()
-    if not pharmacy or not pharmacy.subscription:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Aucun abonnement trouvé pour cette pharmacie."
-        )
-    
     if data.plan not in PLAN_CONFIG:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Plan invalide. Options: {', '.join(PLAN_CONFIG.keys())}"
+        )
+    
+    # Récupérer l'abonnement directement
+    subscription = get_pharmacy_subscription_by_id(db, current_user.active_pharmacy_id)
+    
+    if not subscription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Aucun abonnement trouvé pour cette pharmacie."
         )
     
     plan_config = get_plan_config(data.plan)
@@ -576,46 +579,31 @@ async def upgrade_pharmacy_subscription(
         end_date = now + timedelta(days=30)
         price = plan_config["price_monthly"]
     
-    # Mettre à jour l'abonnement
-    subscription = pharmacy.subscription
-    subscription.plan = data.plan
+    # Mettre à jour l'abonnement directement
+    subscription.plan = SubscriptionPlan(data.plan)
     subscription.plan_name = plan_config["name"]
     subscription.start_date = now
     subscription.end_date = end_date
     subscription.price = price
     subscription.billing_cycle = data.billing_cycle
     subscription.status = SubscriptionStatus.ACTIVE
-    subscription.max_products = plan_config["max_products"]
-    subscription.max_users = plan_config["max_users"]
+    update_subscription_limits(subscription, plan_config)
     subscription.updated_at = now
-    
-    # Ajouter à l'historique
-    config = subscription.config or {}
-    config["upgrade_history"] = config.get("upgrade_history", [])
-    config["upgrade_history"].append({
-        "previous_plan": subscription.plan,
-        "new_plan": data.plan,
-        "upgraded_at": now.isoformat(),
-        "upgraded_by": str(current_user.id),
-        "billing_cycle": data.billing_cycle,
-        "price": price
-    })
-    subscription.config = config
     
     db.commit()
     db.refresh(subscription)
     
-    logger.info("Upgrade abonnement pour pharmacie %s vers %s", pharmacy.id, data.plan)
+    logger.info("Upgrade abonnement pour pharmacie %s vers %s", current_user.active_pharmacy_id, data.plan)
     
     return {
         "success": True,
         "message": f"Abonnement mis à niveau vers le plan {plan_config['name']}.",
         "subscription": {
             "id": str(subscription.id),
-            "pharmacy_id": str(pharmacy.id),
-            "plan": subscription.plan,
+            "pharmacy_id": str(subscription.pharmacy_id),
+            "plan": subscription.plan.value,
             "plan_name": subscription.plan_name,
-            "status": subscription.status,
+            "status": subscription.status.value,
             "start_date": subscription.start_date.isoformat(),
             "end_date": subscription.end_date.isoformat(),
             "days_remaining": subscription.days_remaining(),
@@ -817,6 +805,7 @@ async def get_billing_history(
         "timestamp": utc_now_iso()
     }
 
+
 # =============================================================================
 # ENDPOINTS SUPER ADMIN
 # =============================================================================
@@ -830,6 +819,7 @@ async def get_subscriptions_overview(
     """Vue d'ensemble des abonnements pour le super admin."""
     logger.info("Vue d'ensemble abonnements demandée par %s", current_user.email)
     
+    # Requête directe sur PharmacySubscription
     query = db.query(PharmacySubscription)
     
     if tenant_id:
@@ -877,6 +867,7 @@ async def get_subscriptions_overview(
         "filter": {"tenant_id": tenant_id} if tenant_id else None
     }
 
+
 @router.post("/admin/manual-activation", response_model=Dict[str, Any])
 async def manual_activate_subscription(
     data: ManualActivationSchema,
@@ -903,22 +894,26 @@ async def manual_activate_subscription(
             end_date = now + timedelta(days=30)
             price = plan_config["price_monthly"]
         
-        if pharmacy.subscription:
-            subscription = pharmacy.subscription
-            subscription.plan = data.plan
-            subscription.plan_name = plan_config["name"]
-            subscription.start_date = now
-            subscription.end_date = end_date
-            subscription.price = price
-            subscription.billing_cycle = data.billing_cycle
-            subscription.status = SubscriptionStatus.ACTIVE
-            subscription.max_products = plan_config["max_products"]
-            subscription.max_users = plan_config["max_users"]
-            subscription.updated_at = now
+        # Vérifier si un abonnement existe déjà
+        existing_subscription = get_pharmacy_subscription_by_id(db, pharmacy.id)
+        
+        if existing_subscription:
+            # Mettre à jour l'existant
+            existing_subscription.plan = SubscriptionPlan(data.plan)
+            existing_subscription.plan_name = plan_config["name"]
+            existing_subscription.start_date = now
+            existing_subscription.end_date = end_date
+            existing_subscription.price = price
+            existing_subscription.billing_cycle = data.billing_cycle
+            existing_subscription.status = SubscriptionStatus.ACTIVE
+            update_subscription_limits(existing_subscription, plan_config)
+            existing_subscription.updated_at = now
+            subscription = existing_subscription
         else:
+            # Créer un nouvel abonnement
             subscription = PharmacySubscription(
                 pharmacy_id=pharmacy.id,
-                plan=data.plan,
+                plan=SubscriptionPlan(data.plan),
                 plan_name=plan_config["name"],
                 start_date=now,
                 end_date=end_date,
@@ -930,7 +925,6 @@ async def manual_activate_subscription(
             )
             db.add(subscription)
             db.flush()
-            pharmacy.subscription_id = subscription.id
         
         db.commit()
         
@@ -939,10 +933,10 @@ async def manual_activate_subscription(
             "message": f"Abonnement activé manuellement pour la pharmacie {pharmacy.name}.",
             "subscription": {
                 "id": str(subscription.id),
-                "pharmacy_id": str(pharmacy.id),
-                "plan": subscription.plan,
+                "pharmacy_id": str(subscription.pharmacy_id),
+                "plan": subscription.plan.value,
                 "plan_name": subscription.plan_name,
-                "status": subscription.status,
+                "status": subscription.status.value,
                 "start_date": subscription.start_date.isoformat(),
                 "end_date": subscription.end_date.isoformat(),
                 "days_remaining": subscription.days_remaining(),
@@ -981,8 +975,10 @@ async def force_subscription_sync(
             detail="Aucune pharmacie active sélectionnée."
         )
     
-    pharmacy = db.query(Pharmacy).filter(Pharmacy.id == current_user.active_pharmacy_id).first()
-    if not pharmacy or not pharmacy.subscription:
+    # Requête directe sur PharmacySubscription
+    subscription = get_pharmacy_subscription_by_id(db, current_user.active_pharmacy_id)
+    
+    if not subscription:
         return {
             "success": True,
             "has_subscription": False,
@@ -992,7 +988,6 @@ async def force_subscription_sync(
             "timestamp": utc_now_iso()
         }
     
-    subscription = pharmacy.subscription
     is_active = subscription.is_active()
     
     return {
@@ -1002,7 +997,7 @@ async def force_subscription_sync(
         "access_mode": "full" if is_active else "read_only",
         "force_sync": True,
         "subscription": {
-            "plan": subscription.plan,
+            "plan": subscription.plan.value,
             "plan_name": subscription.plan_name,
             "end_date": subscription.end_date.isoformat() if subscription.end_date else None,
             "days_remaining": subscription.days_remaining(),

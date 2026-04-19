@@ -1,85 +1,94 @@
-# app/core/middleware.py - 
+# app/middleware/middleware.py
 
-from fastapi import Request, HTTPException
+from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
-from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.api.v1.auth import is_subscription_active
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
-class SubscriptionCheckMiddleware(BaseHTTPMiddleware):
-    """Middleware pour vérifier l'abonnement sur les endpoints protégés"""
+
+class SubscriptionMiddleware(BaseHTTPMiddleware):
+    """Middleware pour gérer le mode lecture seule sur abonnement expiré"""
     
-    # Endpoints exemptés de la vérification
-    EXEMPT_PATHS = [
-        "/api/v1/auth/login",
-        "/api/v1/auth/refresh",
-        "/api/v1/auth/tenants/register",
-        "/api/v1/auth/password/reset",
-        "/api/v1/auth/health",
-        "/api/v1/auth/api-status",
-        "/api/v1/auth/verify-subscription",  # Endpoint de vérification lui-même
-        "/docs",
-        "/redoc",
-        "/openapi.json"
+    # Méthodes autorisées en lecture seule
+    READ_ONLY_METHODS = {'GET', 'OPTIONS', 'HEAD'}
+    
+    # Endpoints toujours autorisés (même en écriture)
+    ALWAYS_ALLOWED_PATHS = [
+        r'^/api/v1/auth/.*$',
+        r'^/api/v1/subscriptions/.*$',
+        r'^/api/v1/health$',
+        r'^/api/v1/me$',
+        r'^/api/v1/tenants/me$',
+        r'^/api/v1/session/.*$',
+        r'^/api/v1/pharmacies/.*/service-status$',
+        r'^/api/v1/subscriptions/status$',
+        r'^/api/v1/subscriptions/usage$',
+        r'^/api/v1/subscriptions/plans$',
+        r'^/api/v1/stock/alerts/.*$',  # Lecture des alertes OK
+        r'^/api/v1/dashboard/.*$',      # Dashboard en lecture OK
+        r'^/docs$',
+        r'^/redoc$',
+        r'^/openapi.json$'
     ]
     
     async def dispatch(self, request: Request, call_next):
-        # Vérifier si le chemin est exempté
-        path = request.url.path
-        if any(path.startswith(exempt) for exempt in self.EXEMPT_PATHS):
-            return await call_next(request)
+        # Récupérer l'utilisateur depuis le token (déjà décodé par le dépendance)
+        user = getattr(request.state, 'user', None)
         
-        # Récupérer le token
-        auth_header = request.headers.get("Authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
-            return await call_next(request)
-        
-        token = auth_header.replace("Bearer ", "")
-        
-        # Décoder le token pour obtenir le tenant_id
-        try:
-            from jose import jwt
-            from app.core.config import settings
-            
-            payload = jwt.decode(
-                token, 
-                settings.SECRET_KEY, 
-                algorithms=[settings.ALGORITHM],
-                options={"verify_exp": True}  # Vérifier l'expiration
-            )
-            
-            tenant_id = payload.get("tenant_id")
-            user_id = payload.get("sub")
-            
-            if tenant_id and user_id:
-                # Vérifier l'abonnement dans la base de données
-                db = SessionLocal()
-                try:
-                    subscription_active = is_subscription_active(db, tenant_id)
+        if user and user.tenant_id:
+            db = SessionLocal()
+            try:
+                # Vérifier l'abonnement
+                subscription_active = is_subscription_active(db, str(user.tenant_id))
+                
+                if not subscription_active:
+                    method = request.method
+                    path = request.url.path
                     
-                    if not subscription_active:
-                        logger.warning(f"Abonnement expiré pour tenant {tenant_id}, utilisateur {user_id}")
+                    # Vérifier si le chemin est toujours autorisé
+                    is_allowed_endpoint = any(
+                        re.match(pattern, path) for pattern in self.ALWAYS_ALLOWED_PATHS
+                    )
+                    
+                    # Si méthode non lecture seule et pas endpoint spécial -> bloquer
+                    if method not in self.READ_ONLY_METHODS and not is_allowed_endpoint:
+                        logger.warning(
+                            f"🔒 Tentative d'écriture en mode lecture seule - "
+                            f"User: {user.email}, Method: {method}, Path: {path}"
+                        )
                         return JSONResponse(
                             status_code=403,
                             content={
-                                "detail": {
-                                    "error": "subscription_expired",
-                                    "message": "Votre abonnement a expiré. Veuillez renouveler votre abonnement.",
-                                    "requires_relogin": True
-                                }
+                                "error": "subscription_expired_readonly",
+                                "message": "Votre abonnement a expiré. Mode lecture seule uniquement.",
+                                "read_only_mode": True,
+                                "subscription_expired": True,
+                                "action": "Renouvelez votre abonnement pour modifier vos données",
+                                "allowed_operations": list(self.READ_ONLY_METHODS),
+                                "forbidden_operations": ["POST", "PUT", "PATCH", "DELETE"],
+                                "renewal_url": "/api/v1/subscriptions/plans"
                             }
                         )
-                finally:
-                    db.close()
                     
-        except jwt.ExpiredSignatureError:
-            # Token expiré - laisser passer pour que le client refresh
-            pass
-        except Exception as e:
-            logger.error(f"Erreur dans middleware d'abonnement: {e}")
+                    # Ajouter un flag pour le mode lecture seule
+                    request.state.read_only_mode = True
+                    logger.info(f"📖 Mode lecture seule activé pour {user.email}")
+                    
+            finally:
+                db.close()
         
-        return await call_next(request)
+        # Traiter la requête
+        response = await call_next(request)
+        
+        # Ajouter les headers d'information
+        if hasattr(request.state, 'read_only_mode') and request.state.read_only_mode:
+            response.headers["X-Read-Only-Mode"] = "true"
+            response.headers["X-Subscription-Expired"] = "true"
+            response.headers["X-Allowed-Methods"] = ", ".join(self.READ_ONLY_METHODS)
+        
+        return response

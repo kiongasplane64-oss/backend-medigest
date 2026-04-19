@@ -313,25 +313,24 @@ def is_subscription_active(db: Session, tenant_id: str) -> bool:
     try:
         if not tenant_id:
             logger.warning("is_subscription_active appelé avec tenant_id None")
-            return True  # Par défaut, considérer comme actif pour ne pas bloquer
+            return True
         
-        # Récupérer le tenant
         tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
         if not tenant:
             logger.warning(f"Tenant non trouvé: {tenant_id}")
             return True
         
         # 1. Vérifier la période d'essai
-        current_plan = (tenant.current_plan or "trial").lower()
+        current_plan = (tenant.current_plan or "TRIAL").upper()
         
-        if current_plan == "trial":
+        if current_plan == "TRIAL":
             if tenant.trial_end_date and tenant.trial_end_date > datetime.utcnow():
                 logger.info(f"✅ Tenant {tenant_id} en période d'essai jusqu'au {tenant.trial_end_date}")
                 return True
             logger.warning(f"⚠️ Tenant {tenant_id} période d'essai expirée")
-            return False
+            return False  # ← Retourner False pour indiquer expiré
         
-        # 2. Pour les autres plans, chercher l'abonnement de la pharmacie principale
+        # 2. Pour les autres plans, chercher l'abonnement
         from app.models.pharmacy import Pharmacy
         from app.models.pharmacy_subscription import PharmacySubscription, SubscriptionStatus
         
@@ -343,30 +342,78 @@ def is_subscription_active(db: Session, tenant_id: str) -> bool:
         
         if not main_pharmacy:
             logger.warning(f"⚠️ Aucune pharmacie principale trouvée pour tenant {tenant_id}")
-            return True  # Par défaut, actif
+            return True
         
-        # Requête directe pour éviter les problèmes d'Enum
         subscription = db.query(PharmacySubscription).filter(
             PharmacySubscription.pharmacy_id == main_pharmacy.id
         ).first()
         
         if not subscription:
             logger.warning(f"⚠️ Aucun abonnement trouvé pour pharmacy {main_pharmacy.id}")
-            # Créer un abonnement par défaut si nécessaire
             return True
         
-        # Vérifier le statut
+        # Vérifier si actif
         is_active = subscription.is_active()
         
-        logger.info(f"📊 Abonnement pour {tenant_id}: plan={subscription.plan.value}, actif={is_active}, fin={subscription.end_date}")
+        # Vérifier aussi le statut
+        status_active = subscription.status == SubscriptionStatus.ACTIVE
         
-        return is_active
+        result = is_active and status_active
+        
+        logger.info(f"📊 Abonnement pour {tenant_id}: plan={subscription.plan.value}, actif={result}, fin={subscription.end_date}")
+        
+        return result
         
     except Exception as e:
         logger.error(f"❌ Erreur lors de la vérification de l'abonnement: {e}", exc_info=True)
-        # En cas d'erreur, retourner True pour ne pas bloquer l'utilisateur
+        # En cas d'erreur, retourner True pour ne pas bloquer
         return True
 
+@router.get("/subscription/readonly-status")
+def get_readonly_status(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Retourne le statut de l'abonnement et indique si on est en mode lecture seule"""
+    
+    if not current_user.tenant_id:
+        return {
+            "subscription_active": True,
+            "read_only_mode": False,
+            "subscription_expired": False,
+            "message": "Compte sans abonnement requis",
+            "allowed_operations": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+        }
+    
+    subscription_active = is_subscription_active(db, str(current_user.tenant_id))
+    
+    tenant = db.query(Tenant).filter(Tenant.id == current_user.tenant_id).first()
+    
+    days_remaining = None
+    if tenant and tenant.trial_end_date:
+        if subscription_active:
+            days_remaining = (tenant.trial_end_date - datetime.utcnow()).days
+        else:
+            days_remaining = (datetime.utcnow() - tenant.trial_end_date).days
+            days_remaining = -days_remaining if days_remaining < 0 else days_remaining
+    
+    return {
+        "subscription_active": subscription_active,
+        "read_only_mode": not subscription_active,
+        "subscription_expired": not subscription_active,
+        "message": "Mode lecture seule - Renouvelez votre abonnement pour modifier vos données" if not subscription_active else "Abonnement actif",
+        "expiry_date": tenant.trial_end_date.isoformat() if tenant and tenant.trial_end_date else None,
+        "days_remaining": days_remaining,
+        "current_plan": tenant.current_plan if tenant else None,
+        "tenant_status": tenant.status if tenant else None,
+        "allowed_operations": ["GET", "HEAD", "OPTIONS"] if not subscription_active else ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+        "renewal_url": "/api/v1/subscriptions/plans",
+        "suggestions": [
+            "Consultez les offres d'abonnement",
+            "Contactez le support pour plus d'informations",
+            "Vos données sont toujours accessibles en lecture seule"
+        ] if not subscription_active else []
+    }
 
 def create_refresh_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """Crée un refresh token JWT."""
@@ -736,7 +783,7 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         pharmacy_sub = create_pharmacy_subscription(
             db=db,
             pharmacy_id=pharmacy.id,
-            plan="trial",
+            plan="TRIAL",
             billing_cycle="monthly",
             custom_trial_days=14
         )
@@ -1031,6 +1078,8 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
     response_data = {
         **token_pair,
         "subscription_active": subscription_active,
+        "read_only_mode": not subscription_active,  # ← AJOUTER
+        "subscription_expired": not subscription_active, 
         "is_first_login": is_first_login,
         "user": {
             "id": str(user.id),
@@ -1073,6 +1122,14 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
             "pharmacy_code": main_pharmacy.pharmacy_code
         }
 
+    if not subscription_active and tenant:
+        response_data["renewal_info"] = {
+            "required": True,
+            "message": "Votre abonnement a expiré. Veuillez le renouveler.",
+            "url": "/api/v1/subscriptions/plans",
+            "expiry_date": tenant.trial_end_date.isoformat() if tenant.trial_end_date else None,
+            "days_overdue": abs((tenant.trial_end_date - datetime.utcnow()).days) if tenant.trial_end_date else 0
+        }
     logger.info(f"Login réussi pour: {email} (branche: {active_branch_name})")
     return response_data
 

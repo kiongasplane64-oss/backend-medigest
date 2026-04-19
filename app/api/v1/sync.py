@@ -21,7 +21,7 @@ from app.models.branch import Branch
 from app.models.category import Category
 from app.models.user import User
 from app.models.pharmacy import Pharmacy
-from app.models.subscription import Subscription
+from app.models.pharmacy_subscription import PharmacySubscription
 from app.models.customer import Customer
 
 
@@ -454,37 +454,81 @@ def get_subscription_status(
     db: Session = Depends(get_db),
     user = Depends(get_current_user)
 ):
-    """Récupère le statut de l'abonnement pour une branche"""
-    from app.models.subscription import Subscription
+    """
+    Récupère le statut de l'abonnement pour une branche/pharmacie
+    Utilise le vrai système d'abonnement PharmacySubscription
+    """
+    from app.services.pharmacy_subscription_service import check_pharmacy_subscription
+    from app.models.branch import Branch
     
-    query = db.query(Subscription).filter(
-        Subscription.tenant_id == user.tenant_id,
-        Subscription.is_active == True
-    )
+    # Déterminer la pharmacie
+    pharmacy_id = None
     
-    subscription = query.first()
+    if branch_id:
+        # Chercher via la branche
+        branch = db.query(Branch).filter(
+            Branch.id == branch_id,
+            Branch.tenant_id == user.tenant_id
+        ).first()
+        if branch:
+            pharmacy_id = branch.parent_pharmacy_id
     
-    if not subscription:
+    # Fallback: utiliser la pharmacie active de l'utilisateur
+    if not pharmacy_id and hasattr(user, 'active_pharmacy_id') and user.active_pharmacy_id:
+        pharmacy_id = user.active_pharmacy_id
+    
+    # Fallback: chercher la première pharmacie du tenant
+    if not pharmacy_id:
+        from app.models.pharmacy import Pharmacy
+        first_pharmacy = db.query(Pharmacy).filter(
+            Pharmacy.tenant_id == user.tenant_id
+        ).first()
+        if first_pharmacy:
+            pharmacy_id = first_pharmacy.id
+    
+    if not pharmacy_id:
         return {
             "has_subscription": False,
-            "is_active": True,  # Default
-            "access_mode": "full"
+            "is_active": True,  # Mode par défaut
+            "access_mode": "full",
+            "error": "Aucune pharmacie trouvée pour ce tenant"
         }
     
-    return {
-        "has_subscription": True,
-        "is_active": subscription.status == "active",
-        "access_mode": "full" if subscription.status == "active" else "read_only",
-        "subscription": {
-            "id": str(subscription.id),
-            "plan_name": subscription.plan_name,
-            "plan_type": subscription.plan_type,
-            "status": subscription.status,
-            "current_period_end": subscription.current_period_end.isoformat() if subscription.current_period_end else None,
-            "days_remaining": (subscription.current_period_end - datetime.utcnow()).days if subscription.current_period_end else 30
+    try:
+        # Utiliser le vrai service d'abonnement
+        sub_status = check_pharmacy_subscription(
+            db, 
+            pharmacy_id, 
+            raise_if_inactive=False
+        )
+        
+        return {
+            "has_subscription": sub_status.get("has_subscription", False),
+            "is_active": sub_status.get("is_active", True),
+            "access_mode": "full" if sub_status.get("is_active", True) else "read_only",
+            "subscription": {
+                "id": None,  # Optionnel: récupérer depuis la base
+                "plan_name": sub_status.get("plan_name"),
+                "plan_type": sub_status.get("plan"),
+                "status": "active" if sub_status.get("is_active") else "expired",
+                "current_period_end": sub_status.get("end_date").isoformat() if sub_status.get("end_date") else None,
+                "days_remaining": sub_status.get("days_remaining", 30),
+                "max_products": sub_status.get("max_products"),
+                "max_users": sub_status.get("max_users"),
+                "is_unlimited_products": sub_status.get("is_unlimited_products", False),
+                "is_unlimited_users": sub_status.get("is_unlimited_users", False)
+            }
         }
-    }
-
+        
+    except Exception as e:
+        logger.error(f"Erreur lors de la récupération de l'abonnement: {str(e)}")
+        return {
+            "has_subscription": False,
+            "is_active": True,  # Mode fallback
+            "access_mode": "full",
+            "error": str(e)
+        }
+    
 @router.get("/status")
 def sync_status(
     db: Session = Depends(get_db),
@@ -1841,29 +1885,34 @@ def get_changes_since(db: Session, tenant_id: UUID, since: Optional[datetime] = 
             'updated_at': pharmacy.updated_at.isoformat() if pharmacy.updated_at else None
         })
     
-    # 6. Abonnements
-    subscriptions_query = db.query(Subscription).filter(Subscription.tenant_id == tenant_id)
+    # 6. Abonnements (utiliser PharmacySubscription)
+    subscriptions_query = db.query(PharmacySubscription).filter(
+        PharmacySubscription.pharmacy_id.in_(
+            db.query(Pharmacy.id).filter(Pharmacy.tenant_id == tenant_id)
+        )
+    )
     if since:
-        subscriptions_query = subscriptions_query.filter(Subscription.updated_at >= since)
+        subscriptions_query = subscriptions_query.filter(PharmacySubscription.updated_at >= since)
+
     for sub in subscriptions_query.all():
         changes['subscriptions'].append({
             'id': str(sub.id),
-            'tenant_id': str(sub.tenant_id),
+            'tenant_id': str(tenant_id),  # ou récupérer via pharmacy.tenant_id
             'plan_name': sub.plan_name,
-            'plan_type': sub.plan_type,
-            'status': sub.status,
+            'plan_type': sub.plan.value if sub.plan else None,
+            'status': sub.status.value if sub.status else None,
             'max_users': sub.max_users,
             'max_products': sub.max_products,
-            'max_branches': getattr(sub, 'max_branches', 0),
-            'features': sub.features,
+            'max_branches': sub.max_branches,
+            'features': None,  # À définir selon vos besoins
             'billing_cycle': sub.billing_cycle,
-            'price': float(sub.price) if sub.price else 0,
+            'price': sub.price,
             'currency': sub.currency,
-            'current_period_start': sub.current_period_start.isoformat() if sub.current_period_start else None,
-            'current_period_end': sub.current_period_end.isoformat() if sub.current_period_end else None,
-            'cancel_at_period_end': sub.cancel_at_period_end,
-            'is_active': sub.is_active,
-            'created_at': sub.created_at.isoformat() if sub.created_at else None,
+            'current_period_start': sub.start_date.isoformat() if sub.start_date else None,
+            'current_period_end': sub.end_date.isoformat() if sub.end_date else None,
+            'cancel_at_period_end': not sub.auto_renew,
+            'is_active': sub.is_active(),
+            'created_at': sub.created_at.isoformat() if sub.created_date else None,
             'updated_at': sub.updated_at.isoformat() if sub.updated_at else None
         })
     

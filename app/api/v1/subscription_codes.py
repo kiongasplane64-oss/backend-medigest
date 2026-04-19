@@ -1,67 +1,33 @@
 # app/api/v1/subscription_codes.py
+"""
+Gestion des codes d'abonnement pour les pharmacies/branches.
+Un abonnement est lié à une pharmacie (branche), pas à un utilisateur.
+"""
+
 import logging
 import random
 import string
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from uuid import UUID
-from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, get_current_active_user, get_super_admin_user
+from app.config.plans import PLAN_CONFIG, get_plan_config
 from app.models.subscription_code import SubscriptionCode, SubscriptionCodeStatus
+from app.models.pharmacy_subscription import PharmacySubscription, SubscriptionPlan, SubscriptionStatus
+from app.models.pharmacy import Pharmacy
 from app.models.user import User
-from app.models.tenant import Tenant
-from app.models.subscription import Subscription, SubscriptionPlan, SubscriptionStatus, BillingPeriod, PaymentMethod, SubscriptionPayment, PaymentStatus
 from app.schemas.subscription import (
-    SubscriptionCodeCreate, 
-    SubscriptionCodeResponse,
-    ActivateSubscriptionCode,
-    ValidateCodeResponse
+    SubscriptionCodeCreate,
+    ActivateSubscriptionCode
 )
-from app.services.subscription_service import PLAN_CONFIG
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/subscription-codes", tags=["Subscription Codes"])
-
-# Configuration des plans (basée sur create_default_plans())
-PLAN_CONFIG = {
-    "starter": {
-        "name": "Starter",
-        "price_monthly": 49.99,
-        "price_annual": 479.99,
-        "max_users": 3,
-        "max_products": 500,
-        "max_storage_mb": 1024,
-    },
-    "professional": {
-        "name": "Professional",
-        "price_monthly": 89.99,
-        "price_annual": 899.99,
-        "max_users": 10,
-        "max_products": None,
-        "max_storage_mb": 5120,
-    },
-    "enterprise": {
-        "name": "Enterprise",
-        "price_monthly": 149.99,
-        "price_annual": 1499.99,
-        "max_users": None,
-        "max_products": None,
-        "max_storage_mb": 10240,
-    },
-    "essai": {
-        "name": "Essai Gratuit",
-        "price_monthly": 0.00,
-        "price_annual": 0.00,
-        "max_users": 2,
-        "max_products": 100,
-        "max_storage_mb": 512,
-    }
-}
 
 
 def generate_unique_code(length: int = 8) -> str:
@@ -129,175 +95,65 @@ def validate_code_logic(db: Session, code: str) -> Dict[str, Any]:
         "currency": code_obj.currency or "EUR",
         "valid_until": code_obj.valid_until.isoformat() if code_obj.valid_until else None,
         "code": code_obj.code,
-        "tenant_id": str(code_obj.tenant_id) if code_obj.tenant_id else None,
-        "user_id": str(code_obj.user_id) if code_obj.user_id else None
+        "pharmacy_id": str(code_obj.pharmacy_id) if code_obj.pharmacy_id else None
     }
 
 
-def activate_tenant_subscription_with_code(
+def activate_pharmacy_subscription_with_code(
     db: Session,
-    tenant: Tenant,
+    pharmacy: Pharmacy,
     code: SubscriptionCode,
     activated_by: User
-) -> Subscription:
+) -> PharmacySubscription:
     """
-    Active un abonnement pour un tenant avec un code.
+    Active un abonnement pour une pharmacie avec un code.
     """
-    # Définir la période de facturation
-    billing_period = BillingPeriod.ANNUEL if code.duration_days >= 365 else BillingPeriod.MENSUEL
+    # Obtenir la configuration du plan
+    plan_config = get_plan_config(code.plan_type)
+    now = datetime.utcnow()
+    end_date = now + timedelta(days=code.duration_days)
     
-    # Obtenir les prix selon le plan
-    plan_config = PLAN_CONFIG.get(code.plan_type, {})
-    monthly_price = Decimal(str(plan_config.get("price_monthly", 0)))
-    annual_price = Decimal(str(plan_config.get("price_annual", 0)))
-    
-    # Vérifier si le tenant a déjà un abonnement
-    existing_sub = db.query(Subscription).filter(
-        Subscription.tenant_id == tenant.id,
-        Subscription.user_id == tenant.owner_id
+    # Vérifier si la pharmacie a déjà un abonnement
+    existing_sub = db.query(PharmacySubscription).filter(
+        PharmacySubscription.pharmacy_id == pharmacy.id
     ).first()
     
-    if existing_sub:
-        # Mettre à jour l'abonnement existant
-        existing_sub.plan = SubscriptionPlan(code.plan_type)
-        existing_sub.plan_name = plan_config.get("name", code.plan_type)
-        existing_sub.billing_period = billing_period
-        existing_sub.status = SubscriptionStatus.ACTIVE
-        existing_sub.monthly_price = monthly_price
-        existing_sub.annual_price = annual_price
-        existing_sub.current_price = annual_price if billing_period == BillingPeriod.ANNUEL else monthly_price
-        existing_sub.start_date = datetime.utcnow()
-        existing_sub.end_date = datetime.utcnow() + timedelta(days=code.duration_days)
-        existing_sub.next_billing_date = existing_sub.end_date
-        existing_sub.auto_renew = False  # Les codes ne se renouvellent pas automatiquement
-        existing_sub.updated_at = datetime.utcnow()
-        subscription = existing_sub
-    else:
-        # Créer un nouvel abonnement
-        subscription = Subscription(
-            tenant_id=tenant.id,
-            user_id=tenant.owner_id,
-            plan=SubscriptionPlan(code.plan_type),
-            plan_name=plan_config.get("name", code.plan_type),
-            billing_period=billing_period,
-            status=SubscriptionStatus.ACTIVE,
-            monthly_price=monthly_price,
-            annual_price=annual_price,
-            current_price=annual_price if billing_period == BillingPeriod.ANNUEL else monthly_price,
-            start_date=datetime.utcnow(),
-            end_date=datetime.utcnow() + timedelta(days=code.duration_days),
-            next_billing_date=datetime.utcnow() + timedelta(days=code.duration_days),
-            max_users=plan_config.get("max_users", 3),
-            max_products=plan_config.get("max_products"),
-            max_storage_mb=plan_config.get("max_storage_mb", 1024),
-            auto_renew=False,
-            created_by=activated_by.id,
-            notes=f"Activé avec le code: {code.code}"
-        )
-        db.add(subscription)
-    
-    db.flush()
-    
-    # Créer un enregistrement de paiement
-    payment = SubscriptionPayment(
-        subscription_id=subscription.id,
-        amount=Decimal(str(code.price)) if code.price else subscription.current_price,
-        amount_paid=Decimal(str(code.price)) if code.price else subscription.current_price,
-        status=PaymentStatus.COMPLETED,
-        payment_method=PaymentMethod.CASH,
-        payment_reference=f"CODE-{code.code}",
-        period_start=subscription.start_date,
-        period_end=subscription.end_date,
-        description=f"Activation avec code - {subscription.plan_name}",
-        notes=f"Code d'abonnement: {code.code}",
-        paid_at=datetime.utcnow()
-    )
-    db.add(payment)
-    
-    db.flush()
-    
-    return subscription
-
-
-def activate_user_subscription_with_code(
-    db: Session,
-    user: User,
-    code: SubscriptionCode,
-    activated_by: User
-) -> Subscription:
-    """
-    Active un abonnement pour un utilisateur avec un code.
-    """
-    # Définir la période de facturation
-    billing_period = BillingPeriod.ANNUEL if code.duration_days >= 365 else BillingPeriod.MENSUEL
-    
-    # Obtenir les prix selon le plan
-    plan_config = PLAN_CONFIG.get(code.plan_type, {})
-    monthly_price = Decimal(str(plan_config.get("price_monthly", 0)))
-    annual_price = Decimal(str(plan_config.get("price_annual", 0)))
-    
-    # Vérifier si l'utilisateur a déjà un abonnement
-    existing_sub = user.subscription
+    # Convertir le prix (stocké en cents) en float
+    price_value = float(code.price / 100) if code.price else 0.0
     
     if existing_sub:
         # Mettre à jour l'abonnement existant
         existing_sub.plan = SubscriptionPlan(code.plan_type)
-        existing_sub.plan_name = plan_config.get("name", code.plan_type)
-        existing_sub.billing_period = billing_period
+        existing_sub.plan_name = plan_config["name"]
+        existing_sub.start_date = now
+        existing_sub.end_date = end_date
         existing_sub.status = SubscriptionStatus.ACTIVE
-        existing_sub.monthly_price = monthly_price
-        existing_sub.annual_price = annual_price
-        existing_sub.current_price = annual_price if billing_period == BillingPeriod.ANNUEL else monthly_price
-        existing_sub.start_date = datetime.utcnow()
-        existing_sub.end_date = datetime.utcnow() + timedelta(days=code.duration_days)
-        existing_sub.next_billing_date = existing_sub.end_date
-        existing_sub.auto_renew = False
-        existing_sub.updated_at = datetime.utcnow()
+        existing_sub.billing_cycle = "yearly" if code.duration_days >= 365 else "monthly"
+        existing_sub.price = price_value
+        existing_sub.max_products = plan_config.get("max_products", 0) or 0
+        existing_sub.max_users = plan_config.get("max_users", 0) or 0
+        existing_sub.max_branches = plan_config.get("max_branches", 0) or 0
+        existing_sub.updated_at = now
         subscription = existing_sub
     else:
         # Créer un nouvel abonnement
-        subscription = Subscription(
-            tenant_id=user.tenant_id,
-            user_id=user.id,
+        subscription = PharmacySubscription(
+            pharmacy_id=pharmacy.id,
             plan=SubscriptionPlan(code.plan_type),
-            plan_name=plan_config.get("name", code.plan_type),
-            billing_period=billing_period,
+            plan_name=plan_config["name"],
+            start_date=now,
+            end_date=end_date,
             status=SubscriptionStatus.ACTIVE,
-            monthly_price=monthly_price,
-            annual_price=annual_price,
-            current_price=annual_price if billing_period == BillingPeriod.ANNUEL else monthly_price,
-            start_date=datetime.utcnow(),
-            end_date=datetime.utcnow() + timedelta(days=code.duration_days),
-            next_billing_date=datetime.utcnow() + timedelta(days=code.duration_days),
-            max_users=1,
-            max_products=plan_config.get("max_products"),
-            max_storage_mb=plan_config.get("max_storage_mb", 1024),
-            auto_renew=False,
-            created_by=activated_by.id,
-            notes=f"Activé avec le code: {code.code}"
+            billing_cycle="yearly" if code.duration_days >= 365 else "monthly",
+            price=price_value,
+            currency=code.currency or "EUR",
+            max_products=plan_config.get("max_products", 0) or 0,
+            max_users=plan_config.get("max_users", 0) or 0,
+            max_branches=plan_config.get("max_branches", 0) or 0
         )
         db.add(subscription)
     
     db.flush()
-    
-    # Créer un enregistrement de paiement
-    payment = SubscriptionPayment(
-        subscription_id=subscription.id,
-        amount=Decimal(str(code.price)) if code.price else subscription.current_price,
-        amount_paid=Decimal(str(code.price)) if code.price else subscription.current_price,
-        status=PaymentStatus.COMPLETED,
-        payment_method=PaymentMethod.CASH,
-        payment_reference=f"CODE-{code.code}",
-        period_start=subscription.start_date,
-        period_end=subscription.end_date,
-        description=f"Activation avec code - {subscription.plan_name}",
-        notes=f"Code d'abonnement: {code.code}",
-        paid_at=datetime.utcnow()
-    )
-    db.add(payment)
-    
-    db.flush()
-    
     return subscription
 
 
@@ -312,13 +168,12 @@ async def generate_subscription_code(
     current_user: User = Depends(get_super_admin_user),
 ) -> Any:
     """
-    Génère un code d'abonnement pour paiement cash.
+    Génère un code d'abonnement pour une pharmacie/branche.
     Accessible uniquement aux super admins.
     
     Peut être associé à :
-    - Un tenant spécifique (pharmacie)
-    - Un utilisateur spécifique
-    - Aucun (code générique)
+    - Une pharmacie spécifique
+    - Aucune (code générique)
     """
     logger.info(f"Génération de code abonnement par {current_user.email} pour plan {data.plan_type}")
     
@@ -328,47 +183,24 @@ async def generate_subscription_code(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
                 "error": "invalid_plan",
-                "message": f"Le plan {data.plan_type} n'existe pas."
+                "message": f"Le plan {data.plan_type} n'existe pas. Plans disponibles: {list(PLAN_CONFIG.keys())}"
             }
         )
     
-    # Validation des IDs si fournis
-    assigned_tenant = None
-    assigned_user = None
-    
-    if data.tenant_id:
-        assigned_tenant = db.query(Tenant).filter(Tenant.id == data.tenant_id).first()
-        if not assigned_tenant:
+    # Vérifier la pharmacie si spécifiée
+    assigned_pharmacy = None
+    if data.pharmacy_id:
+        assigned_pharmacy = db.query(Pharmacy).filter(Pharmacy.id == data.pharmacy_id).first()
+        if not assigned_pharmacy:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={
-                    "error": "tenant_not_found",
+                    "error": "pharmacy_not_found",
                     "message": "La pharmacie spécifiée n'existe pas."
                 }
             )
     
-    if data.user_id:
-        assigned_user = db.query(User).filter(User.id == data.user_id).first()
-        if not assigned_user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={
-                    "error": "user_not_found",
-                    "message": "L'utilisateur spécifié n'existe pas."
-                }
-            )
-        
-        # Vérifier que l'utilisateur est bien associé au tenant si les deux sont fournis
-        if data.tenant_id and assigned_user.tenant_id != data.tenant_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error": "user_tenant_mismatch",
-                    "message": "L'utilisateur n'appartient pas à la pharmacie spécifiée."
-                }
-            )
-    
-    plan_config = PLAN_CONFIG[data.plan_type]
+    plan_config = get_plan_config(data.plan_type)
     
     # Générer un code unique
     attempts = 0
@@ -398,11 +230,9 @@ async def generate_subscription_code(
         )
     
     # Calculer la durée en jours
-    duration_days = data.duration_days
-    if not duration_days:
-        duration_days = 365 if data.billing_cycle == "yearly" else 30
+    duration_days = data.duration_days or (365 if data.billing_cycle == "yearly" else 30)
     
-    # Calculer le prix
+    # Calculer le prix (en cents)
     price = data.price
     if not price:
         price_key = f"price_{data.billing_cycle or 'monthly'}"
@@ -412,48 +242,44 @@ async def generate_subscription_code(
     code = SubscriptionCode(
         code=generated_code,
         plan_type=data.plan_type,
-        plan_name=plan_config.get("name", data.plan_type.title()),
+        plan_name=plan_config["name"],
         duration_days=duration_days,
-        price=price,
+        price=int(price * 100) if price else 0,  # Stocker en cents
         currency=data.currency or "EUR",
         valid_from=data.valid_from or datetime.utcnow(),
         valid_until=data.valid_until or (datetime.utcnow() + timedelta(days=data.expiry_days or 90)),
         notes=data.notes,
         created_by_user_id=current_user.id,
         status=SubscriptionCodeStatus.PENDING,
-        tenant_id=data.tenant_id,
-        user_id=data.user_id
+        pharmacy_id=data.pharmacy_id  # Lier à la pharmacie
     )
     
     db.add(code)
     db.commit()
     db.refresh(code)
     
-    logger.info(f"Code généré avec succès: {generated_code} pour tenant: {data.tenant_id}, user: {data.user_id}")
+    logger.info(f"Code généré avec succès: {generated_code} pour pharmacie: {data.pharmacy_id}")
     
     return {
         "success": True,
         "code": code.code,
         "plan_type": code.plan_type,
         "plan_name": code.plan_name,
-        "price": float(code.price),
+        "price": price,
         "currency": code.currency,
         "duration_days": code.duration_days,
         "valid_until": code.valid_until.isoformat() if code.valid_until else None,
         "created_at": code.created_at.isoformat() if code.created_at else None,
         "status": code.status.value if hasattr(code.status, 'value') else code.status,
-        "tenant_id": str(code.tenant_id) if code.tenant_id else None,
-        "user_id": str(code.user_id) if code.user_id else None,
-        "tenant_name": assigned_tenant.nom_pharmacie if assigned_tenant else None,
-        "user_email": assigned_user.email if assigned_user else None
+        "pharmacy_id": str(code.pharmacy_id) if code.pharmacy_id else None,
+        "pharmacy_name": assigned_pharmacy.name if assigned_pharmacy else None
     }
 
 
 @router.get("/admin/list", response_model=Dict[str, Any])
 async def list_subscription_codes(
     status: Optional[str] = Query(None),
-    tenant_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
-    user_id: Optional[UUID] = Query(None, description="Filtrer par utilisateur"),
+    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
@@ -461,7 +287,7 @@ async def list_subscription_codes(
 ) -> Any:
     """
     Liste tous les codes d'abonnement générés.
-    Possibilité de filtrer par tenant ou utilisateur.
+    Possibilité de filtrer par pharmacie.
     """
     query = db.query(SubscriptionCode)
     
@@ -472,11 +298,8 @@ async def list_subscription_codes(
         except ValueError:
             pass
     
-    if tenant_id:
-        query = query.filter(SubscriptionCode.tenant_id == tenant_id)
-    
-    if user_id:
-        query = query.filter(SubscriptionCode.user_id == user_id)
+    if pharmacy_id:
+        query = query.filter(SubscriptionCode.pharmacy_id == pharmacy_id)
     
     total = query.count()
     
@@ -504,10 +327,8 @@ async def list_subscription_codes(
                 "activated_by": code.activated_by_user.email if code.activated_by_user else None,
                 "activated_at": code.activated_at.isoformat() if code.activated_at else None,
                 "created_by": code.created_by_user.email if code.created_by_user else None,
-                "tenant_id": str(code.tenant_id) if code.tenant_id else None,
-                "user_id": str(code.user_id) if code.user_id else None,
-                "tenant_name": code.tenant.nom_pharmacie if code.tenant else None,
-                "user_email": code.assigned_user.email if code.assigned_user else None
+                "pharmacy_id": str(code.pharmacy_id) if code.pharmacy_id else None,
+                "pharmacy_name": code.pharmacy.name if code.pharmacy else None
             }
             for code in codes
         ]
@@ -551,286 +372,145 @@ async def get_subscription_code_details(
         "notes": code.notes,
         "is_valid": code.is_valid(),
         "days_remaining": code.days_remaining(),
-        "tenant_id": str(code.tenant_id) if code.tenant_id else None,
-        "user_id": str(code.user_id) if code.user_id else None,
-        "tenant_name": code.tenant.nom_pharmacie if code.tenant else None,
-        "user_email": code.assigned_user.email if code.assigned_user else None
+        "pharmacy_id": str(code.pharmacy_id) if code.pharmacy_id else None,
+        "pharmacy_name": code.pharmacy.name if code.pharmacy else None
     }
 
 
-@router.post("/admin/manual-activate/{target_id}")
-async def manual_activate(
-    target_id: UUID,
-    activation_type: str = Query(..., pattern="^(tenant|user)$", description="Type: tenant ou user"),
+@router.post("/admin/manual-activate/{pharmacy_id}")
+async def manual_activate_pharmacy(
+    pharmacy_id: UUID,
     plan_type: str = Query(..., description="Type de plan"),
     duration_days: int = Query(30, ge=1, le=3650, description="Durée en jours"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_super_admin_user),
 ) -> Any:
     """
-    Activation manuelle d'un tenant ou d'un utilisateur (paiement cash sans code).
-    Le super admin peut activer directement un compte.
+    Activation manuelle d'une pharmacie (paiement cash sans code).
+    Le super admin peut activer directement une pharmacie.
     """
-    logger.info(f"Activation manuelle de {activation_type} {target_id} par {current_user.email}")
+    logger.info(f"Activation manuelle de la pharmacie {pharmacy_id} par {current_user.email}")
     
-    if activation_type == "tenant":
-        tenant = db.query(Tenant).filter(Tenant.id == target_id).first()
-        if not tenant:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={
-                    "error": "tenant_not_found",
-                    "message": "Tenant non trouvé."
-                }
-            )
-        
-        if not tenant.owner_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error": "no_owner",
-                    "message": "Le tenant n'a pas de propriétaire."
-                }
-            )
-        
-        # Vérifier que le plan existe
-        if plan_type not in PLAN_CONFIG:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error": "invalid_plan",
-                    "message": f"Le plan {plan_type} n'existe pas."
-                }
-            )
-        
-        plan_config = PLAN_CONFIG[plan_type]
-        
-        # Définir la période de facturation
-        billing_period = BillingPeriod.ANNUEL if duration_days >= 365 else BillingPeriod.MENSUEL
-        
-        monthly_price = Decimal(str(plan_config.get("price_monthly", 0)))
-        annual_price = Decimal(str(plan_config.get("price_annual", 0)))
-        
-        # Vérifier si le tenant a déjà un abonnement
-        existing_sub = db.query(Subscription).filter(
-            Subscription.tenant_id == tenant.id,
-            Subscription.user_id == tenant.owner_id
-        ).first()
-        
-        if existing_sub:
-            existing_sub.plan = SubscriptionPlan(plan_type)
-            existing_sub.plan_name = plan_config.get("name", plan_type)
-            existing_sub.billing_period = billing_period
-            existing_sub.status = SubscriptionStatus.ACTIVE
-            existing_sub.monthly_price = monthly_price
-            existing_sub.annual_price = annual_price
-            existing_sub.current_price = annual_price if billing_period == BillingPeriod.ANNUEL else monthly_price
-            existing_sub.start_date = datetime.utcnow()
-            existing_sub.end_date = datetime.utcnow() + timedelta(days=duration_days)
-            existing_sub.next_billing_date = existing_sub.end_date
-            existing_sub.auto_renew = False
-            existing_sub.updated_at = datetime.utcnow()
-            subscription = existing_sub
-        else:
-            subscription = Subscription(
-                tenant_id=tenant.id,
-                user_id=tenant.owner_id,
-                plan=SubscriptionPlan(plan_type),
-                plan_name=plan_config.get("name", plan_type),
-                billing_period=billing_period,
-                status=SubscriptionStatus.ACTIVE,
-                monthly_price=monthly_price,
-                annual_price=annual_price,
-                current_price=annual_price if billing_period == BillingPeriod.ANNUEL else monthly_price,
-                start_date=datetime.utcnow(),
-                end_date=datetime.utcnow() + timedelta(days=duration_days),
-                next_billing_date=datetime.utcnow() + timedelta(days=duration_days),
-                max_users=plan_config.get("max_users", 3),
-                max_products=plan_config.get("max_products"),
-                max_storage_mb=plan_config.get("max_storage_mb", 1024),
-                auto_renew=False,
-                created_by=current_user.id,
-                notes=f"Activation manuelle par {current_user.email}"
-            )
-            db.add(subscription)
-        
-        db.flush()
-        
-        # Créer un enregistrement de paiement
-        payment = SubscriptionPayment(
-            subscription_id=subscription.id,
-            amount=subscription.current_price,
-            amount_paid=subscription.current_price,
-            status=PaymentStatus.COMPLETED,
-            payment_method=PaymentMethod.CASH,
-            payment_reference=f"MANUAL-{tenant.id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
-            period_start=subscription.start_date,
-            period_end=subscription.end_date,
-            description=f"Activation manuelle - {subscription.plan_name}",
-            notes=f"Activation par super admin: {current_user.email}",
-            paid_at=datetime.utcnow()
+    pharmacy = db.query(Pharmacy).filter(Pharmacy.id == pharmacy_id).first()
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "pharmacy_not_found",
+                "message": "Pharmacie non trouvée."
+            }
         )
-        db.add(payment)
-        
-        db.commit()
-        
-        return {
-            "success": True,
-            "message": f"Tenant {tenant.nom_pharmacie} activé manuellement pour {duration_days} jours.",
-            "tenant": {
-                "id": str(tenant.id),
-                "name": tenant.nom_pharmacie,
-                "owner_email": tenant.owner.email if tenant.owner else None
-            },
-            "subscription": {
-                "id": str(subscription.id),
-                "plan": subscription.plan.value,
-                "plan_name": subscription.plan_name,
-                "start_date": subscription.start_date.isoformat(),
-                "end_date": subscription.end_date.isoformat(),
-                "days_remaining": subscription.days_remaining()
-            },
-            "activated_by": current_user.email,
-            "activated_at": datetime.utcnow().isoformat()
-        }
     
-    else:  # activation_type == "user"
-        user = db.query(User).filter(User.id == target_id).first()
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={
-                    "error": "user_not_found",
-                    "message": "Utilisateur non trouvé."
-                }
-            )
-        
-        if not user.tenant_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error": "no_tenant",
-                    "message": "L'utilisateur n'est pas rattaché à une pharmacie."
-                }
-            )
-        
-        if plan_type not in PLAN_CONFIG:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error": "invalid_plan",
-                    "message": f"Le plan {plan_type} n'existe pas."
-                }
-            )
-        
-        plan_config = PLAN_CONFIG[plan_type]
-        billing_period = BillingPeriod.ANNUEL if duration_days >= 365 else BillingPeriod.MENSUEL
-        
-        monthly_price = Decimal(str(plan_config.get("price_monthly", 0)))
-        annual_price = Decimal(str(plan_config.get("price_annual", 0)))
-        
-        existing_sub = user.subscription
-        
-        if existing_sub:
-            existing_sub.plan = SubscriptionPlan(plan_type)
-            existing_sub.plan_name = plan_config.get("name", plan_type)
-            existing_sub.billing_period = billing_period
-            existing_sub.status = SubscriptionStatus.ACTIVE
-            existing_sub.monthly_price = monthly_price
-            existing_sub.annual_price = annual_price
-            existing_sub.current_price = annual_price if billing_period == BillingPeriod.ANNUEL else monthly_price
-            existing_sub.start_date = datetime.utcnow()
-            existing_sub.end_date = datetime.utcnow() + timedelta(days=duration_days)
-            existing_sub.next_billing_date = existing_sub.end_date
-            existing_sub.auto_renew = False
-            existing_sub.updated_at = datetime.utcnow()
-            subscription = existing_sub
-        else:
-            subscription = Subscription(
-                tenant_id=user.tenant_id,
-                user_id=user.id,
-                plan=SubscriptionPlan(plan_type),
-                plan_name=plan_config.get("name", plan_type),
-                billing_period=billing_period,
-                status=SubscriptionStatus.ACTIVE,
-                monthly_price=monthly_price,
-                annual_price=annual_price,
-                current_price=annual_price if billing_period == BillingPeriod.ANNUEL else monthly_price,
-                start_date=datetime.utcnow(),
-                end_date=datetime.utcnow() + timedelta(days=duration_days),
-                next_billing_date=datetime.utcnow() + timedelta(days=duration_days),
-                max_users=1,
-                max_products=plan_config.get("max_products"),
-                max_storage_mb=plan_config.get("max_storage_mb", 1024),
-                auto_renew=False,
-                created_by=current_user.id,
-                notes=f"Activation manuelle par {current_user.email}"
-            )
-            db.add(subscription)
-        
-        db.flush()
-        
-        payment = SubscriptionPayment(
-            subscription_id=subscription.id,
-            amount=subscription.current_price,
-            amount_paid=subscription.current_price,
-            status=PaymentStatus.COMPLETED,
-            payment_method=PaymentMethod.CASH,
-            payment_reference=f"MANUAL-USER-{user.id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
-            period_start=subscription.start_date,
-            period_end=subscription.end_date,
-            description=f"Activation manuelle - {subscription.plan_name}",
-            notes=f"Activation par super admin: {current_user.email}",
-            paid_at=datetime.utcnow()
+    # Vérifier que le plan existe
+    if plan_type not in PLAN_CONFIG:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "invalid_plan",
+                "message": f"Le plan {plan_type} n'existe pas. Plans disponibles: {list(PLAN_CONFIG.keys())}"
+            }
         )
-        db.add(payment)
-        
-        db.commit()
-        
-        return {
-            "success": True,
-            "message": f"Utilisateur {user.email} activé manuellement pour {duration_days} jours.",
-            "user": {
-                "id": str(user.id),
-                "email": user.email,
-                "name": user.nom_complet,
-                "tenant_id": str(user.tenant_id) if user.tenant_id else None,
-                "tenant_name": user.tenant.nom_pharmacie if user.tenant else None
-            },
-            "subscription": {
-                "id": str(subscription.id),
-                "plan": subscription.plan.value,
-                "plan_name": subscription.plan_name,
-                "start_date": subscription.start_date.isoformat(),
-                "end_date": subscription.end_date.isoformat(),
-                "days_remaining": subscription.days_remaining()
-            },
-            "activated_by": current_user.email,
-            "activated_at": datetime.utcnow().isoformat()
-        }
+    
+    plan_config = get_plan_config(plan_type)
+    now = datetime.utcnow()
+    end_date = now + timedelta(days=duration_days)
+    
+    # Vérifier si la pharmacie a déjà un abonnement
+    existing_sub = db.query(PharmacySubscription).filter(
+        PharmacySubscription.pharmacy_id == pharmacy.id
+    ).first()
+    
+    if existing_sub:
+        existing_sub.plan = SubscriptionPlan(plan_type)
+        existing_sub.plan_name = plan_config["name"]
+        existing_sub.start_date = now
+        existing_sub.end_date = end_date
+        existing_sub.status = SubscriptionStatus.ACTIVE
+        existing_sub.billing_cycle = "yearly" if duration_days >= 365 else "monthly"
+        existing_sub.price = float(plan_config.get("price_monthly", 0))
+        existing_sub.max_products = plan_config.get("max_products", 0) or 0
+        existing_sub.max_users = plan_config.get("max_users", 0) or 0
+        existing_sub.max_branches = plan_config.get("max_branches", 0) or 0
+        existing_sub.updated_at = now
+        subscription = existing_sub
+    else:
+        subscription = PharmacySubscription(
+            pharmacy_id=pharmacy.id,
+            plan=SubscriptionPlan(plan_type),
+            plan_name=plan_config["name"],
+            start_date=now,
+            end_date=end_date,
+            status=SubscriptionStatus.ACTIVE,
+            billing_cycle="yearly" if duration_days >= 365 else "monthly",
+            price=float(plan_config.get("price_monthly", 0)),
+            currency="EUR",
+            max_products=plan_config.get("max_products", 0) or 0,
+            max_users=plan_config.get("max_users", 0) or 0,
+            max_branches=plan_config.get("max_branches", 0) or 0
+        )
+        db.add(subscription)
+    
+    db.commit()
+    db.refresh(subscription)
+    
+    return {
+        "success": True,
+        "message": f"Pharmacie {pharmacy.name} activée manuellement pour {duration_days} jours.",
+        "pharmacy": {
+            "id": str(pharmacy.id),
+            "name": pharmacy.name
+        },
+        "subscription": {
+            "id": str(subscription.id),
+            "plan": subscription.plan.value,
+            "plan_name": subscription.plan_name,
+            "start_date": subscription.start_date.isoformat(),
+            "end_date": subscription.end_date.isoformat(),
+            "days_remaining": subscription.days_remaining()
+        },
+        "activated_by": current_user.email,
+        "activated_at": datetime.utcnow().isoformat()
+    }
 
 
 # =============================================================================
-# ENDPOINTS UTILISATEUR - ACTIVATION AVEC CODE
+# ENDPOINTS UTILISATEUR - ACTIVATION POUR UNE PHARMACIE
 # =============================================================================
 
 @router.post("/activate", response_model=Dict[str, Any])
-async def activate_with_code(
+async def activate_code_for_pharmacy(
     data: ActivateSubscriptionCode,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
 ) -> Any:
     """
-    Active un abonnement avec un code (paiement cash).
-    Vérifie que le code est valide et non utilisé.
-    Si le code est associé à un tenant, vérifie que l'utilisateur appartient à ce tenant.
+    Active un abonnement pour la pharmacie active de l'utilisateur.
+    Le code est lié à la pharmacie (branche), pas à l'utilisateur.
     """
-    logger.info(f"Tentative d'activation avec code par {current_user.email}")
+    logger.info(f"Activation de code par {current_user.email}")
     
-    # Nettoyer le code
+    # Vérifier que l'utilisateur a une pharmacie active
+    if not current_user.active_pharmacy_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "no_active_pharmacy",
+                "message": "Aucune pharmacie active sélectionnée."
+            }
+        )
+    
+    pharmacy = db.query(Pharmacy).filter(Pharmacy.id == current_user.active_pharmacy_id).first()
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "pharmacy_not_found",
+                "message": "Pharmacie non trouvée."
+            }
+        )
+    
+    # Nettoyer et chercher le code
     clean_code = data.code.strip().upper().replace('-', '').replace(' ', '')
-    
-    # Chercher le code
     search_variations = [
         data.code.strip().upper(),
         format_code_with_dashes(clean_code),
@@ -851,31 +531,20 @@ async def activate_with_code(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={
                 "error": "invalid_code",
-                "message": "Code d'abonnement invalide ou déjà utilisé."
+                "message": "Code invalide ou déjà utilisé."
             }
         )
     
-    # Vérifier que le tenant correspond (si le code est associé à un tenant)
-    if code.tenant_id and current_user.tenant_id != code.tenant_id:
+    # Vérifier que le code peut être utilisé pour cette pharmacie
+    if code.pharmacy_id and code.pharmacy_id != pharmacy.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
-                "error": "invalid_tenant",
+                "error": "wrong_pharmacy",
                 "message": "Ce code est réservé à une autre pharmacie."
             }
         )
     
-    # Vérifier que l'utilisateur correspond (si le code est associé à un utilisateur)
-    if code.user_id and current_user.id != code.user_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "error": "invalid_user",
-                "message": "Ce code est réservé à un autre utilisateur."
-            }
-        )
-    
-    # Vérifier validité du code
     if not code.is_valid():
         status_text = "expiré" if code.valid_until and datetime.utcnow() > code.valid_until else "non disponible"
         raise HTTPException(
@@ -888,40 +557,33 @@ async def activate_with_code(
         )
     
     try:
-        # Vérifier si c'est un code pour tenant (administrateur) ou pour utilisateur
-        if code.tenant_id and current_user.role == "admin":
-            # Activer pour le tenant
-            subscription = activate_tenant_subscription_with_code(
-                db=db,
-                tenant=current_user.tenant,
-                code=code,
-                activated_by=current_user
-            )
-        else:
-            # Activer pour l'utilisateur
-            subscription = activate_user_subscription_with_code(
-                db=db,
-                user=current_user,
-                code=code,
-                activated_by=current_user
-            )
+        # Activer l'abonnement pour la pharmacie
+        subscription = activate_pharmacy_subscription_with_code(
+            db=db,
+            pharmacy=pharmacy,
+            code=code,
+            activated_by=current_user
+        )
         
         # Marquer le code comme utilisé
         code.status = SubscriptionCodeStatus.ACTIVATED
         code.activated_by_user_id = current_user.id
         code.activated_at = datetime.utcnow()
+        code.pharmacy_id = pharmacy.id
         
         db.commit()
         
         return {
             "success": True,
-            "message": "Abonnement activé avec succès !",
+            "message": f"Abonnement activé pour la pharmacie {pharmacy.name}",
             "subscription": {
                 "id": str(subscription.id),
+                "pharmacy_id": str(pharmacy.id),
+                "pharmacy_name": pharmacy.name,
                 "plan": subscription.plan.value,
                 "plan_name": subscription.plan_name,
-                "start_date": subscription.start_date.isoformat() if subscription.start_date else None,
-                "end_date": subscription.end_date.isoformat() if subscription.end_date else None,
+                "start_date": subscription.start_date.isoformat(),
+                "end_date": subscription.end_date.isoformat(),
                 "days_remaining": subscription.days_remaining()
             },
             "code": {
@@ -933,7 +595,7 @@ async def activate_with_code(
         
     except Exception as exc:
         db.rollback()
-        logger.error(f"Erreur activation code: {exc}", exc_info=True)
+        logger.error(f"Erreur activation: {exc}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
@@ -943,35 +605,26 @@ async def activate_with_code(
         )
 
 
-@router.post("/activate-tenant/{tenant_id}", response_model=Dict[str, Any])
-async def activate_tenant_with_code(
-    tenant_id: UUID,
+@router.post("/activate-pharmacy/{pharmacy_id}", response_model=Dict[str, Any])
+async def activate_pharmacy_with_code(
+    pharmacy_id: UUID,
     data: ActivateSubscriptionCode,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_super_admin_user),
 ) -> Any:
     """
-    Active un abonnement pour un tenant spécifique avec un code.
+    Active un abonnement pour une pharmacie spécifique avec un code.
     Réservé aux super admins.
     """
-    logger.info(f"Activation de tenant {tenant_id} avec code par {current_user.email}")
+    logger.info(f"Activation de pharmacie {pharmacy_id} avec code par {current_user.email}")
     
-    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
-    if not tenant:
+    pharmacy = db.query(Pharmacy).filter(Pharmacy.id == pharmacy_id).first()
+    if not pharmacy:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={
-                "error": "tenant_not_found",
-                "message": "Tenant non trouvé."
-            }
-        )
-    
-    if not tenant.owner_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "error": "no_owner",
-                "message": "Le tenant n'a pas de propriétaire."
+                "error": "pharmacy_not_found",
+                "message": "Pharmacie non trouvée."
             }
         )
     
@@ -1013,9 +666,9 @@ async def activate_tenant_with_code(
         )
     
     try:
-        subscription = activate_tenant_subscription_with_code(
+        subscription = activate_pharmacy_subscription_with_code(
             db=db,
-            tenant=tenant,
+            pharmacy=pharmacy,
             code=code,
             activated_by=current_user
         )
@@ -1028,11 +681,10 @@ async def activate_tenant_with_code(
         
         return {
             "success": True,
-            "message": f"Abonnement activé pour le tenant {tenant.nom_pharmacie}",
-            "tenant": {
-                "id": str(tenant.id),
-                "name": tenant.nom_pharmacie,
-                "owner_email": tenant.owner.email if tenant.owner else None
+            "message": f"Abonnement activé pour la pharmacie {pharmacy.name}",
+            "pharmacy": {
+                "id": str(pharmacy.id),
+                "name": pharmacy.name
             },
             "subscription": {
                 "id": str(subscription.id),
@@ -1050,7 +702,7 @@ async def activate_tenant_with_code(
         
     except Exception as exc:
         db.rollback()
-        logger.error(f"Erreur activation tenant: {exc}", exc_info=True)
+        logger.error(f"Erreur activation pharmacie: {exc}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
@@ -1107,8 +759,7 @@ async def validate_code(
 @router.post("/debug/generate-test", include_in_schema=False)
 async def debug_generate_test_code(
     plan_type: str = "professional",
-    tenant_id: Optional[UUID] = None,
-    user_id: Optional[UUID] = None,
+    pharmacy_id: Optional[UUID] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ) -> Any:
@@ -1122,22 +773,21 @@ async def debug_generate_test_code(
     raw_code = generate_unique_code(8)
     formatted_code = format_code_with_dashes(raw_code)
     
-    plan_config = PLAN_CONFIG[plan_type]
+    plan_config = get_plan_config(plan_type)
     
     code = SubscriptionCode(
         code=formatted_code,
         plan_type=plan_type,
-        plan_name=plan_config.get("name", plan_type),
+        plan_name=plan_config["name"],
         duration_days=30,
-        price=plan_config.get("price_monthly", 0),
+        price=int(plan_config.get("price_monthly", 0) * 100),
         currency="EUR",
         valid_from=datetime.utcnow(),
         valid_until=datetime.utcnow() + timedelta(days=90),
         created_by_user_id=current_user.id,
         status=SubscriptionCodeStatus.PENDING,
         notes="Code de test généré automatiquement",
-        tenant_id=tenant_id,
-        user_id=user_id
+        pharmacy_id=pharmacy_id
     )
     
     db.add(code)
@@ -1151,6 +801,5 @@ async def debug_generate_test_code(
         "plan_type": code.plan_type,
         "plan_name": code.plan_name,
         "valid_until": code.valid_until.isoformat() if code.valid_until else None,
-        "tenant_id": str(code.tenant_id) if code.tenant_id else None,
-        "user_id": str(code.user_id) if code.user_id else None
+        "pharmacy_id": str(code.pharmacy_id) if code.pharmacy_id else None
     }
