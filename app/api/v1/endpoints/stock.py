@@ -924,84 +924,27 @@ async def create_product(
         product = Product(**payload)
         
         # =========================================================
-        # GESTION DES PRIX
+        # GESTION DES PRIX - AUCUN RECALCUL AUTOMATIQUE
         # =========================================================
-        
         # Récupérer les prix spécifiques selon le type de vente
         selling_price_retail = getattr(product_data, 'selling_price_retail', None)
         selling_price_wholesale = getattr(product_data, 'selling_price_wholesale', None)
         
-        if calcul_auto_prix and product_data.purchase_price > 0:
-            # Calcul automatique avec marge
-            from decimal import Decimal
-            margin_percent = Decimal(str(marge_par_defaut))
-            purchase_price = Decimal(str(product_data.purchase_price))
-            
-            # Prix de vente HT = Prix d'achat * (1 + marge%)
-            selling_price_ht = purchase_price * (Decimal('1') + (margin_percent / Decimal('100')))
-            
-            # Appliquer TVA si nécessaire
-            if product_data.has_tva:
-                tva = Decimal(str(product_data.tva_rate or 0))
-                calculated_price = selling_price_ht * (Decimal('1') + (tva / Decimal('100')))
-            else:
-                calculated_price = selling_price_ht
-            
-            # Assigner selon le type de vente
-            if sales_type == "wholesale":
-                product.selling_price = calculated_price
-                product.selling_price_wholesale = calculated_price
-                product.selling_price_retail = None
-            elif sales_type == "retail":
-                product.selling_price = calculated_price
-                product.selling_price_retail = calculated_price
-                product.selling_price_wholesale = None
-            else:  # both
-                product.selling_price = calculated_price
-                product.selling_price_retail = calculated_price
-                product.selling_price_wholesale = calculated_price
-        else:
-            # Utiliser les prix fournis
-            if sales_type == "wholesale":
-                product.selling_price = selling_price_wholesale or product_data.selling_price
-                product.selling_price_wholesale = product.selling_price
-            elif sales_type == "retail":
-                product.selling_price = selling_price_retail or product_data.selling_price
-                product.selling_price_retail = product.selling_price
-            else:  # both
-                product.selling_price = selling_price_retail or product_data.selling_price
-                product.selling_price_retail = product.selling_price
-                product.selling_price_wholesale = selling_price_wholesale or product_data.selling_price
+        # Utiliser TOUJOURS les prix fournis, jamais de calcul automatique
+        if sales_type == "wholesale":
+            product.selling_price = selling_price_wholesale or product_data.selling_price or 0
+            product.selling_price_wholesale = product.selling_price
+        elif sales_type == "retail":
+            product.selling_price = selling_price_retail or product_data.selling_price or 0
+            product.selling_price_retail = product.selling_price
+        else:  # both
+            product.selling_price = selling_price_retail or product_data.selling_price or 0
+            product.selling_price_retail = product.selling_price
+            product.selling_price_wholesale = selling_price_wholesale or product_data.selling_price or 0
         
-        # Arrondissement si activé
-        if config and config.rounding_enabled:
-            precision = config.rounding_precision or 0
-            method = config.rounding_method or "nearest"
-            
-            if precision > 0:
-                if method == "nearest":
-                    product.selling_price = round(product.selling_price / precision) * precision
-                    if product.selling_price_retail:
-                        product.selling_price_retail = round(product.selling_price_retail / precision) * precision
-                    if product.selling_price_wholesale:
-                        product.selling_price_wholesale = round(product.selling_price_wholesale / precision) * precision
-                elif method == "up":
-                    import math
-                    product.selling_price = math.ceil(product.selling_price / precision) * precision
-                    if product.selling_price_retail:
-                        product.selling_price_retail = math.ceil(product.selling_price_retail / precision) * precision
-                    if product.selling_price_wholesale:
-                        product.selling_price_wholesale = math.ceil(product.selling_price_wholesale / precision) * precision
-                elif method == "down":
-                    import math
-                    product.selling_price = math.floor(product.selling_price / precision) * precision
-                    if product.selling_price_retail:
-                        product.selling_price_retail = math.floor(product.selling_price_retail / precision) * precision
-                    if product.selling_price_wholesale:
-                        product.selling_price_wholesale = math.floor(product.selling_price_wholesale / precision) * precision
-        
-        product.refresh_statuses()
-        
+        # Pas d'arrondissement automatique non plus
+        # product.refresh_statuses() est suffisant pour mettre à jour les statuts
+               
         db.add(product)
         db.flush()
         
@@ -1263,14 +1206,14 @@ async def update_product(
                 int(getattr(product, "quantity", 0) or 0) - int(getattr(product, "reserved_quantity", 0) or 0),
             )
         
-        if "purchase_price" in update_data and bool(_tenant_get_config(current_tenant, "calcul_auto_prix", True)):
-            margin = _to_float(_tenant_get_config(current_tenant, "marge_par_defaut", 30.0), 30.0)
-            tva_rate = (
-                _to_float(getattr(product, "tva_rate", 0.0), 0.0)
-                if bool(getattr(product, "has_tva", False))
-                else 0.0
-            )
-            _safe_calculate_prices(product, margin, tva_rate)
+        #if "purchase_price" in update_data and bool(_tenant_get_config(current_tenant, "calcul_auto_prix", True)):
+        #    margin = _to_float(_tenant_get_config(current_tenant, "marge_par_defaut", 30.0), 30.0)
+        #    tva_rate = (
+        #        _to_float(getattr(product, "tva_rate", 0.0), 0.0)
+        #        if bool(getattr(product, "has_tva", False))
+        #        else 0.0
+        #    )
+        #   _safe_calculate_prices(product, margin, tva_rate)
         
         product.refresh_statuses()
         
@@ -3102,8 +3045,8 @@ async def import_products(
                     )
                     
                     # Calcul automatique des prix UNIQUEMENT si preserve_prices est False
-                    if not preserve_prices and calcul_auto_prix and purchase_price > 0:
-                        _safe_calculate_prices(product, marge_par_defaut, taux_tva)
+                    #if not preserve_prices and calcul_auto_prix and purchase_price > 0:
+                    #    _safe_calculate_prices(product, marge_par_defaut, taux_tva)
                     
                     product.refresh_statuses()
                     

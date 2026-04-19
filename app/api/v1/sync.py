@@ -197,6 +197,9 @@ def sync_data(
             }
         )
 
+@router.post("/sync/sales/force")  # Alias pour compatibilité
+def sync_sales_force_alias(payload: dict, db: Session = Depends(get_db), user = Depends(get_current_user)):
+    return sync_sales_force(payload, db, user)
 
 @router.get("/pull")
 def pull_data(
@@ -238,6 +241,42 @@ def pull_data(
             detail={"error": "Erreur lors de la récupération des données", "message": str(e), "tenant_id": str(user.tenant_id)}
         )
 
+@router.get("/subscription/status")
+def get_subscription_status(
+    branch_id: Optional[str] = None,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """Récupère le statut de l'abonnement pour une branche"""
+    from app.models.subscription import Subscription
+    
+    query = db.query(Subscription).filter(
+        Subscription.tenant_id == user.tenant_id,
+        Subscription.is_active == True
+    )
+    
+    subscription = query.first()
+    
+    if not subscription:
+        return {
+            "has_subscription": False,
+            "is_active": True,  # Default
+            "access_mode": "full"
+        }
+    
+    return {
+        "has_subscription": True,
+        "is_active": subscription.status == "active",
+        "access_mode": "full" if subscription.status == "active" else "read_only",
+        "subscription": {
+            "id": str(subscription.id),
+            "plan_name": subscription.plan_name,
+            "plan_type": subscription.plan_type,
+            "status": subscription.status,
+            "current_period_end": subscription.current_period_end.isoformat() if subscription.current_period_end else None,
+            "days_remaining": (subscription.current_period_end - datetime.utcnow()).days if subscription.current_period_end else 30
+        }
+    }
 
 @router.get("/status")
 def sync_status(
