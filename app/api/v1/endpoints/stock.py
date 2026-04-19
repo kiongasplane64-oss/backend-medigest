@@ -694,7 +694,8 @@ async def get_import_template(
 @router.get("/", response_model=ProductListResponse, summary="Liste des produits")
 async def list_products(
     skip: int = Query(0, ge=0),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(100, ge=1, le=100000),
+    get_all: bool = Query(False, description="Récupérer TOUS les produits (ignore skip/limit)"),
     search: Optional[str] = Query(None, description="Recherche par nom, code, code-barres ou nom commercial"),
     category_id: Optional[UUID] = Query(None, description="Filtrer par catégorie ID"),
     category: Optional[str] = Query(None, description="Filtrer par nom de catégorie (legacy)"),
@@ -711,7 +712,14 @@ async def list_products(
     current_branch: Optional[Branch] = Depends(get_current_branch_entity),
     current_user: User = Depends(get_current_active_user)
 ):
-    """Liste tous les produits avec pagination et filtres optionnels."""
+    """
+    Liste tous les produits avec pagination et filtres optionnels.
+    
+    Paramètres:
+    - get_all: Si True, récupère TOUS les produits sans limite de pagination
+    - limit: Nombre maximum de produits par page (max 100000)
+    - skip: Nombre de produits à sauter (pour pagination)
+    """
     try:
         _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant", "pharmacien", "vendeur"])
         
@@ -767,7 +775,21 @@ async def list_products(
             query = query.filter(Product.selling_price <= max_price)
         
         total = query.count()
-        products = query.order_by(Product.name.asc()).offset(skip).limit(limit).all()
+        
+        # ============================================================
+        # GESTION DE get_all : RÉCUPÉRATION DE TOUS LES PRODUITS
+        # ============================================================
+        if get_all:
+            # Récupérer TOUS les produits sans limite de pagination
+            logger.info(f"Récupération de TOUS les produits pour le tenant {tenant_id} (total: {total})")
+            products = query.order_by(Product.name.asc()).all()
+            actual_limit = total
+            actual_skip = 0
+        else:
+            # Pagination normale
+            products = query.order_by(Product.name.asc()).offset(skip).limit(limit).all()
+            actual_limit = limit
+            actual_skip = skip
         
         product_list = []
         for product in products:
@@ -807,8 +829,8 @@ async def list_products(
         
         return ProductListResponse(
             total=total,
-            page=(skip // limit) + 1 if limit > 0 else 1,
-            limit=limit,
+            page=(actual_skip // actual_limit) + 1 if actual_limit > 0 and not get_all else 1,
+            limit=actual_limit,
             products=product_list,
             summary=stats,
         )
@@ -818,7 +840,7 @@ async def list_products(
     except Exception as exc:
         logger.exception("Erreur lors de la recuperation des produits")
         raise HTTPException(status_code=500, detail=f"Erreur interne du serveur: {exc}")
-
+    
 @router.post("/", response_model=ProductResponse, summary="Créer un produit")
 async def create_product(
     product_data: ProductCreate,

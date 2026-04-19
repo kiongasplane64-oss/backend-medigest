@@ -25,6 +25,9 @@ from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import relationship, validates
 
 from app.db.base import Base
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def _as_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
@@ -52,6 +55,8 @@ class Product(Base):
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True)
     pharmacy_id = Column(UUID(as_uuid=True), ForeignKey("pharmacies.id"), nullable=False, index=True)
     branch_id = sa.Column(sa.UUID, sa.ForeignKey("branches.id"), nullable=True)
+    stock_version = Column(Integer, default=1, nullable=False)
+    last_sync_at = Column(DateTime, nullable=True)
     
     # =====================================
     # IDENTIFICATION DU PRODUIT
@@ -268,6 +273,24 @@ class Product(Base):
             return value
         value = str(value).strip()
         return value or None
+    
+    def update_stock_with_version(self, new_quantity: int, expected_version: int = None) -> bool:
+        """
+        Met à jour le stock avec vérification de version.
+        Retourne True si mise à jour réussie, False si conflit.
+        """
+        if expected_version is not None and self.stock_version != expected_version:
+            logger.warning(
+                f"Conflit de version pour {self.name}: "
+                f"attendue={expected_version}, actuelle={self.stock_version}"
+            )
+            return False
+        
+        self.quantity = new_quantity
+        self.stock_version += 1
+        self.last_sync_at = datetime.utcnow()
+        self.refresh_statuses()
+        return True
 
     # =====================================
     # PROPRIÉTÉS CALCULÉES

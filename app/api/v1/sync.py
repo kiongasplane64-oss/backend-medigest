@@ -241,6 +241,213 @@ def pull_data(
             detail={"error": "Erreur lors de la récupération des données", "message": str(e), "tenant_id": str(user.tenant_id)}
         )
 
+@router.post("/sales/with-conflict-handling")
+async def sync_sales_with_conflict_handling(
+    payload: dict,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """
+    Endpoint intelligent pour la synchronisation des ventes
+    avec gestion avancée des conflits de stock.
+    """
+    sales = payload.get('sales', [])
+    batch_id = payload.get('batch_id')
+    branch_id = payload.get('branch_id')
+    default_strategy = payload.get('default_strategy', 'last_write_wins')
+    
+    if not sales:
+        return {"status": "success", "message": "Aucune vente à traiter"}
+    
+    # Récupérer les stocks actuels pour tous les produits concernés
+    product_ids = set()
+    for sale in sales:
+        for item in sale.get('items', []):
+            product_ids.add(item.get('product_id'))
+    
+    # Obtenir les stocks serveur avec version
+    current_stocks = {}
+    for product_id in product_ids:
+        product = db.query(Product).filter(
+            Product.id == product_id,
+            Product.tenant_id == user.tenant_id
+        ).first()
+        
+        if product:
+            current_stocks[str(product_id)] = {
+                'quantity': product.quantity or 0,
+                'version': getattr(product, 'stock_version', 1),
+                'name': product.name,
+                'code': product.code
+            }
+        else:
+            current_stocks[str(product_id)] = {
+                'quantity': 0,
+                'version': 0,
+                'name': 'Inconnu',
+                'code': 'N/A',
+                'error': 'PRODUCT_NOT_FOUND'
+            }
+    
+    # Traiter chaque vente avec gestion de conflit
+    resolved_sales = []
+    partial_sales = []
+    rejected_sales = []
+    stock_updates = []
+    
+    # Trier les ventes par timestamp pour résolution "last_write_wins"
+    sales_sorted = sorted(sales, key=lambda x: x.get('conflict_metadata', {}).get('client_timestamp', ''), reverse=True)
+    
+    # Suivi des quantités disponibles par produit
+    available_quantities = {pid: stock['quantity'] for pid, stock in current_stocks.items()}
+    
+    for sale in sales_sorted:
+        conflict_metadata = sale.get('conflict_metadata', {})
+        client_known_stock = conflict_metadata.get('client_known_stock', 0)
+        
+        # Vérifier chaque item de la vente
+        sale_valid = True
+        sale_partial = False
+        accepted_quantities = []
+        
+        for item in sale.get('items', []):
+            product_id = item.get('product_id')
+            requested_qty = item.get('quantity', 1)
+            
+            current_stock = current_stocks.get(product_id, {})
+            current_quantity = available_quantities.get(product_id, 0)
+            server_version = current_stock.get('version', 1)
+            
+            # Vérifier si le produit existe
+            if current_stock.get('error') == 'PRODUCT_NOT_FOUND':
+                rejected_sales.append({
+                    'original_id': sale.get('original_id'),
+                    'product_name': sale.get('items', [{}])[0].get('product_name', 'Inconnu'),
+                    'reason': f"Le produit n'existe pas sur le serveur ou a été supprimé par l'administrateur",
+                    'details': {'product_id': product_id}
+                })
+                sale_valid = False
+                break
+            
+            # Vérifier la disponibilité
+            if current_quantity >= requested_qty:
+                # Acceptation complète de cet item
+                available_quantities[product_id] -= requested_qty
+                stock_updates.append({
+                    'product_id': product_id,
+                    'new_quantity': available_quantities[product_id],
+                    'sync_version': server_version + 1,
+                    'change': -requested_qty
+                })
+                accepted_quantities.append({
+                    'product_id': product_id,
+                    'quantity': requested_qty,
+                    'accepted': requested_qty,
+                    'rejected': 0
+                })
+            elif current_quantity > 0:
+                # Acceptation partielle de cet item
+                accepted_qty = current_quantity
+                rejected_qty = requested_qty - accepted_qty
+                
+                available_quantities[product_id] = 0
+                stock_updates.append({
+                    'product_id': product_id,
+                    'new_quantity': 0,
+                    'sync_version': server_version + 1,
+                    'change': -accepted_qty
+                })
+                accepted_quantities.append({
+                    'product_id': product_id,
+                    'quantity': requested_qty,
+                    'accepted': accepted_qty,
+                    'rejected': rejected_qty
+                })
+                sale_partial = True
+            else:
+                # Rejet complet de cet item
+                rejected_sales.append({
+                    'original_id': sale.get('original_id'),
+                    'product_name': current_stock.get('name'),
+                    'reason': f"Stock insuffisant. {requested_qty} unités demandées mais stock serveur épuisé.",
+                    'details': {
+                        'requested': requested_qty,
+                        'available': current_quantity,
+                        'client_known_stock': client_known_stock,
+                        'server_stock': current_quantity
+                    }
+                })
+                sale_valid = False
+                break
+        
+        if not sale_valid:
+            continue
+        
+        # Si vente partielle, enregistrer dans partial_sales
+        if sale_partial:
+            total_accepted = sum(a['accepted'] for a in accepted_quantities)
+            total_requested = sum(a['quantity'] for a in accepted_quantities)
+            partial_sales.append({
+                'original_id': sale.get('original_id'),
+                'product_name': sale.get('items', [{}])[0].get('product_name', 'Inconnu'),
+                'accepted_quantity': total_accepted,
+                'rejected_quantity': total_requested - total_accepted,
+                'reason': f"Stock insuffisant. {total_accepted} unités acceptées sur {total_requested} demandées.",
+                'server_stock': available_quantities.get(sale.get('items', [{}])[0].get('product_id'), 0),
+                'local_stock': conflict_metadata.get('client_known_stock', 0)
+            })
+            continue
+        
+        # Si toutes les vérifications sont passées, créer la vente
+        try:
+            # Créer la vente réelle avec la fonction interne
+            created_sale = await create_sale_internal(
+                db=db,
+                sale_data=sale,
+                tenant_id=user.tenant_id,
+                user=user,
+                force_stock_ignore=False
+            )
+            
+            resolved_sales.append({
+                'original_id': sale.get('original_id'),
+                'server_id': str(created_sale.id),
+                'reference': created_sale.reference
+            })
+            
+        except Exception as e:
+            rejected_sales.append({
+                'original_id': sale.get('original_id'),
+                'reason': f"Erreur création vente: {str(e)}"
+            })
+    
+    # Appliquer les mises à jour de stock
+    for update in stock_updates:
+        product = db.query(Product).filter(Product.id == update['product_id']).first()
+        if product:
+            product.quantity = update['new_quantity']
+            product.stock_version = update['sync_version']
+            product.available_quantity = max(0, product.quantity - (product.reserved_quantity or 0))
+            if hasattr(product, 'refresh_statuses'):
+                product.refresh_statuses()
+    
+    db.commit()
+    
+    return {
+        "status": "success",
+        "batch_id": batch_id,
+        "resolved_sales": resolved_sales,
+        "partial_sales": partial_sales,
+        "rejected_sales": rejected_sales,
+        "stock_updates": stock_updates,
+        "summary": {
+            "total": len(sales),
+            "resolved": len(resolved_sales),
+            "partial": len(partial_sales),
+            "rejected": len(rejected_sales)
+        }
+    }
+
 @router.get("/subscription/status")
 def get_subscription_status(
     branch_id: Optional[str] = None,
@@ -656,7 +863,194 @@ def _create_sale_force_stock(
         logger.exception(f"Erreur création vente force stock: {e}")
         return {"success": False, "error": str(e)}
 
-
+async def create_sale_internal(
+    db: Session,
+    sale_data: Dict[str, Any],
+    tenant_id: UUID,
+    user,
+    force_stock_ignore: bool = False
+) -> Sale:
+    """
+    Fonction interne pour créer une vente.
+    Utilisée par l'endpoint de synchronisation avec gestion de conflits.
+    """
+    from app.models.sale import Sale, SaleItem
+    from app.models.product import Product
+    from app.models.stock_movement import StockMovement
+    from app.models.branch import Branch
+    from app.models.pharmacy import Pharmacy
+    from decimal import Decimal
+    from datetime import datetime
+    from uuid import UUID
+    
+    try:
+        items = sale_data.get('items', [])
+        if not items:
+            raise ValueError("Aucun article dans la vente")
+        
+        # Récupérer la branche et la pharmacie
+        branch_id = sale_data.get('branch_id')
+        pharmacy_id = sale_data.get('pharmacy_id')
+        
+        if not pharmacy_id:
+            # Essayer de trouver la pharmacie via la branche
+            if branch_id:
+                branch = db.query(Branch).filter(Branch.id == branch_id).first()
+                if branch:
+                    pharmacy_id = branch.parent_pharmacy_id
+        
+        total_amount = Decimal('0')
+        sale_items_data = []
+        
+        for item in items:
+            product_id = item.get('product_id')
+            if isinstance(product_id, str):
+                product_id = UUID(product_id)
+            
+            quantity = Decimal(str(item.get('quantity', 1)))
+            unit_price = Decimal(str(item.get('unit_price', 0)))
+            discount = Decimal(str(item.get('discount_percent', 0)))
+            
+            product = db.query(Product).filter(
+                Product.id == product_id,
+                Product.tenant_id == tenant_id,
+                Product.is_active == True
+            ).first()
+            
+            if not product:
+                raise ValueError(f"Produit {product_id} non trouvé")
+            
+            current_stock = product.quantity or 0
+            
+            # Vérifier le stock
+            if current_stock < quantity and not force_stock_ignore:
+                raise ValueError(f"Stock insuffisant pour {product.name}. Disponible: {current_stock}, Demandé: {quantity}")
+            
+            # Calculer les totaux
+            subtotal = quantity * unit_price
+            discount_amount = subtotal * (discount / Decimal('100'))
+            after_discount = subtotal - discount_amount
+            
+            # TVA
+            tva_rate = Decimal(str(product.tva_rate)) if product.has_tva else Decimal('0')
+            tva_amount = after_discount * (tva_rate / Decimal('100'))
+            item_total = after_discount + tva_amount
+            
+            total_amount += item_total
+            
+            sale_items_data.append({
+                "product": product,
+                "product_id": product_id,
+                "quantity": quantity,
+                "unit_price": unit_price,
+                "discount_percent": discount,
+                "discount_amount": discount_amount,
+                "tva_rate": tva_rate,
+                "tva_amount": tva_amount,
+                "subtotal": subtotal,
+                "total": item_total,
+                "quantity_change": -float(quantity),
+                "old_quantity": current_stock
+            })
+        
+        # Appliquer la remise globale
+        global_discount = Decimal(str(sale_data.get('global_discount', 0)))
+        global_discount_amount = Decimal('0')
+        if global_discount > 0:
+            global_discount_amount = total_amount * (global_discount / Decimal('100'))
+            total_amount -= global_discount_amount
+        
+        # Générer une référence
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        reference = f"SYNC-{timestamp}-{str(tenant_id)[:8]}"
+        
+        # Créer la vente
+        sale = Sale(
+            tenant_id=tenant_id,
+            pharmacy_id=pharmacy_id,
+            branch_id=branch_id,
+            reference=reference,
+            customer_name=sale_data.get('customer_name', 'Client synchronisé'),
+            customer_phone=sale_data.get('customer_phone'),
+            customer_email=sale_data.get('customer_email'),
+            created_by=user.id if hasattr(user, 'id') else user.get('id') if isinstance(user, dict) else None,
+            seller_name=sale_data.get('seller_name', getattr(user, 'nom_complet', 'Sync Service')),
+            payment_method=sale_data.get('payment_method', 'cash'),
+            is_credit=sale_data.get('is_credit', False),
+            credit_due_date=sale_data.get('credit_due_date'),
+            global_discount=global_discount,
+            notes=sale_data.get('notes', f"Syncé depuis offline - ID original: {sale_data.get('original_id')}"),
+            subtotal=sum(d["subtotal"] for d in sale_items_data),
+            total_discount=sum(d["discount_amount"] for d in sale_items_data) + global_discount_amount,
+            total_tva=sum(d["tva_amount"] for d in sale_items_data),
+            total_amount=total_amount,
+            status="completed",
+            is_synced=True,
+            synced_at=datetime.utcnow()
+        )
+        
+        db.add(sale)
+        db.flush()
+        
+        # Créer les items et mettre à jour le stock
+        for item_data in sale_items_data:
+            product = item_data["product"]
+            
+            sale_item = SaleItem(
+                tenant_id=tenant_id,
+                sale_id=sale.id,
+                pharmacy_id=pharmacy_id,
+                product_id=item_data["product_id"],
+                product_code=product.code,
+                product_name=product.name,
+                quantity=item_data["quantity"],
+                unit_price=item_data["unit_price"],
+                discount_percent=item_data["discount_percent"],
+                discount_amount=item_data["discount_amount"],
+                tva_rate=item_data["tva_rate"],
+                tva_amount=item_data["tva_amount"],
+                subtotal=item_data["subtotal"],
+                total=item_data["total"]
+            )
+            db.add(sale_item)
+            
+            # Mettre à jour le stock
+            old_quantity = product.quantity or 0
+            new_quantity = max(0, old_quantity + item_data["quantity_change"])
+            
+            product.quantity = new_quantity
+            product.available_quantity = max(0, new_quantity - (product.reserved_quantity or 0))
+            product.last_sale_date = datetime.utcnow()
+            product.refresh_statuses()
+            
+            # Mouvement de stock
+            movement = StockMovement(
+                tenant_id=tenant_id,
+                product_id=product.id,
+                pharmacy_id=pharmacy_id,
+                branch_id=branch_id,
+                quantity_before=old_quantity,
+                quantity_after=new_quantity,
+                quantity_change=item_data["quantity_change"],
+                movement_type="sale",
+                reason=f"Synchronisation - Vente #{sale.reference}",
+                reference=sale.reference,
+                sale_id=sale.id,
+                sale_item_id=sale_item.id,
+                selling_price=item_data["unit_price"],
+                created_by=user.id if hasattr(user, 'id') else user.get('id') if isinstance(user, dict) else None
+            )
+            db.add(movement)
+        
+        db.flush()
+        
+        logger.info(f"Vente créée (interne): {sale.reference}, Total: {sale.total_amount}")
+        
+        return sale
+        
+    except Exception as e:
+        logger.exception(f"Erreur create_sale_internal: {e}")
+        raise
 # ============================================================
 # ENDPOINTS POUR LES VENTES AVEC STOCK IGNORÉ
 # ============================================================
