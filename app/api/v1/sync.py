@@ -200,10 +200,6 @@ def sync_data(
             }
         )
 
-@router.post("/sync/sales/force")  # Alias pour compatibilité
-def sync_sales_force_alias(payload: dict, db: Session = Depends(get_db), user = Depends(get_current_user)):
-    return sync_sales_force(payload, db, user)
-
 @router.get("/pull")
 def pull_data(
     last_sync: Optional[str] = None,
@@ -1252,6 +1248,9 @@ def sync_sales_with_stock_override(
         "override_config": global_override
     }
 
+@router.post("/sync/sales/force")  # Alias pour compatibilité
+def sync_sales_force_alias(payload: dict, db: Session = Depends(get_db), user = Depends(get_current_user)):
+    return sync_sales_force(payload, db, user)
 
 @router.post("/sales/deferred")
 def sync_deferred_sales(
