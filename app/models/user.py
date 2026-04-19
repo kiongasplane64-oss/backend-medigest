@@ -1,7 +1,7 @@
 # app/models/user.py
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, JSON, Integer
+from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, JSON, Integer, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from app.db.base import Base
@@ -38,15 +38,11 @@ class User(Base):
     activated_at = Column(DateTime, nullable=True)
 
     # =========================
-    # Dates
+    # Dates (CORRIGÉ - une seule colonne création)
     # =========================
-    date_creation = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     last_login = Column(DateTime, nullable=True)
-    date_modification = Column(
-        DateTime, 
-        default=datetime.utcnow, 
-        onupdate=datetime.utcnow
-    )
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), nullable=True)
 
     # =========================
     # Session active (pharmacie et branche)
@@ -114,19 +110,7 @@ class User(Base):
     )
     expenses = relationship("Expense", foreign_keys="Expense.user_id", back_populates="user")
     expenses_approved = relationship("Expense", foreign_keys="Expense.approved_by")
-
-    # ========== DÉPRÉCIÉ / À SUPPRIMER (abonnement tenant) ==========
-    # tenant_subscription = relationship(
-    #     "Subscription", 
-    #     back_populates="user",
-    #     uselist=False,
-    #     foreign_keys="[Subscription.user_id]"
-    # )
-    # ========== FIN DÉPRÉCIÉ ==========
-
-    # ========== DÉPRÉCIÉ / À SUPPRIMER (abonnement utilisateur individuel) ==========
-    # user_subscription = relationship("UserSubscription", back_populates="user", uselist=False)
-    # ========== FIN DÉPRÉCIÉ ==========
+    user_expenses = relationship("UserExpense", back_populates="user", foreign_keys="UserExpense.user_id")
 
     # =========================
     # Méthodes utilitaires
@@ -188,7 +172,7 @@ class User(Base):
             "telephone": self.telephone,
             "adresse": self.adresse,
             "permissions": self.permissions or {},
-            "date_creation": self.date_creation.isoformat() if self.date_creation else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
             "last_login": self.last_login.isoformat() if self.last_login else None,
             "active_pharmacy_id": str(self.active_pharmacy_id) if self.active_pharmacy_id else None,
             "active_branch_id": str(self.active_branch_id) if self.active_branch_id else None,
@@ -226,7 +210,7 @@ class User(Base):
     def update_last_login(self):
         self.last_login = datetime.utcnow()
     
-    # ========== MÉTHODES MODIFIÉES (abonnement par branche) ==========
+    # ========== MÉTHODES D'ABONNEMENT PAR BRANCHE ==========
     
     def get_active_pharmacy_subscription_status(self, db_session=None):
         """

@@ -1107,7 +1107,7 @@ async def list_all_users(
     # Pagination
     total = query.count()
     offset = (page - 1) * limit
-    users = query.order_by(User.date_creation.desc()).offset(offset).limit(limit).all()
+    users = query.order_by(User.created_at.desc()).offset(offset).limit(limit).all()
     
     # Format des résultats
     users_with_tenant = []
@@ -1126,7 +1126,7 @@ async def list_all_users(
                 "tenant_code": tenant.tenant_code if tenant else None
             } if tenant else None,
             "last_login": user.last_login.isoformat() if user.last_login else None,
-            "created_at": user.date_creation.isoformat() if user.date_creation else None
+            "created_at": user.created_at.isoformat() if user.created_at else None
         })
     
     return {
@@ -1249,7 +1249,7 @@ async def get_user_details(
             "telephone": user.telephone,
             "adresse": user.adresse,
             "permissions": user.permissions,
-            "created_at": user.date_creation.isoformat() if user.date_creation else None,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
             "last_login": user.last_login.isoformat() if user.last_login else None,
             "login_attempts": user.login_attempts,
             "locked_until": user.locked_until.isoformat() if user.locked_until else None
@@ -1814,7 +1814,7 @@ async def get_analytics_overview(
     
     # Nouveaux utilisateurs
     new_users = db.query(User).filter(
-        User.date_creation.between(start_date, end_date)
+        User.created_at.between(start_date, end_date)
     ).count()
     
     # Activité des utilisateurs (connexions)
@@ -1986,7 +1986,7 @@ async def export_analytics_data(
     
     elif data_type == "users":
         users = db.query(User).filter(
-            User.date_creation.between(start_date, end_date)
+            User.created_at.between(start_date, end_date)
         ).all()
         
         for user in users:
@@ -1999,7 +1999,7 @@ async def export_analytics_data(
                 "actif": user.actif,
                 "tenant": tenant.nom_pharmacie if tenant else None,
                 "tenant_id": str(user.tenant_id) if user.tenant_id else None,
-                "created_at": user.date_creation.isoformat() if user.date_creation else None,
+                "created_at": user.created_at.isoformat() if user.created_at else None,
                 "last_login": user.last_login.isoformat() if user.last_login else None
             })
     

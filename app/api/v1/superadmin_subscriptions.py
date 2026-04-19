@@ -2,67 +2,85 @@
 """
 Endpoints de gestion des abonnements pour les super administrateurs.
 Permet l'activation manuelle, la prolongation d'essais et la vue d'ensemble.
-Gère les abonnements des tenants ET des utilisateurs.
+Gère les abonnements des PHARMACIES/BRANCHES uniquement (pas par utilisateur).
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, and_
+from sqlalchemy import or_, and_, func
 from typing import Optional, Dict, Any, List
 from uuid import UUID
 import logging
+import json
 from datetime import datetime, timedelta
 from decimal import Decimal
 
 from app.api.deps import get_db, verify_super_admin
 from app.models.user import User
 from app.models.tenant import Tenant
-from app.models.subscription import (
-    Subscription, SubscriptionPlan, SubscriptionStatus,
-    BillingPeriod, PaymentMethod, SubscriptionPayment, PaymentStatus
+from app.models.pharmacy import Pharmacy
+from app.models.pharmacy_subscription import (
+    PharmacySubscription, SubscriptionPlan, SubscriptionStatus
 )
-from app.schemas.subscription import ManualActivationSchema, SubscriptionFilterSchema
+from app.schemas.subscription import ManualActivationSchema
 
-# Configuration du logger
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/super-admin/subscriptions", tags=["Super Admin - Subscriptions"])
 
-# Configuration des plans (basée sur create_default_plans())
+# Configuration des plans (cohérente avec subscription_codes.py)
 PLAN_CONFIG = {
-    SubscriptionPlan.STARTER: {
+    "starter": {
         "name": "Starter",
         "price_monthly": 49.99,
-        "price_annual": 479.99,
-        "max_users": 3,
+        "price_yearly": 479.99,
         "max_products": 500,
-        "max_storage_mb": 1024,
+        "max_users": 2,
+        "max_branches": 1,
     },
-    SubscriptionPlan.PROFESSIONAL: {
+    "professional": {
         "name": "Professional",
         "price_monthly": 89.99,
-        "price_annual": 899.99,
+        "price_yearly": 899.99,
+        "max_products": 5000,
         "max_users": 10,
-        "max_products": None,
-        "max_storage_mb": 5120,
+        "max_branches": 3,
     },
-    SubscriptionPlan.ENTERPRISE: {
+    "enterprise": {
         "name": "Enterprise",
         "price_monthly": 149.99,
-        "price_annual": 1499.99,
-        "max_users": None,
-        "max_products": None,
-        "max_storage_mb": 10240,
-    },
-    SubscriptionPlan.ESSAI: {
-        "name": "Essai Gratuit",
-        "price_monthly": 0.00,
-        "price_annual": 0.00,
-        "max_users": 2,
-        "max_products": 100,
-        "max_storage_mb": 512,
+        "price_yearly": 1499.99,
+        "max_products": 0,  # Illimité
+        "max_users": 0,     # Illimité
+        "max_branches": 0,  # Illimité
     }
 }
+
+
+# =============================================================================
+# UTILITAIRES
+# =============================================================================
+
+def get_pharmacy_subscription(db: Session, pharmacy_id: UUID) -> Optional[PharmacySubscription]:
+    """Récupère l'abonnement actif d'une pharmacie"""
+    return db.query(PharmacySubscription).filter(
+        PharmacySubscription.pharmacy_id == pharmacy_id
+    ).first()
+
+
+def calculate_end_date(duration_days: int) -> datetime:
+    """Calcule la date de fin à partir de la durée en jours"""
+    return datetime.utcnow() + timedelta(days=duration_days)
+
+
+def get_plan_limits(plan_type: str) -> Dict[str, Any]:
+    """Retourne les limites d'un plan"""
+    config = PLAN_CONFIG.get(plan_type, PLAN_CONFIG["professional"])
+    return {
+        "max_products": config.get("max_products", 0) or 0,
+        "max_users": config.get("max_users", 0) or 0,
+        "max_branches": config.get("max_branches", 0) or 0,
+    }
 
 
 # =============================================================================
@@ -74,132 +92,117 @@ async def get_subscriptions_overview(
     db: Session = Depends(get_db),
     current_user: User = Depends(verify_super_admin),
     tenant_id: Optional[str] = Query(None, description="Filtrer par ID de tenant (optionnel)"),
-    include_users: bool = Query(False, description="Inclure les abonnements utilisateurs")
+    pharmacy_id: Optional[str] = Query(None, description="Filtrer par ID de pharmacie (optionnel)")
 ) -> Dict[str, Any]:
     """
-    Vue d'ensemble des abonnements pour le super admin.
-    Gère à la fois les abonnements des tenants et des utilisateurs.
-    
-    Args:
-        tenant_id: ID du tenant pour filtrer (optionnel)
-        include_users: Si True, inclut les abonnements utilisateurs
-        
-    Returns:
-        Statistiques globales et liste détaillée des abonnements
+    Vue d'ensemble des abonnements des pharmacies/branches.
     """
     logger.info(f"Demande de vue d'ensemble des abonnements par {current_user.email}")
     
     try:
-        # Construire la requête de base pour les tenants
-        tenant_query = db.query(Tenant)
+        # Construire la requête de base pour les pharmacies
+        pharmacy_query = db.query(Pharmacy)
+        
         if tenant_id:
-            tenant_query = tenant_query.filter(Tenant.id == tenant_id)
+            pharmacy_query = pharmacy_query.filter(Pharmacy.tenant_id == tenant_id)
         
-        tenants = tenant_query.all()
+        if pharmacy_id:
+            pharmacy_query = pharmacy_query.filter(Pharmacy.id == pharmacy_id)
         
-        # Statistiques tenants
-        tenant_subscriptions = []
-        total_tenants = len(tenants)
-        trial_tenants = 0
-        active_paid_tenants = 0
-        plans_distribution = {plan.value: 0 for plan in SubscriptionPlan}
+        pharmacies = pharmacy_query.all()
         
-        for tenant in tenants:
-            sub = db.query(Subscription).filter(
-                Subscription.tenant_id == tenant.id,
-                Subscription.user_id == tenant.owner_id
-            ).first()
+        # Statistiques
+        pharmacy_subscriptions = []
+        total_pharmacies = len(pharmacies)
+        trial_pharmacies = 0
+        active_paid_pharmacies = 0
+        expired_pharmacies = 0
+        plans_distribution = {"starter": 0, "professional": 0, "enterprise": 0}
+        
+        for pharmacy in pharmacies:
+            sub = get_pharmacy_subscription(db, pharmacy.id)
             
             if sub:
                 sub_data = {
-                    "tenant_id": str(tenant.id),
-                    "tenant_name": tenant.nom_pharmacie,
-                    "tenant_code": tenant.tenant_code,
-                    "owner_email": tenant.owner.email if tenant.owner else None,
+                    "pharmacy_id": str(pharmacy.id),
+                    "pharmacy_name": pharmacy.name,
+                    "pharmacy_code": pharmacy.pharmacy_code,
+                    "tenant_id": str(pharmacy.tenant_id) if pharmacy.tenant_id else None,
+                    "tenant_name": pharmacy.tenant.nom_pharmacie if pharmacy.tenant else None,
                     "subscription_id": str(sub.id),
                     "plan": sub.plan.value,
                     "plan_name": sub.plan_name,
                     "status": sub.status.value,
                     "is_active": sub.is_active(),
-                    "is_trial": sub.is_trial(),
                     "start_date": sub.start_date.isoformat() if sub.start_date else None,
                     "end_date": sub.end_date.isoformat() if sub.end_date else None,
-                    "trial_end_date": sub.trial_end_date.isoformat() if sub.trial_end_date else None,
                     "days_remaining": sub.days_remaining(),
-                    "trial_days_remaining": sub.trial_days_remaining(),
-                    "current_price": float(sub.current_price),
-                    "auto_renew": sub.auto_renew
+                    "current_price": float(sub.price) if sub.price else 0,
+                    "max_products": sub.max_products,
+                    "max_users": sub.max_users,
+                    "max_branches": sub.max_branches,
                 }
-                tenant_subscriptions.append(sub_data)
+                pharmacy_subscriptions.append(sub_data)
                 
                 # Mise à jour des statistiques
-                if sub.status == SubscriptionStatus.TRIAL:
-                    trial_tenants += 1
-                elif sub.status == SubscriptionStatus.ACTIVE:
-                    active_paid_tenants += 1
-                
-                if sub.plan.value in plans_distribution:
-                    plans_distribution[sub.plan.value] += 1
+                if sub.status == SubscriptionStatus.ACTIVE:
+                    active_paid_pharmacies += 1
+                    if sub.plan.value in plans_distribution:
+                        plans_distribution[sub.plan.value] += 1
+                elif sub.status == SubscriptionStatus.EXPIRED:
+                    expired_pharmacies += 1
+            else:
+                # Pharmacie sans abonnement
+                pharmacy_subscriptions.append({
+                    "pharmacy_id": str(pharmacy.id),
+                    "pharmacy_name": pharmacy.name,
+                    "pharmacy_code": pharmacy.pharmacy_code,
+                    "tenant_id": str(pharmacy.tenant_id) if pharmacy.tenant_id else None,
+                    "tenant_name": pharmacy.tenant.nom_pharmacie if pharmacy.tenant else None,
+                    "subscription_id": None,
+                    "plan": None,
+                    "plan_name": None,
+                    "status": "no_subscription",
+                    "is_active": False,
+                    "start_date": None,
+                    "end_date": None,
+                    "days_remaining": None,
+                    "current_price": 0,
+                    "max_products": 0,
+                    "max_users": 0,
+                    "max_branches": 0,
+                })
         
-        # Abonnements utilisateurs (optionnel)
-        user_subscriptions = []
-        if include_users:
-            users = db.query(User).filter(User.tenant_id.isnot(None))
-            if tenant_id:
-                users = users.filter(User.tenant_id == tenant_id)
-            
-            for user in users.all():
-                sub = user.subscription
-                if sub:
-                    user_subscriptions.append({
-                        "user_id": str(user.id),
-                        "user_email": user.email,
-                        "user_name": user.nom_complet,
-                        "tenant_id": str(user.tenant_id),
-                        "tenant_name": user.tenant.nom_pharmacie if user.tenant else None,
-                        "subscription_id": str(sub.id),
-                        "plan": sub.plan.value,
-                        "plan_name": sub.plan_name,
-                        "status": sub.status.value,
-                        "is_active": sub.is_active(),
-                        "is_trial": sub.is_trial(),
-                        "end_date": sub.end_date.isoformat() if sub.end_date else None,
-                        "days_remaining": sub.days_remaining()
-                    })
-        
-        # Calcul des revenus projetés
+        # Calcul des revenus projetés (uniquement abonnements actifs payants)
         monthly_revenue = sum([
-            PLAN_CONFIG.get(sub["plan"], {}).get("price_monthly", 0) 
-            for sub in tenant_subscriptions 
-            if sub.get("is_active", False) and sub.get("plan") != SubscriptionPlan.ESSAI.value
+            PLAN_CONFIG.get(sub["plan"], {}).get("price_monthly", 0)
+            for sub in pharmacy_subscriptions
+            if sub.get("is_active", False) and sub.get("plan") and sub.get("plan") != "starter"
         ])
         
         result = {
             "timestamp": datetime.utcnow().isoformat(),
             "requested_by": current_user.email,
-            "filter": {"tenant_id": tenant_id} if tenant_id else None,
-            "tenants": {
-                "total": total_tenants,
-                "trial": trial_tenants,
-                "active_paid": active_paid_tenants,
-                "conversion_rate": round(active_paid_tenants / max(trial_tenants + active_paid_tenants, 1) * 100, 2),
-                "subscriptions": tenant_subscriptions
+            "filter": {
+                "tenant_id": tenant_id if tenant_id else None,
+                "pharmacy_id": pharmacy_id if pharmacy_id else None
+            },
+            "pharmacies": {
+                "total": total_pharmacies,
+                "active_paid": active_paid_pharmacies,
+                "expired": expired_pharmacies,
+                "conversion_rate": round(active_paid_pharmacies / max(total_pharmacies, 1) * 100, 2),
+                "subscriptions": pharmacy_subscriptions
             },
             "plans_distribution": plans_distribution,
             "revenue": {
-                "monthly": monthly_revenue,
-                "yearly": monthly_revenue * 12,
-                "average_per_tenant": round(monthly_revenue / max(active_paid_tenants, 1), 2)
+                "monthly": round(monthly_revenue, 2),
+                "yearly": round(monthly_revenue * 12, 2),
+                "average_per_pharmacy": round(monthly_revenue / max(active_paid_pharmacies, 1), 2)
             }
         }
         
-        if include_users:
-            result["users"] = {
-                "total": len(user_subscriptions),
-                "subscriptions": user_subscriptions
-            }
-        
-        logger.info(f"Vue d'ensemble récupérée: {total_tenants} tenants, {len(user_subscriptions)} utilisateurs")
+        logger.info(f"Vue d'ensemble récupérée: {total_pharmacies} pharmacies, {active_paid_pharmacies} actives")
         return result
         
     except Exception as e:
@@ -214,150 +217,142 @@ async def get_subscriptions_overview(
 
 
 # =============================================================================
-# ACTIVATION MANUELLE (PAIEMENT CASH) - POUR TENANT
+# ACTIVATION MANUELLE (PAIEMENT CASH) - POUR PHARMACIE/BRANCHE
 # =============================================================================
 
-@router.post("/manual-activation/tenant", response_model=Dict[str, Any])
-async def manual_activate_tenant_subscription(
-    tenant_id: UUID,
+@router.post("/manual-activation/pharmacy", response_model=Dict[str, Any])
+async def manual_activate_pharmacy_subscription(
+    pharmacy_id: UUID,
     data: ManualActivationSchema,
     db: Session = Depends(get_db),
     current_user: User = Depends(verify_super_admin)
 ):
     """
-    Activation manuelle d'un abonnement tenant (paiement cash).
+    Activation manuelle d'un abonnement pour une pharmacie/branche (paiement cash).
     Réservé aux super administrateurs pour les paiements hors ligne.
     
     Args:
-        tenant_id: ID du tenant à activer
+        pharmacy_id: ID de la pharmacie à activer
         data: Informations d'activation manuelle (plan, période, montant)
         
     Returns:
         Confirmation de l'activation avec détails de l'abonnement
     """
-    logger.info(f"Activation manuelle d'abonnement tenant par {current_user.email} pour {tenant_id}")
+    logger.info(f"Activation manuelle d'abonnement par {current_user.email} pour pharmacie {pharmacy_id}")
     
-    # Vérifier que le tenant existe
-    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
-    if not tenant:
+    # Vérifier que la pharmacie existe
+    pharmacy = db.query(Pharmacy).filter(Pharmacy.id == pharmacy_id).first()
+    if not pharmacy:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": "tenant_not_found", "message": "Tenant non trouvé"}
+            detail={"error": "pharmacy_not_found", "message": "Pharmacie non trouvée"}
         )
     
-    if not tenant.owner_id:
+    # Vérifier que le plan existe
+    plan_type = data.plan.value if hasattr(data.plan, 'value') else data.plan
+    if plan_type not in PLAN_CONFIG:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": "no_owner", "message": "Le tenant n'a pas de propriétaire"}
+            detail={
+                "error": "invalid_plan",
+                "message": f"Le plan {plan_type} n'existe pas. Plans disponibles: {list(PLAN_CONFIG.keys())}"
+            }
         )
     
     try:
+        # Déterminer la durée en jours
+        if data.billing_cycle == "yearly":
+            duration_days = 365
+        else:
+            duration_days = 30
+        
+        plan_config = PLAN_CONFIG.get(plan_type, PLAN_CONFIG["professional"])
+        end_date = calculate_end_date(duration_days)
+        limits = get_plan_limits(plan_type)
+        
+        # Déterminer le prix
+        price = data.amount if data.amount else (
+            plan_config.get("price_yearly") if data.billing_cycle == "yearly" else plan_config.get("price_monthly")
+        )
+        
         # Vérifier si un abonnement existe déjà
-        existing_sub = db.query(Subscription).filter(
-            Subscription.tenant_id == tenant_id,
-            Subscription.user_id == tenant.owner_id
-        ).first()
-        
-        # Définir la période de facturation
-        billing_period = BillingPeriod.MENSUEL if data.billing_cycle == "monthly" else BillingPeriod.ANNUEL
-        
-        # Obtenir les prix selon le plan
-        plan_prices = PLAN_CONFIG.get(data.plan, {})
-        monthly_price = Decimal(str(plan_prices.get("price_monthly", 0)))
-        annual_price = Decimal(str(plan_prices.get("price_annual", 0)))
+        existing_sub = get_pharmacy_subscription(db, pharmacy.id)
         
         if existing_sub:
             # Mettre à jour l'abonnement existant
-            existing_sub.plan = data.plan
-            existing_sub.plan_name = plan_prices.get("name", data.plan.value)
-            existing_sub.billing_period = billing_period
-            existing_sub.status = SubscriptionStatus.ACTIVE
-            existing_sub.monthly_price = monthly_price
-            existing_sub.annual_price = annual_price
-            existing_sub.current_price = annual_price if billing_period == BillingPeriod.ANNUEL else monthly_price
+            existing_sub.plan = SubscriptionPlan(plan_type)
+            existing_sub.plan_name = plan_config["name"]
             existing_sub.start_date = datetime.utcnow()
-            
-            # Calculer la date de fin
-            if billing_period == BillingPeriod.MENSUEL:
-                existing_sub.end_date = datetime.utcnow() + timedelta(days=30)
-            else:
-                existing_sub.end_date = datetime.utcnow() + timedelta(days=365)
-            
-            existing_sub.next_billing_date = existing_sub.end_date
-            existing_sub.auto_renew = data.auto_renew if hasattr(data, 'auto_renew') else True
+            existing_sub.end_date = end_date
+            existing_sub.status = SubscriptionStatus.ACTIVE
+            existing_sub.billing_cycle = data.billing_cycle
+            existing_sub.price = float(price)
+            existing_sub.currency = data.currency or "EUR"
+            existing_sub.max_products = limits["max_products"]
+            existing_sub.max_users = limits["max_users"]
+            existing_sub.max_branches = limits["max_branches"]
             existing_sub.updated_at = datetime.utcnow()
             
             subscription = existing_sub
+            logger.info(f"Mise à jour de l'abonnement existant pour pharmacie {pharmacy.name}")
         else:
             # Créer un nouvel abonnement
-            subscription = Subscription(
-                tenant_id=tenant_id,
-                user_id=tenant.owner_id,
-                plan=data.plan,
-                plan_name=plan_prices.get("name", data.plan.value),
-                billing_period=billing_period,
-                status=SubscriptionStatus.ACTIVE,
-                monthly_price=monthly_price,
-                annual_price=annual_price,
-                current_price=annual_price if billing_period == BillingPeriod.ANNUEL else monthly_price,
+            subscription = PharmacySubscription(
+                pharmacy_id=pharmacy.id,
+                plan=SubscriptionPlan(plan_type),
+                plan_name=plan_config["name"],
                 start_date=datetime.utcnow(),
-                max_users=plan_prices.get("max_users", 3),
-                max_products=plan_prices.get("max_products"),
-                max_storage_mb=plan_prices.get("max_storage_mb", 1024),
-                auto_renew=data.auto_renew if hasattr(data, 'auto_renew') else True,
-                created_by=current_user.id
+                end_date=end_date,
+                status=SubscriptionStatus.ACTIVE,
+                billing_cycle=data.billing_cycle,
+                price=float(price),
+                currency=data.currency or "EUR",
+                max_products=limits["max_products"],
+                max_users=limits["max_users"],
+                max_branches=limits["max_branches"]
             )
             db.add(subscription)
         
         db.flush()
         
-        # Créer un enregistrement de paiement
-        payment = SubscriptionPayment(
-            subscription_id=subscription.id,
-            amount=Decimal(str(data.amount)) if data.amount else subscription.current_price,
-            amount_paid=Decimal(str(data.amount)) if data.amount else subscription.current_price,
-            status=PaymentStatus.COMPLETED,
-            payment_method=data.payment_method,
-            payment_reference=data.reference or f"MANUAL-{subscription.id}",
-            period_start=subscription.start_date,
-            period_end=subscription.end_date,
-            description=f"Activation manuelle - {subscription.plan_name}",
-            notes=data.notes,
-            paid_at=datetime.utcnow()
-        )
-        db.add(payment)
+        # Ajouter une note dans les métadonnées de la pharmacie si possible
+        # (Optionnel: loguer l'activation)
         
         db.commit()
         db.refresh(subscription)
         
         response = {
-            "message": "Abonnement tenant activé manuellement avec succès",
+            "message": f"Abonnement activé manuellement pour la pharmacie {pharmacy.name}",
             "success": True,
             "subscription": {
                 "id": str(subscription.id),
-                "tenant_id": str(tenant.id),
-                "tenant_name": tenant.nom_pharmacie,
-                "owner_email": tenant.owner.email if tenant.owner else None,
+                "pharmacy_id": str(pharmacy.id),
+                "pharmacy_name": pharmacy.name,
+                "pharmacy_code": pharmacy.pharmacy_code,
+                "tenant_id": str(pharmacy.tenant_id) if pharmacy.tenant_id else None,
+                "tenant_name": pharmacy.tenant.nom_pharmacie if pharmacy.tenant else None,
                 "plan": subscription.plan.value,
                 "plan_name": subscription.plan_name,
                 "status": subscription.status.value,
-                "billing_period": subscription.billing_period.value,
+                "billing_cycle": subscription.billing_cycle,
                 "start_date": subscription.start_date.isoformat(),
                 "end_date": subscription.end_date.isoformat(),
                 "days_remaining": subscription.days_remaining(),
-                "current_price": float(subscription.current_price),
+                "current_price": float(subscription.price),
+                "max_products": subscription.max_products,
+                "max_users": subscription.max_users,
+                "max_branches": subscription.max_branches,
                 "activated_by": current_user.email,
                 "activated_at": datetime.utcnow().isoformat()
             },
-            "payment": {
-                "id": str(payment.id),
-                "amount": float(payment.amount),
-                "payment_method": payment.payment_method.value,
-                "reference": payment.payment_reference
+            "plan_details": {
+                "duration_days": duration_days,
+                "price": float(price),
+                "currency": data.currency or "EUR"
             }
         }
         
-        logger.info(f"Activation manuelle réussie pour tenant {tenant.nom_pharmacie} (plan: {data.plan.value})")
+        logger.info(f"Activation manuelle réussie pour pharmacie {pharmacy.name} (plan: {plan_type})")
         return response
         
     except ValueError as e:
@@ -377,188 +372,219 @@ async def manual_activate_tenant_subscription(
 
 
 # =============================================================================
-# ACTIVATION MANUELLE - POUR UTILISATEUR
+# ACTIVATION PAR TENANT (TOUTES LES PHARMACIES D'UN TENANT)
 # =============================================================================
 
-@router.post("/manual-activation/user", response_model=Dict[str, Any])
-async def manual_activate_user_subscription(
-    user_id: UUID,
+@router.post("/manual-activation/tenant", response_model=Dict[str, Any])
+async def manual_activate_tenant_pharmacies(
+    tenant_id: UUID,
     data: ManualActivationSchema,
     db: Session = Depends(get_db),
     current_user: User = Depends(verify_super_admin)
 ):
     """
-    Activation manuelle d'un abonnement utilisateur (paiement cash).
-    Réservé aux super administrateurs pour les paiements hors ligne.
+    Active un abonnement pour TOUTES les pharmacies d'un tenant.
+    Utile pour les chaînes de pharmacies.
     
     Args:
-        user_id: ID de l'utilisateur à activer
-        data: Informations d'activation manuelle (plan, période, montant)
+        tenant_id: ID du tenant
+        data: Informations d'activation manuelle
         
     Returns:
-        Confirmation de l'activation avec détails de l'abonnement
+        Confirmation de l'activation pour chaque pharmacie
     """
-    logger.info(f"Activation manuelle d'abonnement utilisateur par {current_user.email} pour {user_id}")
+    logger.info(f"Activation massive pour tenant {tenant_id} par {current_user.email}")
     
-    # Vérifier que l'utilisateur existe
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
+    # Vérifier que le tenant existe
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": "user_not_found", "message": "Utilisateur non trouvé"}
+            detail={"error": "tenant_not_found", "message": "Tenant non trouvé"}
         )
     
-    if not user.tenant_id:
+    # Récupérer toutes les pharmacies du tenant
+    pharmacies = db.query(Pharmacy).filter(Pharmacy.tenant_id == tenant_id).all()
+    
+    if not pharmacies:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "no_pharmacies", "message": "Aucune pharmacie trouvée pour ce tenant"}
+        )
+    
+    plan_type = data.plan.value if hasattr(data.plan, 'value') else data.plan
+    
+    if plan_type not in PLAN_CONFIG:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": "no_tenant", "message": "L'utilisateur n'est pas rattaché à un tenant"}
+            detail={"error": "invalid_plan", "message": f"Le plan {plan_type} n'existe pas"}
         )
     
     try:
-        # Vérifier si un abonnement existe déjà
-        existing_sub = db.query(Subscription).filter(
-            Subscription.user_id == user_id,
-            Subscription.tenant_id == user.tenant_id
-        ).first()
+        # Déterminer la durée en jours
+        duration_days = 365 if data.billing_cycle == "yearly" else 30
+        plan_config = PLAN_CONFIG.get(plan_type, PLAN_CONFIG["professional"])
+        end_date = calculate_end_date(duration_days)
+        limits = get_plan_limits(plan_type)
         
-        # Définir la période de facturation
-        billing_period = BillingPeriod.MENSUEL if data.billing_cycle == "monthly" else BillingPeriod.ANNUEL
-        
-        # Obtenir les prix selon le plan
-        plan_prices = PLAN_CONFIG.get(data.plan, {})
-        monthly_price = Decimal(str(plan_prices.get("price_monthly", 0)))
-        annual_price = Decimal(str(plan_prices.get("price_annual", 0)))
-        
-        if existing_sub:
-            # Mettre à jour l'abonnement existant
-            existing_sub.plan = data.plan
-            existing_sub.plan_name = plan_prices.get("name", data.plan.value)
-            existing_sub.billing_period = billing_period
-            existing_sub.status = SubscriptionStatus.ACTIVE
-            existing_sub.monthly_price = monthly_price
-            existing_sub.annual_price = annual_price
-            existing_sub.current_price = annual_price if billing_period == BillingPeriod.ANNUEL else monthly_price
-            existing_sub.start_date = datetime.utcnow()
-            
-            if billing_period == BillingPeriod.MENSUEL:
-                existing_sub.end_date = datetime.utcnow() + timedelta(days=30)
-            else:
-                existing_sub.end_date = datetime.utcnow() + timedelta(days=365)
-            
-            existing_sub.next_billing_date = existing_sub.end_date
-            existing_sub.auto_renew = data.auto_renew if hasattr(data, 'auto_renew') else True
-            existing_sub.updated_at = datetime.utcnow()
-            
-            subscription = existing_sub
-        else:
-            # Créer un nouvel abonnement
-            subscription = Subscription(
-                tenant_id=user.tenant_id,
-                user_id=user_id,
-                plan=data.plan,
-                plan_name=plan_prices.get("name", data.plan.value),
-                billing_period=billing_period,
-                status=SubscriptionStatus.ACTIVE,
-                monthly_price=monthly_price,
-                annual_price=annual_price,
-                current_price=annual_price if billing_period == BillingPeriod.ANNUEL else monthly_price,
-                start_date=datetime.utcnow(),
-                max_users=1,
-                max_products=plan_prices.get("max_products"),
-                max_storage_mb=plan_prices.get("max_storage_mb", 1024),
-                auto_renew=data.auto_renew if hasattr(data, 'auto_renew') else True,
-                created_by=current_user.id
-            )
-            db.add(subscription)
-        
-        db.flush()
-        
-        # Créer un enregistrement de paiement
-        payment = SubscriptionPayment(
-            subscription_id=subscription.id,
-            amount=Decimal(str(data.amount)) if data.amount else subscription.current_price,
-            amount_paid=Decimal(str(data.amount)) if data.amount else subscription.current_price,
-            status=PaymentStatus.COMPLETED,
-            payment_method=data.payment_method,
-            payment_reference=data.reference or f"MANUAL-USER-{subscription.id}",
-            period_start=subscription.start_date,
-            period_end=subscription.end_date,
-            description=f"Activation manuelle utilisateur - {subscription.plan_name}",
-            notes=data.notes,
-            paid_at=datetime.utcnow()
+        price = data.amount if data.amount else (
+            plan_config.get("price_yearly") if data.billing_cycle == "yearly" else plan_config.get("price_monthly")
         )
-        db.add(payment)
+        
+        results = []
+        success_count = 0
+        
+        for pharmacy in pharmacies:
+            existing_sub = get_pharmacy_subscription(db, pharmacy.id)
+            
+            if existing_sub:
+                existing_sub.plan = SubscriptionPlan(plan_type)
+                existing_sub.plan_name = plan_config["name"]
+                existing_sub.start_date = datetime.utcnow()
+                existing_sub.end_date = end_date
+                existing_sub.status = SubscriptionStatus.ACTIVE
+                existing_sub.billing_cycle = data.billing_cycle
+                existing_sub.price = float(price)
+                existing_sub.max_products = limits["max_products"]
+                existing_sub.max_users = limits["max_users"]
+                existing_sub.max_branches = limits["max_branches"]
+                existing_sub.updated_at = datetime.utcnow()
+                subscription = existing_sub
+            else:
+                subscription = PharmacySubscription(
+                    pharmacy_id=pharmacy.id,
+                    plan=SubscriptionPlan(plan_type),
+                    plan_name=plan_config["name"],
+                    start_date=datetime.utcnow(),
+                    end_date=end_date,
+                    status=SubscriptionStatus.ACTIVE,
+                    billing_cycle=data.billing_cycle,
+                    price=float(price),
+                    currency=data.currency or "EUR",
+                    max_products=limits["max_products"],
+                    max_users=limits["max_users"],
+                    max_branches=limits["max_branches"]
+                )
+                db.add(subscription)
+            
+            results.append({
+                "pharmacy_id": str(pharmacy.id),
+                "pharmacy_name": pharmacy.name,
+                "subscription_id": str(subscription.id) if subscription.id else "pending",
+                "status": "activated"
+            })
+            success_count += 1
         
         db.commit()
-        db.refresh(subscription)
         
-        response = {
-            "message": "Abonnement utilisateur activé manuellement avec succès",
+        return {
+            "message": f"Abonnement activé pour {success_count} pharmacies du tenant {tenant.nom_pharmacie}",
             "success": True,
-            "subscription": {
+            "tenant_id": str(tenant_id),
+            "tenant_name": tenant.nom_pharmacie,
+            "total_pharmacies": len(pharmacies),
+            "activated_count": success_count,
+            "subscriptions": results,
+            "plan_details": {
+                "plan": plan_type,
+                "plan_name": plan_config["name"],
+                "billing_cycle": data.billing_cycle,
+                "duration_days": duration_days,
+                "price": float(price),
+                "currency": data.currency or "EUR"
+            },
+            "activated_by": current_user.email,
+            "activated_at": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Erreur lors de l'activation massive: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "bulk_activation_failed", "message": str(e)}
+        )
+
+
+# =============================================================================
+# DÉTAILS D'UNE PHARMACIE
+# =============================================================================
+
+@router.get("/pharmacy/{pharmacy_id}", response_model=Dict[str, Any])
+async def get_pharmacy_subscription_details(
+    pharmacy_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(verify_super_admin)
+):
+    """
+    Récupère les détails complets de l'abonnement d'une pharmacie.
+    """
+    logger.info(f"Demande des détails d'abonnement pour pharmacie {pharmacy_id} par {current_user.email}")
+    
+    try:
+        pharmacy = db.query(Pharmacy).filter(Pharmacy.id == pharmacy_id).first()
+        if not pharmacy:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": "pharmacy_not_found", "message": "Pharmacie non trouvée"}
+            )
+        
+        subscription = get_pharmacy_subscription(db, pharmacy.id)
+        
+        result = {
+            "pharmacy_id": str(pharmacy.id),
+            "pharmacy_name": pharmacy.name,
+            "pharmacy_code": pharmacy.pharmacy_code,
+            "tenant_id": str(pharmacy.tenant_id) if pharmacy.tenant_id else None,
+            "tenant_name": pharmacy.tenant.nom_pharmacie if pharmacy.tenant else None,
+            "is_active": pharmacy.is_active,
+            "subscription": None
+        }
+        
+        if subscription:
+            result["subscription"] = {
                 "id": str(subscription.id),
-                "user_id": str(user.id),
-                "user_email": user.email,
-                "user_name": user.nom_complet,
-                "tenant_id": str(user.tenant_id),
-                "tenant_name": user.tenant.nom_pharmacie if user.tenant else None,
                 "plan": subscription.plan.value,
                 "plan_name": subscription.plan_name,
                 "status": subscription.status.value,
-                "billing_period": subscription.billing_period.value,
-                "start_date": subscription.start_date.isoformat(),
-                "end_date": subscription.end_date.isoformat(),
+                "is_active": subscription.is_active(),
+                "billing_cycle": subscription.billing_cycle,
+                "start_date": subscription.start_date.isoformat() if subscription.start_date else None,
+                "end_date": subscription.end_date.isoformat() if subscription.end_date else None,
                 "days_remaining": subscription.days_remaining(),
-                "current_price": float(subscription.current_price),
-                "activated_by": current_user.email,
-                "activated_at": datetime.utcnow().isoformat()
-            },
-            "payment": {
-                "id": str(payment.id),
-                "amount": float(payment.amount),
-                "payment_method": payment.payment_method.value,
-                "reference": payment.payment_reference
+                "price": float(subscription.price),
+                "currency": subscription.currency,
+                "max_products": subscription.max_products,
+                "max_users": subscription.max_users,
+                "max_branches": subscription.max_branches,
+                "created_at": subscription.created_at.isoformat() if subscription.created_at else None,
+                "updated_at": subscription.updated_at.isoformat() if subscription.updated_at else None
             }
-        }
         
-        logger.info(f"Activation manuelle réussie pour utilisateur {user.email} (plan: {data.plan.value})")
-        return response
+        return result
         
-    except ValueError as e:
-        db.rollback()
-        logger.error(f"Erreur de validation: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": "invalid_request", "message": str(e)}
-        )
+    except HTTPException:
+        raise
     except Exception as e:
-        db.rollback()
-        logger.error(f"Erreur inattendue: {e}", exc_info=True)
+        logger.error(f"Erreur: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"error": "activation_failed", "message": "Erreur lors de l'activation"}
+            detail={"error": "fetch_failed", "message": "Erreur lors de la récupération"}
         )
 
 
 # =============================================================================
-# GESTION DES TENANTS - DÉTAILS DES ABONNEMENTS
+# LISTE DES ABONNEMENTS PAR TENANT
 # =============================================================================
 
 @router.get("/tenant/{tenant_id}", response_model=Dict[str, Any])
-async def get_tenant_subscriptions(
+async def get_tenant_pharmacy_subscriptions(
     tenant_id: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(verify_super_admin)
 ):
     """
-    Récupère tous les abonnements d'un tenant spécifique.
-    Inclut l'abonnement principal du tenant et les abonnements utilisateurs.
-    
-    Args:
-        tenant_id: ID du tenant
-        
-    Returns:
-        Abonnement du tenant et liste des abonnements utilisateurs
+    Récupère tous les abonnements des pharmacies d'un tenant.
     """
     logger.info(f"Demande des abonnements du tenant {tenant_id} par {current_user.email}")
     
@@ -570,67 +596,57 @@ async def get_tenant_subscriptions(
                 detail={"error": "tenant_not_found", "message": "Tenant non trouvé"}
             )
         
-        # Abonnement principal du tenant (celui du propriétaire)
-        main_subscription = None
-        if tenant.owner_id:
-            main_sub = db.query(Subscription).filter(
-                Subscription.tenant_id == tenant_id,
-                Subscription.user_id == tenant.owner_id
-            ).first()
+        pharmacies = db.query(Pharmacy).filter(Pharmacy.tenant_id == tenant_id).all()
+        
+        pharmacy_subs = []
+        active_count = 0
+        expired_count = 0
+        no_subscription_count = 0
+        
+        for pharmacy in pharmacies:
+            sub = get_pharmacy_subscription(db, pharmacy.id)
             
-            if main_sub:
-                main_subscription = {
-                    "id": str(main_sub.id),
-                    "plan": main_sub.plan.value,
-                    "plan_name": main_sub.plan_name,
-                    "status": main_sub.status.value,
-                    "billing_period": main_sub.billing_period.value,
-                    "is_active": main_sub.is_active(),
-                    "is_trial": main_sub.is_trial(),
-                    "start_date": main_sub.start_date.isoformat() if main_sub.start_date else None,
-                    "end_date": main_sub.end_date.isoformat() if main_sub.end_date else None,
-                    "trial_end_date": main_sub.trial_end_date.isoformat() if main_sub.trial_end_date else None,
-                    "days_remaining": main_sub.days_remaining(),
-                    "current_price": float(main_sub.current_price),
-                    "auto_renew": main_sub.auto_renew,
-                    "max_users": main_sub.max_users,
-                    "max_products": main_sub.max_products,
-                    "max_storage_mb": main_sub.max_storage_mb
-                }
-        
-        # Abonnements des autres utilisateurs du tenant
-        user_subs = []
-        users = db.query(User).filter(
-            User.tenant_id == tenant_id,
-            User.id != tenant.owner_id  # Exclure le propriétaire (déjà dans main_subscription)
-        ).all()
-        
-        for user in users:
-            sub = user.subscription
+            sub_info = {
+                "pharmacy_id": str(pharmacy.id),
+                "pharmacy_name": pharmacy.name,
+                "pharmacy_code": pharmacy.pharmacy_code,
+                "is_active": pharmacy.is_active,
+            }
+            
             if sub:
-                user_subs.append({
-                    "user_id": str(user.id),
-                    "user_email": user.email,
-                    "user_name": user.nom_complet,
-                    "user_role": user.role,
+                sub_info.update({
                     "subscription_id": str(sub.id),
                     "plan": sub.plan.value,
                     "plan_name": sub.plan_name,
                     "status": sub.status.value,
-                    "is_active": sub.is_active(),
                     "end_date": sub.end_date.isoformat() if sub.end_date else None,
                     "days_remaining": sub.days_remaining(),
-                    "current_price": float(sub.current_price)
+                    "price": float(sub.price)
                 })
+                
+                if sub.is_active():
+                    active_count += 1
+                else:
+                    expired_count += 1
+            else:
+                sub_info["subscription_id"] = None
+                sub_info["status"] = "no_subscription"
+                no_subscription_count += 1
+            
+            pharmacy_subs.append(sub_info)
         
         return {
             "tenant_id": str(tenant_id),
             "tenant_name": tenant.nom_pharmacie,
             "tenant_code": tenant.tenant_code,
-            "owner_email": tenant.owner.email if tenant.owner else None,
-            "main_subscription": main_subscription,
-            "user_subscriptions": user_subs,
-            "total_users_with_subscription": len(user_subs) + (1 if main_subscription else 0),
+            "total_pharmacies": len(pharmacies),
+            "statistics": {
+                "active_subscriptions": active_count,
+                "expired_subscriptions": expired_count,
+                "no_subscription": no_subscription_count,
+                "coverage_rate": round((active_count + expired_count) / max(len(pharmacies), 1) * 100, 2)
+            },
+            "pharmacies": pharmacy_subs,
             "requested_at": datetime.utcnow().isoformat()
         }
         
@@ -645,99 +661,54 @@ async def get_tenant_subscriptions(
 
 
 # =============================================================================
-# PROLONGATION D'ESSAI - TENANT
+# PROLONGATION D'ABONNEMENT
 # =============================================================================
 
-@router.post("/extend-trial/tenant/{tenant_id}", response_model=Dict[str, Any])
-async def extend_tenant_trial(
-    tenant_id: UUID,
+@router.post("/extend/{pharmacy_id}", response_model=Dict[str, Any])
+async def extend_pharmacy_subscription(
+    pharmacy_id: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(verify_super_admin),
-    extra_days: int = Query(7, ge=1, le=30, description="Nombre de jours supplémentaires (1-30)")
+    extra_days: int = Query(30, ge=1, le=365, description="Nombre de jours supplémentaires (1-365)")
 ):
     """
-    Prolonge la période d'essai d'un tenant.
-    
-    Args:
-        tenant_id: ID du tenant
-        extra_days: Nombre de jours supplémentaires
-        
-    Returns:
-        Confirmation de la prolongation
+    Prolonge l'abonnement d'une pharmacie.
     """
-    logger.info(f"Prolongation d'essai tenant demandée par {current_user.email} pour {tenant_id} (+{extra_days} jours)")
+    logger.info(f"Prolongation d'abonnement demandée par {current_user.email} pour pharmacie {pharmacy_id} (+{extra_days} jours)")
     
     try:
-        tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
-        if not tenant:
+        pharmacy = db.query(Pharmacy).filter(Pharmacy.id == pharmacy_id).first()
+        if not pharmacy:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail={"error": "tenant_not_found", "message": "Tenant non trouvé"}
+                detail={"error": "pharmacy_not_found", "message": "Pharmacie non trouvée"}
             )
         
-        if not tenant.owner_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={"error": "no_owner", "message": "Le tenant n'a pas de propriétaire"}
-            )
-        
-        subscription = db.query(Subscription).filter(
-            Subscription.tenant_id == tenant_id,
-            Subscription.user_id == tenant.owner_id
-        ).first()
+        subscription = get_pharmacy_subscription(db, pharmacy.id)
         
         if not subscription:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail={"error": "no_subscription", "message": "Aucun abonnement trouvé pour ce tenant"}
+                detail={"error": "no_subscription", "message": "Aucun abonnement trouvé pour cette pharmacie"}
             )
         
-        if subscription.status != SubscriptionStatus.TRIAL:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error": "not_in_trial",
-                    "message": "Le tenant n'est pas en période d'essai",
-                    "current_status": subscription.status.value
-                }
-            )
-        
-        # Prolonger l'essai
+        # Prolonger l'abonnement
         old_end = subscription.end_date
         new_end = old_end + timedelta(days=extra_days)
         
         subscription.end_date = new_end
-        subscription.trial_end_date = new_end
-        
-        # Ajouter une trace dans les métadonnées
-        import json
-        meta_data = {}
-        if subscription.meta_data:
-            try:
-                meta_data = json.loads(subscription.meta_data)
-            except:
-                pass
-        
-        meta_data["trial_extended"] = {
-            "extended_by": str(current_user.id),
-            "extended_by_email": current_user.email,
-            "extended_at": datetime.utcnow().isoformat(),
-            "extra_days": extra_days,
-            "old_end_date": old_end.isoformat(),
-            "new_end_date": new_end.isoformat()
-        }
-        subscription.meta_data = json.dumps(meta_data)
+        subscription.status = SubscriptionStatus.ACTIVE
         subscription.updated_at = datetime.utcnow()
         
         db.commit()
         
-        logger.info(f"Prolongation d'essai réussie pour tenant {tenant.nom_pharmacie}: {old_end} -> {new_end}")
+        logger.info(f"Prolongation réussie pour pharmacie {pharmacy.name}: {old_end} -> {new_end}")
         
         return {
-            "message": f"Période d'essai du tenant prolongée de {extra_days} jours",
+            "message": f"Abonnement prolongé de {extra_days} jours",
             "success": True,
-            "tenant_id": str(tenant.id),
-            "tenant_name": tenant.nom_pharmacie,
+            "pharmacy_id": str(pharmacy.id),
+            "pharmacy_name": pharmacy.name,
             "old_end_date": old_end.isoformat(),
             "new_end_date": new_end.isoformat(),
             "days_remaining": subscription.days_remaining(),
@@ -748,109 +719,7 @@ async def extend_tenant_trial(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Erreur lors de la prolongation d'essai: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"error": "extension_failed", "message": "Erreur lors de la prolongation"}
-        )
-
-
-# =============================================================================
-# PROLONGATION D'ESSAI - UTILISATEUR
-# =============================================================================
-
-@router.post("/extend-trial/user/{user_id}", response_model=Dict[str, Any])
-async def extend_user_trial(
-    user_id: UUID,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(verify_super_admin),
-    extra_days: int = Query(7, ge=1, le=30, description="Nombre de jours supplémentaires (1-30)")
-):
-    """
-    Prolonge la période d'essai d'un utilisateur.
-    
-    Args:
-        user_id: ID de l'utilisateur
-        extra_days: Nombre de jours supplémentaires
-        
-    Returns:
-        Confirmation de la prolongation
-    """
-    logger.info(f"Prolongation d'essai utilisateur demandée par {current_user.email} pour {user_id} (+{extra_days} jours)")
-    
-    try:
-        user = db.query(User).filter(User.id == user_id).first()
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={"error": "user_not_found", "message": "Utilisateur non trouvé"}
-            )
-        
-        subscription = user.subscription
-        if not subscription:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={"error": "no_subscription", "message": "L'utilisateur n'a pas d'abonnement"}
-            )
-        
-        if subscription.status != SubscriptionStatus.TRIAL:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error": "not_in_trial",
-                    "message": "L'utilisateur n'est pas en période d'essai",
-                    "current_status": subscription.status.value
-                }
-            )
-        
-        # Prolonger l'essai
-        old_end = subscription.end_date
-        new_end = old_end + timedelta(days=extra_days)
-        
-        subscription.end_date = new_end
-        subscription.trial_end_date = new_end
-        
-        # Ajouter une trace dans les métadonnées
-        import json
-        meta_data = {}
-        if subscription.meta_data:
-            try:
-                meta_data = json.loads(subscription.meta_data)
-            except:
-                pass
-        
-        meta_data["trial_extended"] = {
-            "extended_by": str(current_user.id),
-            "extended_by_email": current_user.email,
-            "extended_at": datetime.utcnow().isoformat(),
-            "extra_days": extra_days,
-            "old_end_date": old_end.isoformat(),
-            "new_end_date": new_end.isoformat()
-        }
-        subscription.meta_data = json.dumps(meta_data)
-        subscription.updated_at = datetime.utcnow()
-        
-        db.commit()
-        
-        logger.info(f"Prolongation d'essai réussie pour utilisateur {user.email}: {old_end} -> {new_end}")
-        
-        return {
-            "message": f"Période d'essai de l'utilisateur prolongée de {extra_days} jours",
-            "success": True,
-            "user_id": str(user.id),
-            "user_email": user.email,
-            "user_name": user.nom_complet,
-            "old_end_date": old_end.isoformat(),
-            "new_end_date": new_end.isoformat(),
-            "days_remaining": subscription.days_remaining(),
-            "extended_by": current_user.email,
-            "extended_at": datetime.utcnow().isoformat()
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Erreur lors de la prolongation d'essai: {e}", exc_info=True)
+        logger.error(f"Erreur lors de la prolongation: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"error": "extension_failed", "message": "Erreur lors de la prolongation"}
@@ -867,55 +736,66 @@ async def get_subscription_statistics(
     current_user: User = Depends(verify_super_admin)
 ):
     """
-    Statistiques avancées sur les abonnements.
+    Statistiques avancées sur les abonnements des pharmacies.
     """
     logger.info(f"Demande de statistiques avancées par {current_user.email}")
     
     try:
-        # Statistiques des abonnements tenants
-        tenant_subs = db.query(Subscription).join(Tenant, Subscription.tenant_id == Tenant.id)
+        # Statistiques globales
+        total_pharmacies = db.query(Pharmacy).count()
+        pharmacies_with_subscription = db.query(PharmacySubscription).distinct(PharmacySubscription.pharmacy_id).count()
         
-        total_tenant_subs = tenant_subs.count()
-        active_tenant_subs = tenant_subs.filter(Subscription.status == SubscriptionStatus.ACTIVE).count()
-        trial_tenant_subs = tenant_subs.filter(Subscription.status == SubscriptionStatus.TRIAL).count()
+        # Statistiques par statut
+        status_stats = db.query(
+            PharmacySubscription.status,
+            func.count(PharmacySubscription.id).label("count")
+        ).group_by(PharmacySubscription.status).all()
         
-        # Statistiques des abonnements utilisateurs (hors propriétaires)
-        user_subs = db.query(Subscription).join(User).filter(User.role != "admin")
-        total_user_subs = user_subs.count()
-        active_user_subs = user_subs.filter(Subscription.status == SubscriptionStatus.ACTIVE).count()
-        trial_user_subs = user_subs.filter(Subscription.status == SubscriptionStatus.TRIAL).count()
+        # Statistiques par plan
+        plan_stats = db.query(
+            PharmacySubscription.plan,
+            func.count(PharmacySubscription.id).label("count")
+        ).group_by(PharmacySubscription.plan).all()
         
-        # Répartition par plan
-        plans_distribution = {}
-        for plan in SubscriptionPlan:
-            count = db.query(Subscription).filter(Subscription.plan == plan).count()
-            if count > 0:
-                plans_distribution[plan.value] = count
+        # Abonnements expirant dans les 30 jours
+        now = datetime.utcnow()
+        expiring_soon = db.query(PharmacySubscription).filter(
+            PharmacySubscription.status == SubscriptionStatus.ACTIVE,
+            PharmacySubscription.end_date.between(now, now + timedelta(days=30))
+        ).count()
         
-        # Calcul des revenus
-        active_subs = db.query(Subscription).filter(Subscription.status == SubscriptionStatus.ACTIVE).all()
-        monthly_revenue = sum([float(sub.current_price) for sub in active_subs])
+        # Abonnements expirés
+        expired = db.query(PharmacySubscription).filter(
+            PharmacySubscription.status == SubscriptionStatus.EXPIRED
+        ).count()
+        
+        # Calcul des revenus mensuels récurrents (MRR)
+        active_subs = db.query(PharmacySubscription).filter(
+            PharmacySubscription.status == SubscriptionStatus.ACTIVE
+        ).all()
+        
+        monthly_revenue = sum([float(sub.price) for sub in active_subs if sub.billing_cycle == "monthly"])
+        yearly_revenue = sum([float(sub.price) / 12 for sub in active_subs if sub.billing_cycle == "yearly"])
+        total_mrr = round(monthly_revenue + yearly_revenue, 2)
         
         return {
             "timestamp": datetime.utcnow().isoformat(),
-            "tenants": {
-                "total_subscriptions": total_tenant_subs,
-                "active": active_tenant_subs,
-                "trial": trial_tenant_subs,
-                "conversion_rate": round(active_tenant_subs / max(trial_tenant_subs + active_tenant_subs, 1) * 100, 2)
+            "overview": {
+                "total_pharmacies": total_pharmacies,
+                "pharmacies_with_subscription": pharmacies_with_subscription,
+                "coverage_rate": round(pharmacies_with_subscription / max(total_pharmacies, 1) * 100, 2)
             },
-            "users": {
-                "total_subscriptions": total_user_subs,
-                "active": active_user_subs,
-                "trial": trial_user_subs,
-                "conversion_rate": round(active_user_subs / max(trial_user_subs + active_user_subs, 1) * 100, 2)
+            "by_status": {status.value: count for status, count in status_stats},
+            "by_plan": {plan.value: count for plan, count in plan_stats},
+            "alerts": {
+                "expiring_soon_30d": expiring_soon,
+                "expired": expired
             },
-            "plans_distribution": plans_distribution,
             "revenue": {
-                "monthly_recurring": round(monthly_revenue, 2),
-                "annual_projected": round(monthly_revenue * 12, 2)
-            },
-            "plans_config": {k.value: v for k, v in PLAN_CONFIG.items()}
+                "monthly_recurring_revenue": total_mrr,
+                "annual_projected": round(total_mrr * 12, 2),
+                "average_revenue_per_pharmacy": round(total_mrr / max(pharmacies_with_subscription, 1), 2)
+            }
         }
         
     except Exception as e:
@@ -931,86 +811,81 @@ async def get_subscription_statistics(
 # =============================================================================
 
 @router.get("/search", response_model=Dict[str, Any])
-async def search_subscriptions(
+async def search_pharmacy_subscriptions(
     db: Session = Depends(get_db),
     current_user: User = Depends(verify_super_admin),
     query: str = Query(..., min_length=2, description="Terme de recherche"),
-    subscription_type: Optional[str] = Query(None, regex="^(tenant|user)$", description="Type d'abonnement"),
-    status: Optional[str] = Query(None, regex="^(active|trial|expired|suspended|cancelled)$")
+    status: Optional[str] = Query(None, regex="^(active|expired|trial|cancelled)$", description="Statut de l'abonnement"),
+    plan: Optional[str] = Query(None, regex="^(starter|professional|enterprise)$", description="Type de plan"),
+    tenant_id: Optional[UUID] = Query(None, description="ID du tenant")
 ):
     """
-    Recherche d'abonnements par email, nom ou tenant.
+    Recherche d'abonnements par nom de pharmacie, code ou tenant.
     """
     logger.info(f"Recherche d'abonnements: '{query}' par {current_user.email}")
     
     try:
         search_pattern = f"%{query.lower()}%"
+        
+        # Requête de base: pharmacies avec leurs abonnements
+        pharmacy_query = db.query(Pharmacy, PharmacySubscription).outerjoin(
+            PharmacySubscription, PharmacySubscription.pharmacy_id == Pharmacy.id
+        )
+        
+        # Filtre de recherche
+        pharmacy_query = pharmacy_query.filter(
+            or_(
+                Pharmacy.name.ilike(search_pattern),
+                Pharmacy.pharmacy_code.ilike(search_pattern),
+                Pharmacy.city.ilike(search_pattern)
+            )
+        )
+        
+        if tenant_id:
+            pharmacy_query = pharmacy_query.filter(Pharmacy.tenant_id == tenant_id)
+        
         results = []
-        
-        # Recherche d'abonnements tenants
-        if not subscription_type or subscription_type == "tenant":
-            tenant_subs = db.query(Subscription).join(Tenant).filter(
-                or_(
-                    Tenant.nom_pharmacie.ilike(search_pattern),
-                    Tenant.tenant_code.ilike(search_pattern),
-                    Tenant.email.ilike(search_pattern)
-                )
-            )
+        for pharmacy, subscription in pharmacy_query.limit(50).all():
+            result_item = {
+                "pharmacy_id": str(pharmacy.id),
+                "pharmacy_name": pharmacy.name,
+                "pharmacy_code": pharmacy.pharmacy_code,
+                "city": pharmacy.city,
+                "tenant_id": str(pharmacy.tenant_id) if pharmacy.tenant_id else None,
+                "tenant_name": pharmacy.tenant.nom_pharmacie if pharmacy.tenant else None,
+            }
             
-            if status:
-                tenant_subs = tenant_subs.filter(Subscription.status == status)
+            if subscription:
+                # Filtrer par statut si spécifié
+                if status and subscription.status.value != status:
+                    continue
+                # Filtrer par plan si spécifié
+                if plan and subscription.plan.value != plan:
+                    continue
+                    
+                result_item["subscription"] = {
+                    "id": str(subscription.id),
+                    "plan": subscription.plan.value,
+                    "plan_name": subscription.plan_name,
+                    "status": subscription.status.value,
+                    "is_active": subscription.is_active(),
+                    "end_date": subscription.end_date.isoformat() if subscription.end_date else None,
+                    "days_remaining": subscription.days_remaining(),
+                    "price": float(subscription.price)
+                }
+            else:
+                if status or plan:
+                    continue  # Filtrer les pharmacies sans abonnement si on filtre par statut/plan
+                result_item["subscription"] = None
             
-            for sub in tenant_subs.limit(50).all():
-                tenant = sub.tenant
-                results.append({
-                    "type": "tenant",
-                    "tenant_id": str(tenant.id) if tenant else None,
-                    "tenant_name": tenant.nom_pharmacie if tenant else None,
-                    "tenant_code": tenant.tenant_code if tenant else None,
-                    "subscription_id": str(sub.id),
-                    "plan": sub.plan.value,
-                    "plan_name": sub.plan_name,
-                    "status": sub.status.value,
-                    "is_active": sub.is_active(),
-                    "end_date": sub.end_date.isoformat() if sub.end_date else None,
-                    "days_remaining": sub.days_remaining()
-                })
-        
-        # Recherche d'abonnements utilisateurs
-        if not subscription_type or subscription_type == "user":
-            user_subs = db.query(Subscription).join(User).filter(
-                or_(
-                    User.email.ilike(search_pattern),
-                    User.nom_complet.ilike(search_pattern)
-                )
-            )
-            
-            if status:
-                user_subs = user_subs.filter(Subscription.status == status)
-            
-            for sub in user_subs.limit(50).all():
-                user = sub.user
-                results.append({
-                    "type": "user",
-                    "user_id": str(user.id) if user else None,
-                    "user_email": user.email if user else None,
-                    "user_name": user.nom_complet if user else None,
-                    "tenant_id": str(user.tenant_id) if user and user.tenant_id else None,
-                    "tenant_name": user.tenant.nom_pharmacie if user and user.tenant else None,
-                    "subscription_id": str(sub.id),
-                    "plan": sub.plan.value,
-                    "plan_name": sub.plan_name,
-                    "status": sub.status.value,
-                    "is_active": sub.is_active(),
-                    "end_date": sub.end_date.isoformat() if sub.end_date else None,
-                    "days_remaining": sub.days_remaining()
-                })
+            results.append(result_item)
         
         return {
             "query": query,
             "filters": {
-                "subscription_type": subscription_type,
-                "status": status
+                "status": status,
+                "plan": plan,
+                "tenant_id": str(tenant_id) if tenant_id else None
             },
             "total_results": len(results),
             "results": results,
@@ -1036,7 +911,8 @@ async def health_check():
     """
     return {
         "status": "healthy",
-        "service": "super-admin-subscriptions-api",
+        "service": "super-admin-pharmacy-subscriptions-api",
         "timestamp": datetime.utcnow().isoformat(),
-        "plans_available": [plan.value for plan in SubscriptionPlan]
+        "model": "PharmacySubscription (abonnement par pharmacie/branche)",
+        "plans_available": list(PLAN_CONFIG.keys())
     }

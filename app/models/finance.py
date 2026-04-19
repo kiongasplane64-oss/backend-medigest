@@ -178,7 +178,7 @@ class Expense(Base):
     tenant = relationship("Tenant", back_populates="expenses")
     branch = relationship("Branch", foreign_keys=[branch_id], back_populates="expenses")
     user = relationship("User", foreign_keys=[user_id], back_populates="expenses")
-    approver = relationship("User", foreign_keys=[approved_by])
+    approver = relationship("User", foreign_keys=[approved_by], overlaps="expenses_approved")
 
     financial_transaction = relationship(
         "FinancialTransaction",

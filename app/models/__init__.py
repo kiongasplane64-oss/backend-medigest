@@ -50,7 +50,7 @@ from app.models.order import Order, OrderStatus, PaymentStatus
 from app.models.capital import Capital, CapitalAccount, CapitalTransaction, Turnover
 from app.models.user_history import UserHistory
 from app.models.trash_bin import TrashBin
-from .user_expense import UserExpense 
+from app.models.user_expense import UserExpense 
 
 __all__ = [
     # Core

@@ -93,6 +93,7 @@ class ExpenseUpdate(BaseModel):
     expense_type: Optional[ExpenseType] = None
     amount: Optional[Decimal] = Field(None, gt=0, decimal_places=2)
     tax_amount: Optional[Decimal] = Field(None, ge=0, decimal_places=2)
+    total_amount: Optional[Decimal] = Field(None, decimal_places=2)
     supplier: Optional[str] = Field(None, max_length=200)
     payee: Optional[str] = Field(None, max_length=200)
     payment_method: Optional[PaymentMethod] = None
@@ -101,6 +102,9 @@ class ExpenseUpdate(BaseModel):
     notes: Optional[str] = None
     invoice_number: Optional[str] = Field(None, max_length=100)
     invoice_date: Optional[date] = None
+    is_recurring: Optional[bool] = None
+    recurrence_interval: Optional[str] = Field(None, max_length=30)
+    next_due_date: Optional[date] = None
     cost_center: Optional[str] = Field(None, max_length=100)
     project_code: Optional[str] = Field(None, max_length=50)
     
@@ -108,9 +112,11 @@ class ExpenseUpdate(BaseModel):
     def calculate_total_amount(cls, v, values):
         if v is not None:
             return v
-        if 'amount' in values and 'tax_amount' in values:
-            return values['amount'] + values['tax_amount']
-        return None
+        amount = values.get('amount')
+        tax = values.get('tax_amount')
+        if amount is not None and tax is not None:
+            return amount + tax
+        return v
 
 # =====================================
 # APPROVAL SCHEMA
