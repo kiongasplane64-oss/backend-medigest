@@ -454,10 +454,9 @@ def create_refresh_token(data: dict, expires_delta: Optional[timedelta] = None) 
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
-def create_token_pair(user: User, subscription_active: bool, branch_id: Optional[str] = None) -> dict:  # CHANGÉ: pharmacy_id -> branch_id
+def create_token_pair(user: User, subscription_active: bool, branch_id: Optional[str] = None) -> dict:
     """Génère un couple access_token + refresh_token cohérent."""
     
-    # Récupérer la durée d'expiration depuis settings
     access_expire_minutes = getattr(settings, 'ACCESS_TOKEN_EXPIRE_MINUTES', 43200)
     refresh_expire_days = getattr(settings, 'REFRESH_TOKEN_EXPIRE_DAYS', 60)
     
@@ -467,15 +466,17 @@ def create_token_pair(user: User, subscription_active: bool, branch_id: Optional
         "role": user.role,
         "email": user.email,
         "subscription_active": subscription_active,
-        "branch_id": branch_id,  # CHANGÉ: pharmacy_id -> branch_id
+        "branch_id": branch_id,
         "type": "access"
     }
 
+    # ✅ CORRECTION : Ajouter branch_id au refresh token aussi
     refresh_payload = {
         "sub": str(user.id),
         "tenant_id": str(user.tenant_id) if user.tenant_id else None,
         "role": user.role,
         "email": user.email,
+        "branch_id": branch_id,  # ← AJOUTER CETTE LIGNE
         "type": "refresh"
     }
 
@@ -924,8 +925,7 @@ def verify_subscription(
     db: Session = Depends(get_db)
 ):
     """
-    Vérifie si l'abonnement est actif.
-    Si l'abonnement est expiré, l'utilisateur doit se reconnecter.
+    Vérifie si l'abonnement est actif (basé sur la branche active).
     """
     if not current_user.tenant_id:
         return {
@@ -933,20 +933,36 @@ def verify_subscription(
             "message": "Compte sans abonnement requis"
         }
     
-    subscription_active = is_subscription_active(db, str(current_user.tenant_id))
+    # ✅ CORRECTION : Utiliser active_branch_id au lieu de tenant_id
+    branch_id = current_user.active_branch_id
+    if not branch_id:
+        # Fallback: trouver la branche principale
+        main_branch = db.query(Branch).filter(
+            Branch.tenant_id == current_user.tenant_id,
+            Branch.is_main_branch == True
+        ).first()
+        if main_branch:
+            branch_id = main_branch.id
+    
+    if not branch_id:
+        return {
+            "subscription_active": True,
+            "message": "Aucune branche trouvée"
+        }
+    
+    subscription_active = is_subscription_active(db, str(branch_id))
     
     if not subscription_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
                 "error": "subscription_expired",
-                "message": "Votre abonnement a expiré",
+                "message": "L'abonnement de votre succursale a expiré",
                 "requires_relogin": True,
-                "action": "Veuillez renouveler votre abonnement et vous reconnecter"
+                "action": "Veuillez renouveler l'abonnement de votre succursale"
             }
         )
     
-    # Récupérer le tenant pour plus d'informations
     tenant = db.query(Tenant).filter(Tenant.id == current_user.tenant_id).first()
     
     return {
@@ -954,7 +970,6 @@ def verify_subscription(
         "current_plan": tenant.current_plan if tenant else None,
         "trial_end_date": tenant.trial_end_date.isoformat() if tenant and tenant.trial_end_date else None
     }
-
 # =========================
 # ENDPOINTS DE CONNEXION (SANS OTP)
 # =========================
@@ -1435,7 +1450,13 @@ def get_me(
         ).order_by(Pharmacy.is_main.desc(), Pharmacy.name).all()
 
         current_pharmacy = next((p for p in pharmacies if p.is_main), pharmacies[0] if pharmacies else None)
-        subscription_active = is_subscription_active(db, str(current_user.tenant_id))
+        
+        # ✅ CORRECTION : Utiliser active_branch_id
+        branch_id = current_user.active_branch_id
+        if branch_id:
+            subscription_active = is_subscription_active(db, str(branch_id))
+        else:
+            subscription_active = True
 
     return {
         "user": {
@@ -1460,7 +1481,6 @@ def get_me(
             "pharmacy_code": current_pharmacy.pharmacy_code
         } if current_pharmacy else None
     }
-
 
 @router.get("/tenants/me")
 def get_current_tenant_info(
@@ -1538,12 +1558,30 @@ def get_subscription_status(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Récupère le statut de l'abonnement actuel"""
+    """Récupère le statut de l'abonnement de la branche active"""
     tenant = db.query(Tenant).filter(Tenant.id == current_user.tenant_id).first()
     if not tenant:
         raise HTTPException(404, "Tenant non trouvé")
     
-    subscription_active = is_subscription_active(db, str(current_user.tenant_id))
+    # ✅ CORRECTION : Utiliser active_branch_id
+    branch_id = current_user.active_branch_id
+    if not branch_id:
+        main_branch = db.query(Branch).filter(
+            Branch.tenant_id == current_user.tenant_id,
+            Branch.is_main_branch == True
+        ).first()
+        if main_branch:
+            branch_id = main_branch.id
+    
+    subscription_active = is_subscription_active(db, str(branch_id)) if branch_id else True
+    
+    # Récupérer l'abonnement de la branche
+    branch_subscription = None
+    if branch_id:
+        from app.models.branch_subscription import BranchSubscription
+        branch_subscription = db.query(BranchSubscription).filter(
+            BranchSubscription.branch_id == branch_id
+        ).first()
     
     last_payment = db.query(Payment).filter(
         Payment.tenant_id == current_user.tenant_id,
@@ -1554,9 +1592,9 @@ def get_subscription_status(
     is_expired = False
     is_near_expiry = False
     
-    if tenant.trial_end_date:
+    if branch_subscription and branch_subscription.end_date:
         now = datetime.utcnow()
-        days_remaining = (tenant.trial_end_date - now).days
+        days_remaining = (branch_subscription.end_date - now).days
         
         if days_remaining < 0:
             is_expired = True
@@ -1567,16 +1605,17 @@ def get_subscription_status(
         "tenant_id": str(tenant.id),
         "tenant_code": tenant.tenant_code,
         "tenant_status": tenant.status,
-        "current_plan": tenant.current_plan,
-        "plan_name": tenant.config.get("plan_name") if tenant.config else tenant.current_plan.capitalize(),
+        "branch_id": str(branch_id) if branch_id else None,
+        "current_plan": branch_subscription.plan if branch_subscription else tenant.current_plan,
+        "plan_name": branch_subscription.plan_name if branch_subscription else (tenant.config.get("plan_name") if tenant.config else tenant.current_plan.capitalize()),
         "subscription_active": subscription_active,
-        "trial_end_date": tenant.trial_end_date.isoformat() if tenant.trial_end_date else None,
+        "trial_end_date": branch_subscription.end_date.isoformat() if branch_subscription and branch_subscription.end_date else None,
         "days_remaining": days_remaining,
         "is_expired": is_expired,
         "is_near_expiry": is_near_expiry,
         "limits": {
-            "max_users": tenant.max_users,
-            "max_products": tenant.max_products,
+            "max_users": branch_subscription.max_users if branch_subscription else tenant.max_users,
+            "max_products": branch_subscription.max_products if branch_subscription else tenant.max_products,
             "max_pharmacies": tenant.max_pharmacies
         },
         "last_payment": {
@@ -1586,7 +1625,6 @@ def get_subscription_status(
             "paid_at": last_payment.paid_at.isoformat() if last_payment and last_payment.paid_at else None
         } if last_payment else None
     }
-
 
 @router.post("/subscription/payment")
 def create_subscription_payment(

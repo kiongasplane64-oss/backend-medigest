@@ -18,6 +18,7 @@ def process_sync(
     db: Session,
     tenant_id: UUID,
     items: List[Any],
+    user_branch_id: Optional[UUID] = None,
 ) -> Dict[str, Any]:
     """
     Traite les données de synchronisation envoyées par un client mobile.
@@ -130,7 +131,9 @@ def process_sync(
 def get_changes_since(
     db: Session,
     tenant_id: UUID,
-    since: Optional[datetime] = None
+    since: Optional[datetime] = None,
+    branch_id: Optional[UUID] = None, 
+    user_id: Optional[UUID] = None
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     Récupère tous les changements depuis une date pour toutes les entités.

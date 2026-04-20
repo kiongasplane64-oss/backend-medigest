@@ -41,12 +41,24 @@ def sync_data(
     - Filtre automatiquement les items avec des données nulles
     - Valide les actions et les noms de tables
     - Supporte les noms de tables en français et anglais
+    - Vérifie les droits d'accès par branche
     - Retourne un rapport détaillé des traitements
     """
+    
+    # ✅ Récupérer la branche active de l'utilisateur
+    user_branch_id = None
+    if hasattr(user, 'active_branch_id') and user.active_branch_id:
+        user_branch_id = user.active_branch_id
+    elif hasattr(user, 'branch_id') and user.branch_id:
+        user_branch_id = user.branch_id
+    
+    # ✅ Vérifier si l'utilisateur est super admin
+    is_super_admin = user.role in ["super_admin", "superadmin"]
     
     # 1. Filtrer les items valides et invalides
     valid_items: List[SyncItem] = []
     invalid_items: List[Dict[str, Any]] = []
+    permission_errors: List[Dict[str, Any]] = []  # ✅ Nouveau: erreurs de permission
     
     for item in payload.items:
         errors = []
@@ -62,7 +74,7 @@ def sync_data(
                     # Français -> Anglais
                     'produits': 'products', 'produit': 'products',
                     'catégories': 'categories', 'categorie': 'categories', 'categories': 'categories',
-                    'commandes': 'sales', 'commande': 'sales',  # Changé de orders à sales
+                    'commandes': 'sales', 'commande': 'sales',
                     'clients': 'customers', 'client': 'customers',
                     'factures': 'invoices', 'facture': 'invoices',
                     'utilisateurs': 'users', 'utilisateur': 'users',
@@ -115,6 +127,24 @@ def sync_data(
             if not any(item.data.values()):
                 errors.append("Les données ne peuvent pas être vides pour la création")
         
+        # ✅ VALIDATION DES PERMISSIONS PAR BRANCHE (sauf pour super admin)
+        if not is_super_admin and user_branch_id and item.data:
+            tables_requiring_branch_check = ['products', 'sales', 'debts', 'customers', 
+                                              'stock_movements', 'expenses', 'returns']
+            normalized_table = table_mapping.get(item.table_name.lower(), item.table_name.lower())
+            
+            if normalized_table in tables_requiring_branch_check:
+                # Vérifier que la donnée appartient à la branche de l'utilisateur
+                data_branch_id = item.data.get('branch_id')
+                if data_branch_id and str(data_branch_id) != str(user_branch_id):
+                    permission_errors.append({
+                        "item": item.model_dump() if hasattr(item, 'model_dump') else item.__dict__,
+                        "error": f"Accès non autorisé: cette donnée appartient à une autre branche",
+                        "user_branch": str(user_branch_id),
+                        "data_branch": str(data_branch_id)
+                    })
+                    continue  # ✅ Ignorer cet item
+        
         if errors:
             invalid_items.append({
                 "item": item.model_dump() if hasattr(item, 'model_dump') else item.__dict__,
@@ -127,7 +157,7 @@ def sync_data(
                                            'factures', 'facture', 'utilisateurs', 'utilisateur',
                                            'abonnements', 'abonnement', 'ventes', 'vente',
                                            'dettes', 'dette', 'retours', 'retour']:
-                table_mapping = {
+                table_mapping_normalize = {
                     'produits': 'products', 'produit': 'products',
                     'catégories': 'categories', 'categorie': 'categories',
                     'commandes': 'orders', 'commande': 'orders',
@@ -139,11 +169,11 @@ def sync_data(
                     'dettes': 'debts', 'dette': 'debts',
                     'retours': 'returns', 'retour': 'returns'
                 }
-                item.table_name = table_mapping.get(item.table_name.lower(), item.table_name)
+                item.table_name = table_mapping_normalize.get(item.table_name.lower(), item.table_name)
             valid_items.append(item)
     
     # 2. Si tous les items sont invalides
-    if not valid_items:
+    if not valid_items and not permission_errors:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
@@ -151,7 +181,8 @@ def sync_data(
                 "invalid_items": invalid_items,
                 "total_items": len(payload.items)
             }
-        )  
+        )
+    
     # 3. Logger les items filtrés
     if invalid_items:
         logger.warning(
@@ -159,18 +190,38 @@ def sync_data(
             f"{[item['errors'] for item in invalid_items]}"
         )
     
-    # 4. Traiter les items valides
+    if permission_errors:
+        logger.warning(
+            f"{len(permission_errors)} item(s) rejeté(s) pour cause de permissions de branche "
+            f"pour l'utilisateur {user.id} (branche: {user_branch_id})"
+        )
+    
+    # 4. Traiter les items valides avec la branche utilisateur
     try:
-        process_sync(db, user.tenant_id, valid_items)
+        result = process_sync(
+            db, 
+            user.tenant_id, 
+            valid_items,
+            user_branch_id=user_branch_id,  # ✅ Passer la branche pour validation supplémentaire
+            user_id=user.id,
+            is_super_admin=is_super_admin
+        )
         
-        return {
+        # ✅ Construire la réponse avec les informations de branche
+        response = {
             "status": "success",
             "message": "Synchronisation traitée avec succès",
             "tenant_id": str(user.tenant_id),
+            "user_id": str(user.id),
+            "user_name": user.nom_complet,
+            "user_role": user.role,
+            "branch_id": str(user_branch_id) if user_branch_id else None,
+            "is_super_admin": is_super_admin,
             "summary": {
                 "total_items": len(payload.items),
                 "processed_items": len(valid_items),
                 "ignored_items": len(invalid_items),
+                "permission_errors": len(permission_errors),
                 "success": True
             },
             "details": {
@@ -183,9 +234,19 @@ def sync_data(
                     for item in valid_items[:10]
                 ] if valid_items else [],
                 "ignored": invalid_items if invalid_items else None,
-                "processed_tables": list(set(item.table_name for item in valid_items))
+                "permission_errors": permission_errors if permission_errors else None,
+                "processed_tables": list(set(item.table_name for item in valid_items)) if valid_items else []
             }
         }
+        
+        # ✅ Ajouter les résultats du traitement si disponibles
+        if result:
+            response["processing_results"] = {
+                "successful": result.get("processed", 0),
+                "errors": result.get("errors", [])
+            }
+        
+        return response
         
     except Exception as e:
         logger.error(
@@ -199,10 +260,12 @@ def sync_data(
                 "error": "Erreur lors du traitement de la synchronisation",
                 "message": str(e),
                 "tenant_id": str(user.tenant_id),
+                "user_id": str(user.id),
+                "branch_id": str(user_branch_id) if user_branch_id else None,
                 "processed_items": len(valid_items) if valid_items else 0
             }
         )
-
+    
 @router.get("/pull")
 def pull_data(
     last_sync: Optional[str] = None,
@@ -222,16 +285,33 @@ def pull_data(
                     detail="Format de date invalide. Utilisez le format ISO (YYYY-MM-DDTHH:MM:SS)"
                 )
         
-        changes = get_changes_since(db, user.tenant_id, last_sync_dt)
+        # ✅ Récupérer la branche active de l'utilisateur
+        active_branch_id = None
+        if hasattr(user, 'active_branch_id') and user.active_branch_id:
+            active_branch_id = user.active_branch_id
+        elif hasattr(user, 'branch_id') and user.branch_id:
+            active_branch_id = user.branch_id
+        
+        # ✅ Si l'utilisateur n'est pas super_admin, filtrer par sa branche
+        is_super_admin = user.role in ["super_admin", "superadmin"]
+        
+        changes = get_changes_since(
+            db, 
+            user.tenant_id, 
+            last_sync_dt,
+            branch_id=active_branch_id if not is_super_admin else None,
+            user_id=user.id
+        )
         
         return {
             "status": "success",
             "message": "Données récupérées avec succès",
             "tenant_id": str(user.tenant_id),
+            "branch_id": str(active_branch_id) if active_branch_id else None,
             "last_sync": last_sync,
             "timestamp": datetime.utcnow().isoformat(),
             "data": changes,
-            "count": len(changes)
+            "count": sum(len(v) for v in changes.values())
         }
         
     except HTTPException:
@@ -242,7 +322,7 @@ def pull_data(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"error": "Erreur lors de la récupération des données", "message": str(e), "tenant_id": str(user.tenant_id)}
         )
-
+    
 @router.post("/sales/with-conflict-handling")
 async def sync_sales_with_conflict_handling(
     payload: dict,
@@ -2355,6 +2435,39 @@ def sync_users(
         "processed": processed,
         "synced_ids": synced_ids,
         "errors": errors
+    }
+
+@router.get("/user/branch")
+def get_user_branch(
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
+    """Récupère la branche active de l'utilisateur pour la synchronisation"""
+    from app.models.branch import Branch
+    
+    branch_id = None
+    if hasattr(user, 'active_branch_id') and user.active_branch_id:
+        branch_id = user.active_branch_id
+    elif hasattr(user, 'branch_id') and user.branch_id:
+        branch_id = user.branch_id
+    
+    branch = None
+    if branch_id:
+        branch = db.query(Branch).filter(
+            Branch.id == branch_id,
+            Branch.tenant_id == user.tenant_id,
+            Branch.is_active == True
+        ).first()
+    
+    return {
+        "status": "success",
+        "user_id": str(user.id),
+        "user_name": user.nom_complet,
+        "user_role": user.role,
+        "branch_id": str(branch.id) if branch else None,
+        "branch_name": branch.name if branch else None,
+        "tenant_id": str(user.tenant_id),
+        "is_super_admin": user.role in ["super_admin", "superadmin"]
     }
 
 @router.get("/health/details")
