@@ -17,6 +17,8 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.security import verify_token as security_verify_token
+from app.core.permissions import has_permission as core_has_permission
+from app.core.roles import Role
 from app.db.session import get_db
 from app.models.branch import Branch
 from app.models.pharmacy import Pharmacy
@@ -133,7 +135,7 @@ PERMISSION_MAP = {
     "admin": [
         "stock:view", "stock:create", "stock:update", "stock:delete", "stock:export",
         "stock:adjust", "stock:transfer",
-        "sales:view", "sales:create", "sales:update", "sales:delete", "sales:cancel",
+        "sales:view", "sales:create", "sales:update", "sales:delete", "sales:cancel",  # ← Ajoutez sales:create
         "sales:stats", "sales:export",
         "pharmacy:view", "pharmacy:create", "pharmacy:update", "pharmacy:delete",
         "user:view", "user:create", "user:update", "user:delete",
@@ -143,7 +145,7 @@ PERMISSION_MAP = {
     ],
     "gerant": [
         "stock:view", "stock:create", "stock:update", "stock:adjust",
-        "sales:view", "sales:create", "sales:cancel", "sales:stats",
+        "sales:view", "sales:create", "sales:cancel", "sales:stats",  # ← Ajoutez sales:create
         "pharmacy:view",
         "user:view",
         "report:view", "report:export",
@@ -151,16 +153,16 @@ PERMISSION_MAP = {
     ],
     "pharmacien": [
         "stock:view", "stock:create", "stock:update", "stock:adjust",
-        "sales:view", "sales:create", "sales:cancel",
+        "sales:view", "sales:create", "sales:cancel",  # ← Ajoutez sales:create
         "report:view",
         "branch:view",
     ],
     "vendeur": [
         "stock:view",
-        "sales:create", "sales:view",
+        "sales:create", "sales:view",  # ← Déjà présent
     ],
     "caissier": [
-        "sales:create", "sales:view", "sales:cancel",
+        "sales:create", "sales:view", "sales:cancel",  # ← Déjà présent
     ],
     "superviseur": [
         "stock:view",
@@ -174,7 +176,6 @@ PERMISSION_MAP = {
         "stock:view", "stock:adjust",
     ],
 }
-
 
 def _is_super_admin(user: User) -> bool:
     return (getattr(user, "role", None) or "").lower() in SUPER_ADMIN_ROLES
@@ -388,7 +389,10 @@ def get_current_tenant(
             detail="Tenant introuvable",
         )
 
-    if tenant.status not in {"active", "trial"}:
+    # ✅ CORRECTION : Normaliser le statut en minuscules pour la comparaison
+    tenant_status_lower = (tenant.status or "").lower()
+    
+    if tenant_status_lower not in {"active", "trial"}:
         status_messages = {
             "suspended": "Votre compte a été suspendu. Contactez le support.",
             "expired": "Votre abonnement a expiré.",
@@ -396,7 +400,7 @@ def get_current_tenant(
             "draft": "Votre compte n'est pas encore activé.",
             "archived": "Ce tenant est archivé.",
         }
-        message = status_messages.get(tenant.status, f"Tenant {tenant.status}")
+        message = status_messages.get(tenant_status_lower, f"Tenant {tenant.status}")
         logger.warning("⚠️ Tenant %s - %s", getattr(tenant, "tenant_code", None), message)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -404,7 +408,6 @@ def get_current_tenant(
         )
 
     return tenant
-
 
 def get_tenant_id_from_request(request: Request) -> Optional[str]:
     """
@@ -1041,6 +1044,49 @@ def get_pharmacy_or_main(
 # =============================================================================
 # 5. RÔLES ET PERMISSIONS
 # =============================================================================
+def require_core_permission(permission: str):
+    """
+    Dépendance utilisant le système de permissions de app.core.permissions
+    """
+    def permission_dependency(
+        current_user: User = Depends(get_current_active_user),
+    ) -> User:
+        # Convertir le rôle string en enum Role
+        user_role_str = current_user.role
+        if hasattr(user_role_str, 'value'):
+            user_role_str = user_role_str.value
+        elif hasattr(user_role_str, 'name'):
+            user_role_str = user_role_str.name
+        
+        # Mapper les strings vers les enums Role
+        role_mapping = {
+            "super_admin": Role.SUPER_ADMIN,
+            "superadmin": Role.SUPER_ADMIN,
+            "admin": Role.TENANT_ADMIN,
+            "gerant": Role.MANAGER,
+            "manager": Role.MANAGER,
+            "caissier": Role.CASHIER,
+            "vendeur": Role.CASHIER,
+            "read_only": Role.READ_ONLY,
+        }
+        
+        user_role_enum = role_mapping.get(user_role_str.lower(), Role.READ_ONLY)
+        
+        # Vérifier la permission avec le système core
+        if not core_has_permission(user_role_enum, permission):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": "permission_denied",
+                    "message": f"Permission requise : {permission}",
+                    "current_role": user_role_str,
+                    "required_permission": permission,
+                },
+            )
+        
+        return current_user
+    
+    return permission_dependency
 
 def require_role(required_roles: List[str]):
     """

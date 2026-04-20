@@ -194,12 +194,22 @@ async def create_sale(
     - Les champs unit_price et tva_rate dans SaleItemCreate sont ignorés
     - Seule la remise (discount_percent) peut être appliquée par l'utilisateur
     """
+    # Dans create_sale, avant la vérification :
+    logger.info(f"🔍 Type du rôle: {type(current_user.role)}")
+    logger.info(f"🔍 Valeur du rôle: {current_user.role}")
+    logger.info(f"🔍 Attributs du rôle: {dir(current_user.role)}")
+
+# Puis adaptez la vérification en conséquence
     # Vérifier les permissions
+    user_role = (current_user.role).lower() if current_user.role else ""
     allowed_roles = ["admin", "super_admin", "superadmin", "vendeur", "gerant", "caissier"]
-    if current_user.role not in allowed_roles:
+    
+    if user_role not in allowed_roles:
+        logger.error(f"❌ Rôle insuffisant: {user_role} (attendu: {allowed_roles})")
+        logger.error(f"📋 Rôle original: {current_user.role}")
         raise HTTPException(
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            detail=f"Rôle insuffisant pour créer une vente. Rôles autorisés: {allowed_roles}"
+            status_code=HTTPStatus.FORBIDDEN,  # Utiliser 403 au lieu de 500
+            detail=f"Rôle insuffisant pour créer une vente. Rôles autorisés: {allowed_roles}, rôle actuel: {user_role}"
         )
     
     try:

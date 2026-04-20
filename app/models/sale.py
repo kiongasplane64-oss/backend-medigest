@@ -110,6 +110,7 @@ class Sale(Base):
         back_populates="sale",
         uselist=False,
     )
+    returns = relationship("Return", back_populates="sale", cascade="all, delete-orphan")
 
     # CORRECTION: Index mis à jour pour utiliser customer_id 
     __table_args__ = (

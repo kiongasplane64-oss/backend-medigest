@@ -213,7 +213,7 @@ class Product(Base):
         cascade="all, delete-orphan",
         lazy="selectin",
     )
-
+    return_items = relationship("ReturnItem", back_populates="product", cascade="all, delete-orphan")
     # =====================================
     # INDEXES
     # =====================================

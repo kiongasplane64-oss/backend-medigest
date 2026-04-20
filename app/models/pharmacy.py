@@ -54,7 +54,7 @@ class Pharmacy(Base):
         uselist=False,
         foreign_keys=[subscription_id]
     )
-    
+    returns = relationship("Return", back_populates="pharmacy", cascade="all, delete-orphan")
     # =========================
     # CONFIGURATION COMPLÈTE (harmonisée avec les schémas)
     # =========================

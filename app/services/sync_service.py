@@ -1,4 +1,4 @@
-# app/services/sync_service.py - Service de synchronisation complet unifié
+# app/services/sync_service.py - Service de synchronisation complet avec gestion des branches
 
 from sqlalchemy.orm import Session, joinedload
 from typing import List, Dict, Any, Optional
@@ -19,71 +19,180 @@ def process_sync(
     tenant_id: UUID,
     items: List[Any],
     user_branch_id: Optional[UUID] = None,
+    user_id: Optional[UUID] = None,
+    is_super_admin: bool = False,
 ) -> Dict[str, Any]:
     """
     Traite les données de synchronisation envoyées par un client mobile.
     Supporte: products, categories, customers, sales, debts, users, branches, 
-              pharmacies, subscriptions, stock_movements
+              pharmacies, subscriptions, stock_movements, expenses, returns
     
     Args:
         db: Session SQLAlchemy
         tenant_id: Identifiant du tenant
         items: Liste des items à synchroniser
+        user_branch_id: ID de la branche de l'utilisateur (pour validation des droits)
+        user_id: ID de l'utilisateur qui synchronise
+        is_super_admin: Si True, ignore les restrictions de branche
         
     Returns:
         Dict contenant le statut, le nombre d'items traités et les erreurs
     """
     processed = 0
     errors = []
+    permission_errors = []
     results_by_table = {}
+    
+    # Tables qui nécessitent une vérification de branche
+    tables_requiring_branch_check = {
+        'products', 'produits', 'produit',
+        'sales', 'ventes', 'vente', 'orders', 'commandes', 'commande',
+        'debts', 'dettes', 'dette',
+        'customers', 'clients', 'client',
+        'stock_movements', 'mouvements_stock',
+        'expenses', 'depenses', 'depense',
+        'returns', 'retours', 'retour'
+    }
+    
+    # Tables où la branche est implicite (ex: branches elle-même)
+    tables_with_implicit_branch = {'branches', 'succursales', 'succursale'}
+    
+    # Table mapping pour normalisation
+    table_mapping = {
+        'produits': 'products', 'produit': 'products',
+        'catégories': 'categories', 'categorie': 'categories', 'categories': 'categories',
+        'commandes': 'sales', 'commande': 'sales',
+        'clients': 'customers', 'client': 'customers',
+        'factures': 'invoices', 'facture': 'invoices',
+        'utilisateurs': 'users', 'utilisateur': 'users',
+        'tenants': 'tenants', 'tenant': 'tenants',
+        'subscriptions': 'branch_subscriptions', 'abonnements': 'branch_subscriptions',
+        'abonnement': 'branch_subscriptions', 'branch_subscriptions': 'branch_subscriptions',
+        'ventes': 'sales', 'vente': 'sales', 'sales': 'sales',
+        'dettes': 'debts', 'dette': 'debts', 'debts': 'debts',
+        'retours': 'returns', 'retour': 'returns', 'returns': 'returns',
+        'branches': 'branches', 'succursales': 'branches', 'succursale': 'branches',
+        'pharmacies': 'pharmacies', 'pharmacie': 'pharmacies',
+        'mouvements_stock': 'stock_movements', 'mouvement_stock': 'stock_movements',
+        'paiements_dette': 'debt_payments', 'paiement_dette': 'debt_payments',
+        'depenses': 'expenses', 'depense': 'expenses', 'expenses': 'expenses',
+        'charges': 'expenses', 'charge': 'expenses',
+    }
     
     for item in items:
         # Gestion des objets et dictionnaires
         if hasattr(item, 'table_name'):
-            table_name = item.table_name
+            raw_table_name = item.table_name
             action = item.action
             data = item.data if hasattr(item, 'data') else {}
+            original_item = item
         else:
-            table_name = item.get("table_name")
+            raw_table_name = item.get("table_name")
             action = item.get("action")
             data = item.get("data", {})
+            original_item = item
+        
+        # Normaliser le nom de la table
+        table_name = table_mapping.get(raw_table_name.lower(), raw_table_name.lower())
         
         # Validation minimale
         if not table_name or not action:
             errors.append({
-                "item": item,
+                "item": original_item,
                 "error": "table_name ou action manquant",
             })
             continue
         
-        logger.info(f"Traitement de {table_name} - {action} pour tenant {tenant_id}")
+        # VÉRIFICATION DES DROITS D'ACCÈS À LA BRANCHE
+        if not is_super_admin and user_branch_id:
+            table_normalized = table_name.lower()
+            
+            # Vérification pour les tables qui nécessitent un branch_id
+            if table_normalized in tables_requiring_branch_check:
+                data_branch_id = data.get('branch_id')
+                
+                # Si pas de branch_id dans les données, essayer de le trouver via d'autres champs
+                if not data_branch_id and table_normalized in ['customers', 'clients', 'client']:
+                    data_branch_id = data.get('branch_id') or data.get('default_branch_id')
+                
+                if data_branch_id:
+                    if str(data_branch_id) != str(user_branch_id):
+                        permission_errors.append({
+                            "table": table_name,
+                            "action": action,
+                            "error": f"Accès non autorisé: cette donnée appartient à la branche {data_branch_id} mais l'utilisateur est sur la branche {user_branch_id}",
+                            "data_id": data.get('id'),
+                            "user_branch": str(user_branch_id),
+                            "data_branch": str(data_branch_id)
+                        })
+                        continue
+                elif table_normalized in ['products', 'produits'] and not data_branch_id:
+                    pharmacy_id = data.get('pharmacy_id')
+                    if pharmacy_id:
+                        from app.models.pharmacy import Pharmacy
+                        from app.models.branch import Branch
+                        pharmacy = db.query(Pharmacy).filter(Pharmacy.id == pharmacy_id).first()
+                        if pharmacy and pharmacy.tenant_id == tenant_id:
+                            branch = db.query(Branch).filter(
+                                Branch.parent_pharmacy_id == pharmacy.id,
+                                Branch.tenant_id == tenant_id,
+                                Branch.id == user_branch_id
+                            ).first()
+                            if not branch:
+                                permission_errors.append({
+                                    "table": table_name,
+                                    "action": action,
+                                    "error": f"Accès non autorisé: la pharmacie {pharmacy_id} n'appartient pas à la branche de l'utilisateur",
+                                    "data_id": data.get('id'),
+                                    "user_branch": str(user_branch_id)
+                                })
+                                continue
+            
+            # Vérification pour les tables où la branche est implicite
+            elif table_normalized in tables_with_implicit_branch:
+                data_id = data.get('id')
+                if data_id and str(data_id) != str(user_branch_id):
+                    permission_errors.append({
+                        "table": table_name,
+                        "action": action,
+                        "error": f"Accès non autorisé: l'utilisateur ne peut modifier que sa propre branche",
+                        "data_id": data_id,
+                        "user_branch": str(user_branch_id)
+                    })
+                    continue
+        
+        logger.info(f"Traitement de {table_name} - {action} pour tenant {tenant_id} (user_branch={user_branch_id})")
         
         try:
             result = None
             
             # Dispatch vers le handler approprié
             if table_name in ['products', 'produits', 'produit']:
-                result = _sync_product(db, tenant_id, action, data)
-            elif table_name in ['categories', 'categories', 'categorie']:
-                result = _sync_category(db, tenant_id, action, data)
+                result = _sync_product(db, tenant_id, action, data, user_branch_id, user_id)
+            elif table_name in ['categories', 'categorie']:
+                result = _sync_category(db, tenant_id, action, data, user_branch_id, user_id)
             elif table_name in ['customers', 'clients', 'client']:
-                result = _sync_customer(db, tenant_id, action, data)
+                result = _sync_customer(db, tenant_id, action, data, user_branch_id, user_id)
             elif table_name in ['sales', 'ventes', 'vente', 'orders', 'commandes', 'commande']:
-                result = _sync_sale(db, tenant_id, action, data)
+                result = _sync_sale(db, tenant_id, action, data, user_branch_id, user_id)
             elif table_name in ['debts', 'dettes', 'dette']:
-                result = _sync_debt(db, tenant_id, action, data)
+                result = _sync_debt(db, tenant_id, action, data, user_branch_id, user_id)
             elif table_name in ['debt_payments', 'paiements_dette']:
-                result = _sync_debt_payment(db, tenant_id, action, data)
+                result = _sync_debt_payment(db, tenant_id, action, data, user_branch_id, user_id)
             elif table_name in ['users', 'utilisateurs', 'utilisateur']:
-                result = _sync_user(db, tenant_id, action, data)
+                result = _sync_user(db, tenant_id, action, data, user_branch_id, user_id)
             elif table_name in ['branches', 'succursales', 'succursale']:
-                result = _sync_branch(db, tenant_id, action, data)
+                result = _sync_branch(db, tenant_id, action, data, user_branch_id, user_id, is_super_admin)
             elif table_name in ['pharmacies', 'pharmacie']:
-                result = _sync_pharmacy(db, tenant_id, action, data)
-            elif table_name in ['subscriptions', 'abonnements', 'abonnement']:
-                result = _sync_subscription(db, tenant_id, action, data)
+                result = _sync_pharmacy(db, tenant_id, action, data, user_branch_id, user_id)
+            elif table_name in ['subscriptions', 'abonnements', 'abonnement', 'branch_subscriptions']:
+                result = _sync_subscription(db, tenant_id, action, data, user_branch_id, user_id)
             elif table_name in ['stock_movements', 'mouvements_stock']:
-                result = _sync_stock_movement(db, tenant_id, action, data)
+                result = _sync_stock_movement(db, tenant_id, action, data, user_branch_id, user_id)
+            elif table_name in ['expenses', 'depenses', 'depense']:
+                result = _sync_expense(db, tenant_id, action, data, user_branch_id, user_id)
+            elif table_name in ['returns', 'retours', 'retour']:
+                result = _sync_return(db, tenant_id, action, data, user_branch_id, user_id)
             else:
                 logger.warning(f"Table non supportée: {table_name}")
                 errors.append({
@@ -103,7 +212,7 @@ def process_sync(
                     "table": table_name,
                     "action": action,
                     "error": result.get('error', 'Erreur inconnue'),
-                    "data": data.get('id') if data else None
+                    "data_id": data.get('id') if data else None
                 })
                 
         except Exception as e:
@@ -112,7 +221,7 @@ def process_sync(
                 "table": table_name,
                 "action": action,
                 "error": str(e),
-                "data": data.get('id') if data else None
+                "data_id": data.get('id') if data else None
             })
             db.rollback()
     
@@ -120,11 +229,19 @@ def process_sync(
         db.commit()
     
     return {
-        "status": "success" if not errors else "partial",
+        "status": "success" if not errors and not permission_errors else "partial",
         "processed": processed,
+        "total_items": len(items),
         "errors": errors,
+        "permission_errors": permission_errors,
         "results_by_table": results_by_table,
         "synced_at": datetime.utcnow().isoformat(),
+        "context": {
+            "tenant_id": str(tenant_id),
+            "user_branch_id": str(user_branch_id) if user_branch_id else None,
+            "user_id": str(user_id) if user_id else None,
+            "is_super_admin": is_super_admin
+        }
     }
 
 
@@ -132,8 +249,9 @@ def get_changes_since(
     db: Session,
     tenant_id: UUID,
     since: Optional[datetime] = None,
-    branch_id: Optional[UUID] = None, 
-    user_id: Optional[UUID] = None
+    branch_id: Optional[UUID] = None,
+    user_id: Optional[UUID] = None,
+    is_super_admin: bool = False
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     Récupère tous les changements depuis une date pour toutes les entités.
@@ -142,6 +260,9 @@ def get_changes_since(
         db: Session SQLAlchemy
         tenant_id: Identifiant du tenant
         since: Date de dernière synchronisation (optionnel)
+        branch_id: ID de la branche (si non super admin)
+        user_id: ID de l'utilisateur
+        is_super_admin: Si True, récupère toutes les branches
         
     Returns:
         Dictionnaire contenant les changements par table
@@ -157,13 +278,17 @@ def get_changes_since(
         'branches': [],
         'pharmacies': [],
         'subscriptions': [],
-        'stock_movements': []
+        'stock_movements': [],
+        'expenses': [],
+        'returns': []
     }
     
     try:
         # 1. Produits
         from app.models.product import Product
         query = db.query(Product).filter(Product.tenant_id == tenant_id)
+        if not is_super_admin and branch_id:
+            query = query.filter(Product.branch_id == branch_id)
         if since:
             query = query.filter(
                 (Product.updated_at >= since) | (Product.created_at >= since)
@@ -173,7 +298,7 @@ def get_changes_since(
             changes['products'].append({
                 'id': str(product.id),
                 'action': 'update' if (product.updated_at and since and product.updated_at >= since) else 'create',
-                'data': product.to_dict(include_details=True) if hasattr(product, 'to_dict') else _serialize_product(product),
+                'data': _serialize_product(product),
                 'timestamp': (product.updated_at or product.created_at).isoformat() if (product.updated_at or product.created_at) else None
             })
         
@@ -202,6 +327,8 @@ def get_changes_since(
         # 3. Clients
         from app.models.customer import Customer
         query = db.query(Customer).filter(Customer.tenant_id == tenant_id)
+        if not is_super_admin and branch_id:
+            query = query.filter(Customer.branch_id == branch_id)
         if since:
             query = query.filter(
                 (Customer.updated_at >= since) | (Customer.created_at >= since)
@@ -231,6 +358,8 @@ def get_changes_since(
         # 4. Ventes
         from app.models.sale import Sale, SaleItem
         query = db.query(Sale).filter(Sale.tenant_id == tenant_id)
+        if not is_super_admin and branch_id:
+            query = query.filter(Sale.branch_id == branch_id)
         if since:
             query = query.filter(
                 (Sale.updated_at >= since) | (Sale.created_at >= since)
@@ -282,6 +411,8 @@ def get_changes_since(
         # 5. Dettes
         from app.models.debt import Debt
         query = db.query(Debt).filter(Debt.tenant_id == tenant_id)
+        if not is_super_admin and branch_id:
+            query = query.filter(Debt.branch_id == branch_id)
         if since:
             query = query.filter(
                 (Debt.updated_at >= since) | (Debt.created_at >= since)
@@ -306,7 +437,6 @@ def get_changes_since(
                     'issue_date': debt.issue_date.isoformat() if debt.issue_date else None,
                     'due_date': debt.due_date.isoformat() if debt.due_date else None,
                     'status': debt.status,
-                    'is_overdue': debt.days_overdue > 0 if hasattr(debt, 'days_overdue') else False,
                     'notes': debt.notes,
                     'is_active': debt.is_active,
                     'branch_id': str(debt.branch_id) if hasattr(debt, 'branch_id') and debt.branch_id else None,
@@ -345,6 +475,8 @@ def get_changes_since(
         # 7. Utilisateurs
         from app.models.user import User
         query = db.query(User).filter(User.tenant_id == tenant_id)
+        if not is_super_admin and user_id:
+            query = query.filter(User.id == user_id)
         if since:
             query = query.filter(
                 (User.updated_at >= since) | (User.created_at >= since)
@@ -375,6 +507,8 @@ def get_changes_since(
         # 8. Branches
         from app.models.branch import Branch
         query = db.query(Branch).filter(Branch.tenant_id == tenant_id)
+        if not is_super_admin and branch_id:
+            query = query.filter(Branch.id == branch_id)
         if since:
             query = query.filter(
                 (Branch.updated_at >= since) | (Branch.created_at >= since)
@@ -440,12 +574,14 @@ def get_changes_since(
                 'timestamp': (pharmacy.updated_at or pharmacy.created_at).isoformat() if (pharmacy.updated_at or pharmacy.created_at) else None
             })
         
-        # 10. Abonnements des branches (BranchSubscription)
+        # 10. Abonnements des branches
         from app.models.branch_subscription import BranchSubscription
         from app.models.branch import Branch
 
-        # Récupérer toutes les branches du tenant
         branches_query = db.query(Branch.id).filter(Branch.tenant_id == tenant_id)
+        if not is_super_admin and branch_id:
+            branches_query = branches_query.filter(Branch.id == branch_id)
+        
         branch_ids = [b[0] for b in branches_query.all()]
 
         if branch_ids:
@@ -494,6 +630,8 @@ def get_changes_since(
         # 11. Mouvements de stock
         from app.models.stock_movement import StockMovement
         query = db.query(StockMovement).filter(StockMovement.tenant_id == tenant_id)
+        if not is_super_admin and branch_id:
+            query = query.filter(StockMovement.branch_id == branch_id)
         if since:
             query = query.filter(StockMovement.created_at >= since)
         
@@ -518,6 +656,50 @@ def get_changes_since(
                 'timestamp': movement.created_at.isoformat() if movement.created_at else None
             })
         
+        # 12. Dépenses
+        from app.models.finance import Expense
+        query = db.query(Expense).filter(Expense.tenant_id == tenant_id)
+        if not is_super_admin and branch_id:
+            query = query.filter(Expense.branch_id == branch_id)
+        if since:
+            query = query.filter(Expense.updated_at >= since)
+        
+        for expense in query.all():
+            changes['expenses'].append({
+                'id': str(expense.id),
+                'action': 'update' if (expense.updated_at and since and expense.updated_at >= since) else 'create',
+                'data': {
+                    'id': str(expense.id),
+                    'tenant_id': str(expense.tenant_id),
+                    'branch_id': str(expense.branch_id) if expense.branch_id else None,
+                    'user_id': str(expense.user_id) if expense.user_id else None,
+                    'expense_date': expense.expense_date.isoformat() if expense.expense_date else None,
+                    'expense_type': expense.expense_type,
+                    'amount': float(expense.amount),
+                    'tax_amount': float(expense.tax_amount) if expense.tax_amount else 0,
+                    'total_amount': float(expense.total_amount),
+                    'supplier': expense.supplier,
+                    'payee': expense.payee,
+                    'payment_method': expense.payment_method,
+                    'payment_reference': expense.payment_reference,
+                    'description': expense.description,
+                    'notes': expense.notes,
+                    'invoice_number': expense.invoice_number,
+                    'invoice_date': expense.invoice_date.isoformat() if expense.invoice_date else None,
+                    'is_recurring': expense.is_recurring,
+                    'recurrence_interval': expense.recurrence_interval,
+                    'next_due_date': expense.next_due_date.isoformat() if expense.next_due_date else None,
+                    'approved_by': str(expense.approved_by) if expense.approved_by else None,
+                    'approval_status': expense.approval_status,
+                    'rejection_reason': expense.rejection_reason,
+                    'cost_center': expense.cost_center,
+                    'project_code': expense.project_code,
+                    'created_at': expense.created_at.isoformat() if expense.created_at else None,
+                    'updated_at': expense.updated_at.isoformat() if expense.updated_at else None
+                },
+                'timestamp': (expense.updated_at or expense.created_at).isoformat() if (expense.updated_at or expense.created_at) else None
+            })
+        
         logger.info(f"Récupéré {sum(len(v) for v in changes.values())} changements pour tenant {tenant_id}")
         
     except Exception as e:
@@ -527,13 +709,14 @@ def get_changes_since(
     return changes
 
 
-def get_sync_status(db: Session, tenant_id: UUID) -> Dict[str, Any]:
+def get_sync_status(db: Session, tenant_id: UUID, branch_id: Optional[UUID] = None) -> Dict[str, Any]:
     """
-    Récupère le statut de synchronisation pour un tenant.
+    Récupère le statut de synchronisation pour un tenant et une branche.
     
     Args:
         db: Session SQLAlchemy
         tenant_id: Identifiant du tenant
+        branch_id: Identifiant de la branche (optionnel)
         
     Returns:
         Dict contenant le statut de synchronisation
@@ -545,30 +728,42 @@ def get_sync_status(db: Session, tenant_id: UUID) -> Dict[str, Any]:
     from app.models.debt import Debt
     from app.models.customer import Customer
     
-    last_sale = db.query(Sale).filter(Sale.tenant_id == tenant_id).order_by(Sale.updated_at.desc()).first()
-    last_product = db.query(Product).filter(Product.tenant_id == tenant_id).order_by(Product.updated_at.desc()).first()
+    # Base query filters
+    sale_filter = Sale.tenant_id == tenant_id
+    product_filter = Product.tenant_id == tenant_id
+    debt_filter = Debt.tenant_id == tenant_id
+    customer_filter = Customer.tenant_id == tenant_id
+    
+    if branch_id:
+        sale_filter = sale_filter & (Sale.branch_id == branch_id)
+        product_filter = product_filter & (Product.branch_id == branch_id)
+        debt_filter = debt_filter & (Debt.branch_id == branch_id)
+        customer_filter = customer_filter & (Customer.branch_id == branch_id)
+    
+    last_sale = db.query(Sale).filter(sale_filter).order_by(Sale.updated_at.desc()).first()
+    last_product = db.query(Product).filter(product_filter).order_by(Product.updated_at.desc()).first()
     last_user = db.query(User).filter(User.tenant_id == tenant_id).order_by(User.updated_at.desc()).first()
     last_branch = db.query(Branch).filter(Branch.tenant_id == tenant_id).order_by(Branch.updated_at.desc()).first()
-    last_debt = db.query(Debt).filter(Debt.tenant_id == tenant_id).order_by(Debt.updated_at.desc()).first()
-    last_customer = db.query(Customer).filter(Customer.tenant_id == tenant_id).order_by(Customer.updated_at.desc()).first()
+    last_debt = db.query(Debt).filter(debt_filter).order_by(Debt.updated_at.desc()).first()
+    last_customer = db.query(Customer).filter(customer_filter).order_by(Customer.updated_at.desc()).first()
     
     counts = {
-        'sales': db.query(Sale).filter(Sale.tenant_id == tenant_id).count(),
-        'products': db.query(Product).filter(Product.tenant_id == tenant_id).count(),
+        'sales': db.query(Sale).filter(sale_filter).count(),
+        'products': db.query(Product).filter(product_filter).count(),
         'users': db.query(User).filter(User.tenant_id == tenant_id).count(),
         'branches': db.query(Branch).filter(Branch.tenant_id == tenant_id).count(),
-        'debts': db.query(Debt).filter(Debt.tenant_id == tenant_id).count(),
-        'customers': db.query(Customer).filter(Customer.tenant_id == tenant_id).count(),
+        'debts': db.query(Debt).filter(debt_filter).count(),
+        'customers': db.query(Customer).filter(customer_filter).count(),
     }
     
     total_pending_debts = db.query(Debt).filter(
-        Debt.tenant_id == tenant_id,
+        debt_filter,
         Debt.remaining_amount > 0,
         Debt.status.in_(["pending", "partial", "overdue"])
     ).count()
     
     total_overdue_amount = db.query(Debt).filter(
-        Debt.tenant_id == tenant_id,
+        debt_filter,
         Debt.due_date < date.today(),
         Debt.remaining_amount > 0
     ).with_entities(Debt.remaining_amount).all()
@@ -579,6 +774,7 @@ def get_sync_status(db: Session, tenant_id: UUID) -> Dict[str, Any]:
         'last_sync': None,
         'status': 'active',
         'tenant_id': str(tenant_id),
+        'branch_id': str(branch_id) if branch_id else None,
         'last_update': {
             'sales': last_sale.updated_at.isoformat() if last_sale else None,
             'products': last_product.updated_at.isoformat() if last_product else None,
@@ -599,10 +795,15 @@ def get_sync_status(db: Session, tenant_id: UUID) -> Dict[str, Any]:
 # HANDLERS PAR TABLE
 # ==========================================================
 
-def _sync_product(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    """Synchronise un produit"""
+def _sync_product(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any], 
+                  user_branch_id: Optional[UUID] = None, user_id: Optional[UUID] = None) -> Dict[str, Any]:
+    """Synchronise un produit avec vérification de branche"""
     from app.models.product import Product
     from uuid import UUID as UUIDType
+    
+    # Ajouter le branch_id par défaut si nécessaire
+    if user_branch_id and 'branch_id' not in data:
+        data['branch_id'] = user_branch_id
     
     try:
         product_id = data.get('id')
@@ -655,7 +856,8 @@ def _sync_product(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any
         return {'success': False, 'error': str(e)}
 
 
-def _sync_category(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
+def _sync_category(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any],
+                   user_branch_id: Optional[UUID] = None, user_id: Optional[UUID] = None) -> Dict[str, Any]:
     """Synchronise une catégorie"""
     from app.models.category import Category
     from uuid import UUID as UUIDType
@@ -706,10 +908,15 @@ def _sync_category(db: Session, tenant_id: UUID, action: str, data: Dict[str, An
         return {'success': False, 'error': str(e)}
 
 
-def _sync_customer(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    """Synchronise un client"""
+def _sync_customer(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any],
+                   user_branch_id: Optional[UUID] = None, user_id: Optional[UUID] = None) -> Dict[str, Any]:
+    """Synchronise un client avec vérification de branche"""
     from app.models.customer import Customer
     from uuid import UUID as UUIDType
+    
+    # Ajouter le branch_id par défaut si nécessaire
+    if user_branch_id and 'branch_id' not in data:
+        data['branch_id'] = user_branch_id
     
     try:
         customer_id = data.get('id')
@@ -757,13 +964,22 @@ def _sync_customer(db: Session, tenant_id: UUID, action: str, data: Dict[str, An
         return {'success': False, 'error': str(e)}
 
 
-def _sync_sale(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    """Synchronise une vente"""
+def _sync_sale(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any],
+               user_branch_id: Optional[UUID] = None, user_id: Optional[UUID] = None) -> Dict[str, Any]:
+    """Synchronise une vente avec vérification de branche"""
     from app.models.sale import Sale, SaleItem
     from app.models.product import Product
     from app.models.stock_movement import StockMovement
     from uuid import UUID as UUIDType
     from decimal import Decimal
+    
+    # Ajouter le branch_id par défaut si nécessaire
+    if user_branch_id and 'branch_id' not in data:
+        data['branch_id'] = user_branch_id
+    
+    # Ajouter l'utilisateur qui crée la vente
+    if user_id and 'created_by' not in data:
+        data['created_by'] = user_id
     
     try:
         sale_id = data.get('id')
@@ -799,7 +1015,6 @@ def _sync_sale(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) 
             items_data = data.pop('items', [])
             data.pop('id', None)
             
-            # Créer la vente
             sale = Sale(
                 tenant_id=tenant_id,
                 **{k: v for k, v in data.items() if hasattr(Sale, k)}
@@ -807,11 +1022,9 @@ def _sync_sale(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) 
             db.add(sale)
             db.flush()
             
-            # Créer les items et gérer le stock
             for item_data in items_data:
                 item_data.pop('id', None)
                 
-                # Récupérer le produit pour la gestion du stock
                 product_id = item_data.get('product_id')
                 if product_id and isinstance(product_id, str):
                     product_id = UUIDType(product_id)
@@ -833,7 +1046,6 @@ def _sync_sale(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) 
                 db.add(sale_item)
                 db.flush()
                 
-                # Mettre à jour le stock si nécessaire
                 if product and sale.status == "completed":
                     old_quantity = product.quantity or 0
                     new_quantity = max(0, old_quantity - int(quantity))
@@ -843,7 +1055,6 @@ def _sync_sale(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) 
                     if hasattr(product, 'refresh_statuses'):
                         product.refresh_statuses()
                     
-                    # Mouvement de stock
                     movement = StockMovement(
                         tenant_id=tenant_id,
                         product_id=product.id,
@@ -871,12 +1082,17 @@ def _sync_sale(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) 
         return {'success': False, 'error': str(e)}
 
 
-def _sync_debt(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    """Synchronise une dette"""
+def _sync_debt(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any],
+               user_branch_id: Optional[UUID] = None, user_id: Optional[UUID] = None) -> Dict[str, Any]:
+    """Synchronise une dette avec vérification de branche"""
     from app.models.debt import Debt
     from app.models.customer import Customer
     from uuid import UUID as UUIDType
     from decimal import Decimal
+    
+    # Ajouter le branch_id par défaut si nécessaire
+    if user_branch_id and 'branch_id' not in data:
+        data['branch_id'] = user_branch_id
     
     try:
         debt_id = data.get('id')
@@ -902,13 +1118,11 @@ def _sync_debt(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) 
         if existing and action_upper in ['UPDATE', 'UPSERT']:
             for field, value in data.items():
                 if field != 'id' and hasattr(existing, field):
-                    # Gérer les conversions Decimal
                     if field in ['initial_amount', 'paid_amount', 'remaining_amount', 'interest_rate', 'interest_amount']:
                         value = Decimal(str(value)) if value else Decimal('0')
                     setattr(existing, field, value)
             existing.updated_at = datetime.utcnow()
             
-            # Mettre à jour le statut automatiquement
             if hasattr(existing, 'update_status'):
                 existing.update_status()
             
@@ -916,7 +1130,6 @@ def _sync_debt(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) 
             return {'success': True, 'id': str(existing.id), 'action': 'updated'}
         
         elif action_upper in ['CREATE', 'UPSERT']:
-            # S'assurer que le client existe
             customer_id = data.get('customer_id')
             if customer_id:
                 if isinstance(customer_id, str):
@@ -928,20 +1141,19 @@ def _sync_debt(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) 
                 ).first()
                 
                 if not customer and data.get('customer_name'):
-                    # Créer le client s'il n'existe pas
                     customer = Customer(
                         tenant_id=tenant_id,
                         id=customer_id,
                         name=data.get('customer_name'),
                         phone=data.get('customer_phone'),
-                        email=data.get('customer_email')
+                        email=data.get('customer_email'),
+                        branch_id=data.get('branch_id')
                     )
                     db.add(customer)
                     db.flush()
             
             data.pop('id', None)
             
-            # Convertir les valeurs Decimal
             for field in ['initial_amount', 'paid_amount', 'remaining_amount', 'interest_rate', 'interest_amount']:
                 if field in data and data[field] is not None:
                     data[field] = Decimal(str(data[field]))
@@ -953,7 +1165,6 @@ def _sync_debt(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) 
             db.add(debt)
             db.flush()
             
-            # Mettre à jour le total des dettes du client
             if debt.customer_id:
                 total_debt = db.query(Debt).filter(
                     Debt.customer_id == debt.customer_id,
@@ -975,10 +1186,10 @@ def _sync_debt(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) 
         return {'success': False, 'error': str(e)}
 
 
-def _sync_debt_payment(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
+def _sync_debt_payment(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any],
+                       user_branch_id: Optional[UUID] = None, user_id: Optional[UUID] = None) -> Dict[str, Any]:
     """Synchronise un paiement de dette"""
     from app.models.debt import Debt, DebtPayment
-    from app.models.customer import Customer
     from uuid import UUID as UUIDType
     from decimal import Decimal
     
@@ -998,7 +1209,6 @@ def _sync_debt_payment(db: Session, tenant_id: UUID, action: str, data: Dict[str
         
         if action_upper == 'DELETE':
             if existing:
-                # Rembourser le paiement
                 debt = db.query(Debt).filter(Debt.id == existing.debt_id).first()
                 if debt:
                     debt.remaining_amount += existing.amount
@@ -1044,7 +1254,6 @@ def _sync_debt_payment(db: Session, tenant_id: UUID, action: str, data: Dict[str
             db.add(payment)
             db.flush()
             
-            # Mettre à jour la dette
             debt.remaining_amount -= amount
             debt.paid_amount += amount
             
@@ -1067,21 +1276,22 @@ def _sync_debt_payment(db: Session, tenant_id: UUID, action: str, data: Dict[str
         return {'success': False, 'error': str(e)}
 
 
-def _sync_user(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
+def _sync_user(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any],
+               user_branch_id: Optional[UUID] = None, user_id: Optional[UUID] = None) -> Dict[str, Any]:
     """Synchronise un utilisateur"""
     from app.models.user import User
     from app.core.security import hash_password
     from uuid import UUID as UUIDType
     
     try:
-        user_id = data.get('id')
-        if user_id and isinstance(user_id, str):
-            user_id = UUIDType(user_id)
+        target_user_id = data.get('id')
+        if target_user_id and isinstance(target_user_id, str):
+            target_user_id = UUIDType(target_user_id)
         
         existing = None
-        if user_id:
+        if target_user_id:
             existing = db.query(User).filter(
-                User.id == user_id,
+                User.id == target_user_id,
                 User.tenant_id == tenant_id
             ).first()
         
@@ -1091,7 +1301,7 @@ def _sync_user(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) 
             if existing:
                 existing.actif = False
                 db.flush()
-                return {'success': True, 'id': str(user_id), 'action': 'deactivated'}
+                return {'success': True, 'id': str(target_user_id), 'action': 'deactivated'}
             return {'success': False, 'error': 'Utilisateur non trouvé'}
         
         if existing and action_upper in ['UPDATE', 'UPSERT']:
@@ -1124,10 +1334,18 @@ def _sync_user(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) 
         return {'success': False, 'error': str(e)}
 
 
-def _sync_branch(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    """Synchronise une branche/succursale"""
+def _sync_branch(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any],
+                 user_branch_id: Optional[UUID] = None, user_id: Optional[UUID] = None,
+                 is_super_admin: bool = False) -> Dict[str, Any]:
+    """Synchronise une branche - seule la branche de l'utilisateur peut être modifiée"""
     from app.models.branch import Branch
     from uuid import UUID as UUIDType
+    
+    # Un utilisateur normal ne peut modifier que sa propre branche
+    if not is_super_admin and user_branch_id:
+        branch_id = data.get('id')
+        if branch_id and str(branch_id) != str(user_branch_id):
+            return {'success': False, 'error': 'Vous ne pouvez modifier que votre propre branche'}
     
     try:
         branch_id = data.get('id')
@@ -1175,7 +1393,8 @@ def _sync_branch(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]
         return {'success': False, 'error': str(e)}
 
 
-def _sync_pharmacy(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
+def _sync_pharmacy(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any],
+                   user_branch_id: Optional[UUID] = None, user_id: Optional[UUID] = None) -> Dict[str, Any]:
     """Synchronise une pharmacie"""
     from app.models.pharmacy import Pharmacy
     from uuid import UUID as UUIDType
@@ -1225,8 +1444,10 @@ def _sync_pharmacy(db: Session, tenant_id: UUID, action: str, data: Dict[str, An
         logger.error(f"Erreur sync pharmacy: {e}", exc_info=True)
         return {'success': False, 'error': str(e)}
 
-def _sync_subscription(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    """Synchronise un abonnement de branche (BranchSubscription)"""
+
+def _sync_subscription(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any],
+                       user_branch_id: Optional[UUID] = None, user_id: Optional[UUID] = None) -> Dict[str, Any]:
+    """Synchronise un abonnement de branche"""
     from app.models.branch_subscription import BranchSubscription, SubscriptionPlan, SubscriptionStatus
     from app.models.branch import Branch
     from uuid import UUID as UUIDType
@@ -1259,7 +1480,6 @@ def _sync_subscription(db: Session, tenant_id: UUID, action: str, data: Dict[str
                 BranchSubscription.tenant_id == tenant_id
             ).first()
         elif branch_id:
-            # Chercher l'abonnement de la branche
             existing = db.query(BranchSubscription).filter(
                 BranchSubscription.branch_id == branch_id,
                 BranchSubscription.tenant_id == tenant_id
@@ -1269,7 +1489,6 @@ def _sync_subscription(db: Session, tenant_id: UUID, action: str, data: Dict[str
         
         if action_upper == 'DELETE':
             if existing:
-                # Soft delete: marquer comme annulé
                 existing.status = SubscriptionStatus.CANCELLED.value
                 existing.cancelled_at = datetime.utcnow()
                 existing.updated_at = datetime.utcnow()
@@ -1277,12 +1496,10 @@ def _sync_subscription(db: Session, tenant_id: UUID, action: str, data: Dict[str
                 return {'success': True, 'id': str(existing.id), 'action': 'cancelled'}
             return {'success': False, 'error': 'Abonnement non trouvé'}
         
-        # Préparer les données
         data['branch_id'] = branch_id
         data['tenant_id'] = tenant_id
         data.pop('id', None)
         
-        # Convertir les champs
         if 'plan' in data:
             plan_value = data['plan'].upper() if isinstance(data['plan'], str) else data['plan']
             data['plan'] = plan_value
@@ -1291,14 +1508,12 @@ def _sync_subscription(db: Session, tenant_id: UUID, action: str, data: Dict[str
             status_value = data['status'].upper() if isinstance(data['status'], str) else data['status']
             data['status'] = status_value
         
-        # Gérer la période d'essai
         if data.get('is_trial') and not data.get('trial_end_date'):
             data['trial_end_date'] = datetime.utcnow() + timedelta(days=14)
             if not data.get('end_date'):
                 data['end_date'] = data['trial_end_date']
         
         if existing and action_upper in ['UPDATE', 'UPSERT']:
-            # Mise à jour limitée
             updatable_fields = ['status', 'auto_renew', 'billing_cycle', 'plan', 'plan_name', 
                                 'max_products', 'max_users', 'max_storage_mb', 'end_date', 
                                 'trial_end_date', 'price', 'currency', 'cancelled_reason']
@@ -1307,7 +1522,6 @@ def _sync_subscription(db: Session, tenant_id: UUID, action: str, data: Dict[str
                     setattr(existing, field, data[field])
             existing.updated_at = datetime.utcnow()
             
-            # Recalculer le statut si nécessaire
             if existing.end_date and existing.end_date < datetime.utcnow():
                 existing.status = SubscriptionStatus.EXPIRED.value
             
@@ -1315,18 +1529,15 @@ def _sync_subscription(db: Session, tenant_id: UUID, action: str, data: Dict[str
             return {'success': True, 'id': str(existing.id), 'action': 'updated'}
         
         elif action_upper in ['CREATE', 'UPSERT']:
-            # Vérifier que la branche existe
             if not branch:
                 return {'success': False, 'error': 'branch_id requis pour la création'}
             
-            # Vérifier qu'il n'y a pas déjà un abonnement pour cette branche
             existing_for_branch = db.query(BranchSubscription).filter(
                 BranchSubscription.branch_id == branch_id,
                 BranchSubscription.tenant_id == tenant_id
             ).first()
             
             if existing_for_branch:
-                # Mettre à jour l'existant au lieu de créer
                 for field, value in data.items():
                     if hasattr(existing_for_branch, field):
                         setattr(existing_for_branch, field, value)
@@ -1334,7 +1545,6 @@ def _sync_subscription(db: Session, tenant_id: UUID, action: str, data: Dict[str
                 db.flush()
                 return {'success': True, 'id': str(existing_for_branch.id), 'action': 'updated'}
             
-            # Créer un nouvel abonnement
             subscription = BranchSubscription(
                 branch_id=branch_id,
                 tenant_id=tenant_id,
@@ -1356,7 +1566,6 @@ def _sync_subscription(db: Session, tenant_id: UUID, action: str, data: Dict[str
             db.add(subscription)
             db.flush()
             
-            # Lier l'abonnement à la branche
             branch.subscription_id = subscription.id
             db.flush()
             
@@ -1367,11 +1576,17 @@ def _sync_subscription(db: Session, tenant_id: UUID, action: str, data: Dict[str
     except Exception as e:
         logger.error(f"Erreur sync subscription: {e}", exc_info=True)
         return {'success': False, 'error': str(e)}
-    
-def _sync_stock_movement(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
+
+
+def _sync_stock_movement(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any],
+                         user_branch_id: Optional[UUID] = None, user_id: Optional[UUID] = None) -> Dict[str, Any]:
     """Synchronise un mouvement de stock"""
     from app.models.stock_movement import StockMovement
     from uuid import UUID as UUIDType
+    
+    # Ajouter le branch_id par défaut si nécessaire
+    if user_branch_id and 'branch_id' not in data:
+        data['branch_id'] = user_branch_id
     
     try:
         movement_id = data.get('id')
@@ -1387,7 +1602,6 @@ def _sync_stock_movement(db: Session, tenant_id: UUID, action: str, data: Dict[s
         
         action_upper = action.upper()
         
-        # Les mouvements de stock sont généralement en lecture seule côté offline
         if not existing and action_upper in ['CREATE', 'UPSERT']:
             data.pop('id', None)
             movement = StockMovement(
@@ -1402,6 +1616,127 @@ def _sync_stock_movement(db: Session, tenant_id: UUID, action: str, data: Dict[s
         
     except Exception as e:
         logger.error(f"Erreur sync stock movement: {e}", exc_info=True)
+        return {'success': False, 'error': str(e)}
+
+
+def _sync_expense(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any],
+                  user_branch_id: Optional[UUID] = None, user_id: Optional[UUID] = None) -> Dict[str, Any]:
+    """Synchronise une dépense"""
+    from app.models.finance import Expense
+    from uuid import UUID as UUIDType
+    
+    # Ajouter le branch_id par défaut si nécessaire
+    if user_branch_id and 'branch_id' not in data:
+        data['branch_id'] = user_branch_id
+    
+    try:
+        expense_id = data.get('id')
+        if expense_id and isinstance(expense_id, str):
+            expense_id = UUIDType(expense_id)
+        
+        existing = None
+        if expense_id:
+            existing = db.query(Expense).filter(
+                Expense.id == expense_id,
+                Expense.tenant_id == tenant_id
+            ).first()
+        
+        action_upper = action.upper()
+        
+        if action_upper == 'DELETE':
+            if existing:
+                if hasattr(existing, 'is_active'):
+                    existing.is_active = False
+                else:
+                    db.delete(existing)
+                db.flush()
+                return {'success': True, 'id': str(expense_id), 'action': 'deleted'}
+            return {'success': False, 'error': 'Dépense non trouvée'}
+        
+        if existing and action_upper in ['UPDATE', 'UPSERT']:
+            for field, value in data.items():
+                if field != 'id' and hasattr(existing, field):
+                    setattr(existing, field, value)
+            existing.total_amount = existing.amount + (existing.tax_amount or 0)
+            existing.updated_at = datetime.utcnow()
+            db.flush()
+            return {'success': True, 'id': str(existing.id), 'action': 'updated'}
+        
+        elif action_upper in ['CREATE', 'UPSERT']:
+            data.pop('id', None)
+            expense = Expense(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                **{k: v for k, v in data.items() if hasattr(Expense, k)}
+            )
+            expense.total_amount = expense.amount + (expense.tax_amount or 0)
+            db.add(expense)
+            db.flush()
+            return {'success': True, 'id': str(expense.id), 'action': 'created'}
+        
+        return {'success': False, 'error': f'Action non supportée: {action}'}
+        
+    except Exception as e:
+        logger.error(f"Erreur sync expense: {e}", exc_info=True)
+        return {'success': False, 'error': str(e)}
+
+
+def _sync_return(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any],
+                 user_branch_id: Optional[UUID] = None, user_id: Optional[UUID] = None) -> Dict[str, Any]:
+    """Synchronise un retour produit"""
+    from app.models.return_product import Return
+    from uuid import UUID as UUIDType
+    
+    # Ajouter le branch_id par défaut si nécessaire
+    if user_branch_id and 'branch_id' not in data:
+        data['branch_id'] = user_branch_id
+    
+    try:
+        return_id = data.get('id')
+        if return_id and isinstance(return_id, str):
+            return_id = UUIDType(return_id)
+        
+        existing = None
+        if return_id:
+            existing = db.query(Return).filter(
+                Return.id == return_id,
+                Return.tenant_id == tenant_id
+            ).first()
+        
+        action_upper = action.upper()
+        
+        if action_upper == 'DELETE':
+            if existing:
+                if hasattr(existing, 'is_active'):
+                    existing.is_active = False
+                else:
+                    db.delete(existing)
+                db.flush()
+                return {'success': True, 'id': str(return_id), 'action': 'deleted'}
+            return {'success': False, 'error': 'Retour non trouvé'}
+        
+        if existing and action_upper in ['UPDATE', 'UPSERT']:
+            for field, value in data.items():
+                if field != 'id' and hasattr(existing, field):
+                    setattr(existing, field, value)
+            existing.updated_at = datetime.utcnow()
+            db.flush()
+            return {'success': True, 'id': str(existing.id), 'action': 'updated'}
+        
+        elif action_upper in ['CREATE', 'UPSERT']:
+            data.pop('id', None)
+            return_obj = Return(
+                tenant_id=tenant_id,
+                **{k: v for k, v in data.items() if hasattr(Return, k)}
+            )
+            db.add(return_obj)
+            db.flush()
+            return {'success': True, 'id': str(return_obj.id), 'action': 'created'}
+        
+        return {'success': False, 'error': f'Action non supportée: {action}'}
+        
+    except Exception as e:
+        logger.error(f"Erreur sync return: {e}", exc_info=True)
         return {'success': False, 'error': str(e)}
 
 

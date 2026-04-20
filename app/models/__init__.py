@@ -52,6 +52,7 @@ from app.models.capital import Capital, CapitalAccount, CapitalTransaction, Turn
 from app.models.user_history import UserHistory
 from app.models.trash_bin import TrashBin
 from app.models.user_expense import UserExpense 
+from app.models.return_product import Return, ReturnItem
 
 __all__ = [
     # Core
@@ -112,5 +113,7 @@ __all__ = [
     "TrashBin",
     "PharmacyConfig",
     "BranchSubscription",
-    "UserExpense"
+    "UserExpense",
+    "Return",
+    "ReturnItem"
 ]

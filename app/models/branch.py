@@ -84,6 +84,7 @@ class Branch(Base):
     capitals = relationship("Capital", back_populates="branch")
     expenses = relationship("Expense", back_populates="branch", cascade="all, delete-orphan")
     subscription = relationship("BranchSubscription", back_populates="branch", uselist=False)
+    returns = relationship("Return", back_populates="branch", cascade="all, delete-orphan")
     # =========================
     # Méthodes
     # =========================
