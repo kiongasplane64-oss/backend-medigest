@@ -315,38 +315,37 @@ def is_subscription_active(db: Session, branch_id: str) -> bool:
             logger.warning("is_subscription_active appelé avec branch_id None")
             return True
         
-        branch = db.query(Branch).filter(Branch.id == branch_id).first()
-        if not branch:
-            logger.warning(f"Branche non trouvée: {branch_id}")
-            return True
-        
         from app.models.branch_subscription import BranchSubscription, SubscriptionStatus
         
+        # Chercher l'abonnement de la branche
         subscription = db.query(BranchSubscription).filter(
-            BranchSubscription.branch_id == branch.id
+            BranchSubscription.branch_id == branch_id
         ).first()
         
         if not subscription:
-            logger.warning(f"⚠️ Aucun abonnement trouvé pour branche {branch.id}")
-            return True
+            logger.warning(f"⚠️ Aucun abonnement trouvé pour la branche {branch_id}")
+            # Essayer de trouver la branche et créer un abonnement d'essai
+            branch = db.query(Branch).filter(Branch.id == branch_id).first()
+            if branch and branch.is_main_branch:
+                # Créer un abonnement d'essai pour la branche principale
+                from app.services.branch_subscription_service import create_trial_subscription
+                subscription = create_trial_subscription(db, branch_id)
+                if subscription:
+                    logger.info(f"✅ Abonnement d'essai créé pour la branche {branch_id}")
+                    return True
+            return True  # Fallback pour ne pas bloquer
         
-        # ✅ CORRIGÉ: subscription.plan est maintenant une string, pas un enum
+        # Vérifier si l'abonnement est actif
         is_active = subscription.is_active()
         
-        # Vérifier aussi le statut
-        status_active = subscription.status_enum == SubscriptionStatus.ACTIVE or subscription.status_enum == SubscriptionStatus.TRIAL
+        logger.info(f"📊 Abonnement pour branche {branch_id}: plan={subscription.plan}, actif={is_active}, fin={subscription.end_date}")
         
-        result = is_active and status_active
-        
-        # ✅ CORRIGÉ: Utiliser subscription.plan directement (c'est une string)
-        logger.info(f"📊 Abonnement pour branche {branch.id}: plan={subscription.plan}, actif={result}, fin={subscription.end_date}")
-        
-        return result
+        return is_active
         
     except Exception as e:
         logger.error(f"❌ Erreur lors de la vérification de l'abonnement: {e}", exc_info=True)
-        return True
-
+        return True  # Fallback pour ne pas bloquer en cas d'erreur
+    
 @router.post("/reset-active-branch")
 async def reset_active_branch(
     current_user: User = Depends(get_current_active_user),
@@ -514,7 +513,7 @@ def decode_token_safely(token: str) -> dict:
 # =========================
 @router.post("/tenants/register", status_code=201)
 def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
-    """Inscription d'un nouveau tenant (pharmacie) avec création automatique de l'abonnement d'essai"""
+    """Inscription d'un nouveau tenant (pharmacie) avec création automatique de l'abonnement d'essai pour la branche"""
     
     # =========================
     # 1. VÉRIFICATIONS PRÉLIMINAIRES
@@ -744,13 +743,13 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         )
 
     # =========================
-    # 6. CRÉATION DE L'UTILISATEUR ADMIN ET ASSOCIATION (UNE SEULE FOIS)
+    # 6. CRÉATION DE L'UTILISATEUR ADMIN
     # =========================
 
     try:
         hashed_password = hash_password(data.password)
         
-        # Créer l'utilisateur
+        # Créer l'utilisateur avec active_branch_id
         admin = User(
             tenant_id=tenant.id,
             nom_complet=data.nom_complet,
@@ -761,12 +760,12 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
             telephone=data.telephone,
             login_attempts=0,
             active_pharmacy_id=pharmacy.id,
-            active_branch_id=default_branch.id
+            active_branch_id=default_branch.id  # L'utilisateur appartient à cette branche
         )
         db.add(admin)
         db.flush()
         
-        # Créer l'association user_pharmacy (UNE SEULE FOIS)
+        # Créer l'association user_pharmacy
         association = UserPharmacy(
             user_id=admin.id,
             pharmacy_id=pharmacy.id,
@@ -777,7 +776,7 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         db.add(association)
         db.flush()
         
-        # Mettre à jour la branche
+        # Mettre à jour la branche avec le manager
         default_branch.manager_id = admin.id
         default_branch.created_by = admin.id
         db.add(default_branch)
@@ -795,31 +794,43 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         )
 
     # =========================
-    # 7. CRÉATION DE L'ABONNEMENT DE LA PHARMACIE
+    # 7. CRÉATION DE L'ABONNEMENT DE LA BRANCHE
     # =========================
 
-    from app.services.pharmacy_subscription_service import create_pharmacy_subscription
+    from app.models.branch_subscription import BranchSubscription, SubscriptionPlan, SubscriptionStatus
 
-    pharmacy_sub = None
+    branch_subscription = None
     try:
-        # Créer un abonnement d'essai pour la pharmacie principale
-        pharmacy_sub = create_pharmacy_subscription(
-            db=db,
+        # Créer un abonnement d'essai pour la branche principale
+        trial_end_date = datetime.utcnow() + timedelta(days=14)
+        
+        branch_subscription = BranchSubscription(
+            id=uuid.uuid4(),
+            branch_id=default_branch.id,
+            tenant_id=tenant.id,
             pharmacy_id=pharmacy.id,
-            plan="TRIAL",
+            plan=SubscriptionPlan.TRIAL.value,
+            plan_name="Essai gratuit",
+            start_date=datetime.utcnow(),
+            end_date=trial_end_date,
+            trial_end_date=trial_end_date,
+            status=SubscriptionStatus.TRIAL.value,
             billing_cycle="monthly",
-            custom_trial_days=14
+            price=0.0,
+            currency="EUR",
+            auto_renew=False,
+            max_products=limits["max_products"],
+            max_users=limits["max_users"],
+            max_storage_mb=100
         )
+        db.add(branch_subscription)
+        db.flush()
         
-        logger.info(f"Abonnement d'essai créé pour la pharmacie {pharmacy.id}")
-        
-        # Mettre à jour la pharmacie avec l'abonnement
-        pharmacy.subscription_id = pharmacy_sub.id
-        db.add(pharmacy)
+        logger.info(f"✅ Abonnement d'essai créé pour la branche {default_branch.id}")
         
     except Exception as e:
         db.rollback()
-        logger.error(f"Erreur création abonnement pharmacie: {e}")
+        logger.error(f"❌ Erreur création abonnement branche: {e}")
         raise HTTPException(
             status_code=500,
             detail={
@@ -830,12 +841,12 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         )
     
     # =========================
-    # 9. VALIDATION FINALE
+    # 8. VALIDATION FINALE
     # =========================
     
     try:
         db.commit()
-        logger.info(f"Tenant créé avec succès: {tenant_code} - Admin: {admin.email}")
+        logger.info(f"Tenant créé avec succès: {tenant_code} - Admin: {admin.email} - Branche: {default_branch.id}")
         
     except Exception as e:
         db.rollback()
@@ -850,7 +861,7 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
         )
 
     # =========================
-    # 10. RÉPONSE AU CLIENT
+    # 9. RÉPONSE AU CLIENT
     # =========================
     
     response = {
@@ -861,24 +872,25 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
             "user_id": str(admin.id),
             "tenant_code": tenant_code,
             "pharmacy_id": str(pharmacy.id),
+            "branch_id": str(default_branch.id),
             "plan": "trial",
             "plan_name": "Essai gratuit",
-            "trial_end_date": pharmacy_sub.end_date.isoformat(),
+            "trial_end_date": branch_subscription.end_date.isoformat(),
             "trial_days": 14,
             "subscription": {
-                "id": str(pharmacy_sub.id),
-                "status": pharmacy_sub.status,
-                "days_remaining": pharmacy_sub.days_remaining(),
-                "is_trial": pharmacy_sub.plan == "trial",
-                "mode": "FULL" if pharmacy_sub.is_active() else "READ_ONLY"
+                "id": str(branch_subscription.id),
+                "branch_id": str(default_branch.id),
+                "status": branch_subscription.status,
+                "days_remaining": branch_subscription.days_remaining(),
+                "is_trial": branch_subscription.is_trial(),
+                "mode": "FULL" if branch_subscription.is_active() else "READ_ONLY"
             },
             "limits": {
                 "max_users": limits["max_users"],
                 "max_products": limits["max_products"],
                 "max_pharmacies": limits["max_pharmacies"]
             },
-            "created_at": datetime.utcnow().isoformat(),
-            "trial_end_date": pharmacy_sub.end_date.isoformat()
+            "created_at": datetime.utcnow().isoformat()
         },
         "next_steps": {
             "login": {
@@ -893,7 +905,7 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
                 "message": "Un SMS de bienvenue sera envoyé lors de votre première connexion",
                 "note": "Le SMS sera envoyé automatiquement après votre première connexion réussie"
             },
-            "trial_info": f"Vous bénéficiez de 14 jours d'essai gratuit jusqu'au {pharmacy_sub.end_date.strftime('%d/%m/%Y')}",
+            "trial_info": f"Vous bénéficiez de 14 jours d'essai gratuit jusqu'au {branch_subscription.end_date.strftime('%d/%m/%Y')}",
             "dashboard_access": "Connectez-vous pour accéder à votre tableau de bord"
         },
         "recommendations": [

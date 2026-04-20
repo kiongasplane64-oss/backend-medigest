@@ -476,44 +476,66 @@ async def require_active_subscription(
     db: Session = Depends(get_db),
 ) -> User:
     """
-    Vérifie que l'utilisateur a un abonnement actif.
+    Vérifie que l'utilisateur a un abonnement actif (basé sur sa branche active)
     """
     if _is_super_admin(current_user):
         logger.info("✅ Super admin - accès illimité: %s", getattr(current_user, "email", None))
         return current_user
 
-    sub_status = check_user_subscription(db, str(current_user.id))
+    # Vérifier l'abonnement de la branche active de l'utilisateur
+    active_branch_id = getattr(current_user, "active_branch_id", None)
     
-    if not sub_status.get("has_subscription", False):
-        logger.warning("⚠️ Pas d'abonnement pour %s", getattr(current_user, "email", None))
+    if not active_branch_id:
+        # Si pas de branche active, essayer de trouver la branche principale du tenant
+        if current_user.tenant_id:
+            main_branch = db.query(Branch).filter(
+                Branch.tenant_id == current_user.tenant_id,
+                Branch.is_main_branch == True,
+                Branch.is_active == True
+            ).first()
+            if main_branch:
+                active_branch_id = main_branch.id
+                # Mettre à jour l'utilisateur
+                current_user.active_branch_id = active_branch_id
+                db.commit()
+    
+    if not active_branch_id:
+        logger.warning("⚠️ Pas de branche active pour %s", getattr(current_user, "email", None))
+        # Fallback : autoriser temporairement
+        return current_user
+    
+    # Vérifier l'abonnement de la branche
+    from app.models.branch_subscription import BranchSubscription
+    
+    subscription = db.query(BranchSubscription).filter(
+        BranchSubscription.branch_id == active_branch_id
+    ).first()
+    
+    if not subscription:
+        logger.warning(f"⚠️ Pas d'abonnement trouvé pour la branche {active_branch_id}")
+        # Créer un abonnement d'essai si c'est la branche principale
+        branch = db.query(Branch).filter(Branch.id == active_branch_id).first()
+        if branch and branch.is_main_branch:
+            from app.services.branch_subscription_service import create_trial_subscription
+            subscription = create_trial_subscription(db, str(active_branch_id))
+            if subscription:
+                logger.info(f"✅ Abonnement d'essai créé pour branche {active_branch_id}")
+                return current_user
+    
+    if not subscription or not subscription.is_active():
+        logger.warning(f"⚠️ Abonnement expiré pour la branche {active_branch_id} de {current_user.email}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
-                "error": "no_subscription",
-                "message": "Vous n'avez pas d'abonnement actif",
+                "error": "subscription_expired",
+                "message": "L'abonnement de votre succursale a expiré. Mode lecture seule.",
                 "mode": "READ_ONLY",
-                "action": "subscribe",
-            },
+                "branch_id": str(active_branch_id),
+                "action": "Renouvelez l'abonnement de votre succursale"
+            }
         )
-
-    if sub_status.get("mode") == "READ_ONLY":
-        error_detail = {
-            "error": "subscription_expired",
-            "message": sub_status.get("message", "Votre abonnement a expiré"),
-            "mode": "READ_ONLY",
-        }
-        if sub_status.get("expired_date"):
-            error_detail["expired_date"] = sub_status["expired_date"]
-
-        logger.warning("⚠️ Abonnement expiré pour %s", getattr(current_user, "email", None))
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=error_detail,
-        )
-
-    current_user.user_subscription_info = sub_status
+    
     return current_user
-
 
 async def check_admin_limits(
     current_user: User = Depends(get_current_active_user),
@@ -521,7 +543,7 @@ async def check_admin_limits(
     action: Optional[str] = None,
 ) -> User:
     """
-    Vérifie que l'admin peut effectuer une action selon les limites de son plan.
+    Vérifie que l'admin peut effectuer une action selon les limites de l'abonnement de sa branche.
     """
     if getattr(current_user, "role", None) != "admin":
         raise HTTPException(
@@ -529,8 +551,20 @@ async def check_admin_limits(
             detail="Action réservée aux administrateurs",
         )
 
-    sub_status = check_user_subscription(db, str(current_user.id))
-    if not sub_status.get("has_subscription", False) or sub_status.get("mode") == "READ_ONLY":
+    # Vérifier l'abonnement de la branche active
+    active_branch_id = getattr(current_user, "active_branch_id", None)
+    
+    if not active_branch_id:
+        logger.warning("⚠️ Admin sans branche active")
+        return current_user
+    
+    from app.models.branch_subscription import BranchSubscription
+    
+    subscription = db.query(BranchSubscription).filter(
+        BranchSubscription.branch_id == active_branch_id
+    ).first()
+    
+    if not subscription or not subscription.is_active():
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
@@ -539,68 +573,49 @@ async def check_admin_limits(
                 "mode": "READ_ONLY",
             },
         )
+    
+    # Vérifier les limites
+    if action == "create_user" and subscription.max_users > 0:
+        # Compter les utilisateurs de la branche
+        user_count = db.query(User).filter(
+            User.tenant_id == current_user.tenant_id,
+            User.active_branch_id == active_branch_id,
+            User.actif == True
+        ).count()
+        
+        if user_count >= subscription.max_users:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": "user_limit_reached",
+                    "message": f"Limite d'utilisateurs atteinte ({user_count} / {subscription.max_users})",
+                    "current": user_count,
+                    "limit": subscription.max_users,
+                    "suggestion": "Passez à un plan supérieur pour ajouter plus d'utilisateurs",
+                },
+            )
 
-    limits = check_tenant_limits(db, str(current_user.tenant_id))
-    current_user.tenant_limits = limits
-
-    if action == "create_user" and not limits.get("can_create_user", False):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "error": "user_limit_reached",
-                "message": (
-                    f"Limite d'utilisateurs atteinte "
-                    f"({limits['current_usage']['users']} / {limits['limits']['max_users']})"
-                ),
-                "current": limits["current_usage"]["users"],
-                "limit": limits["limits"]["max_users"],
-                "suggestion": "Passez à un plan supérieur pour ajouter plus d'utilisateurs",
-            },
-        )
-
-    if action == "create_pharmacy" and not limits.get("can_create_pharmacy", False):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "error": "pharmacy_limit_reached",
-                "message": (
-                    f"Limite de pharmacies atteinte "
-                    f"({limits['current_usage']['pharmacies']} / {limits['limits']['max_pharmacies']})"
-                ),
-                "current": limits["current_usage"]["pharmacies"],
-                "limit": limits["limits"]["max_pharmacies"],
-                "suggestion": "Passez à un plan supérieur pour créer plus de pharmacies",
-            },
-        )
-
-    if action == "create_branch" and not limits.get("can_create_branch", False):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "error": "branch_limit_reached",
-                "message": (
-                    f"Limite de succursales atteinte "
-                    f"({limits['current_usage']['branches']} / {limits['limits']['max_branches']})"
-                ),
-                "current": limits["current_usage"].get("branches", 0),
-                "limit": limits["limits"].get("max_branches", 0),
-                "suggestion": "Passez à un plan supérieur pour créer plus de succursales",
-            },
-        )
-
-    if action and not can_user_access_feature(current_user, action):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "error": "feature_not_available",
-                "message": "Cette fonctionnalité n'est pas disponible dans votre plan actuel",
-                "feature": action,
-                "plan": limits.get("plan"),
-            },
-        )
+    if action == "create_product" and subscription.max_products > 0:
+        # Compter les produits de la branche
+        from app.models.product import Product
+        product_count = db.query(Product).filter(
+            Product.branch_id == active_branch_id,
+            Product.is_active == True
+        ).count()
+        
+        if product_count >= subscription.max_products:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": "product_limit_reached",
+                    "message": f"Limite de produits atteinte ({product_count} / {subscription.max_products})",
+                    "current": product_count,
+                    "limit": subscription.max_products,
+                    "suggestion": "Passez à un plan supérieur pour ajouter plus de produits",
+                },
+            )
 
     return current_user
-
 
 # =============================================================================
 # 4. CONTEXTE PHARMACIE

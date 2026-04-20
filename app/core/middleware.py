@@ -5,7 +5,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
-from app.api.v1.auth import is_subscription_active
+from app.models.branch_subscription import BranchSubscription
 import logging
 import re
 
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class SubscriptionCheckMiddleware(BaseHTTPMiddleware):
-    """Middleware pour vérifier l'abonnement sur les endpoints protégés"""
+    """Middleware pour vérifier l'abonnement de la branche sur les endpoints protégés"""
     
     # Endpoints exemptés de la vérification (toujours autorisés)
     EXEMPT_PATHS = [
@@ -25,6 +25,7 @@ class SubscriptionCheckMiddleware(BaseHTTPMiddleware):
         "/api/v1/auth/api-status",
         "/api/v1/auth/verify-subscription",
         "/api/v1/auth/subscription/readonly-status",
+        "/api/v1/auth/reset-active-branch",
         "/docs",
         "/redoc",
         "/openapi.json"
@@ -43,7 +44,7 @@ class SubscriptionCheckMiddleware(BaseHTTPMiddleware):
         r'^/api/v1/session/.*$',
         r'^/api/v1/pharmacies/.*/service-status$',
         r'^/api/v1/pharmacies/active$',
-        r'^/api/v1/pharmacies/.*$',  # GET sur une pharmacie spécifique
+        r'^/api/v1/branches/.*$',  # GET sur les branches
         r'^/api/v1/stock/alerts/stock$',
         r'^/api/v1/stock/alerts/expiry$',
         r'^/api/v1/dashboard/stats$',
@@ -83,7 +84,7 @@ class SubscriptionCheckMiddleware(BaseHTTPMiddleware):
         
         token = auth_header.replace("Bearer ", "")
         
-        # Décoder le token pour obtenir le tenant_id
+        # Décoder le token pour obtenir le branch_id
         try:
             from jose import jwt
             from app.core.config import settings
@@ -95,16 +96,22 @@ class SubscriptionCheckMiddleware(BaseHTTPMiddleware):
                 options={"verify_exp": True}
             )
             
-            tenant_id = payload.get("tenant_id")
+            branch_id = payload.get("branch_id")
             user_id = payload.get("sub")
+            tenant_id = payload.get("tenant_id")
             
-            if tenant_id and user_id:
+            if branch_id and user_id:
                 db = SessionLocal()
                 try:
-                    subscription_active = is_subscription_active(db, tenant_id)
+                    # Vérifier l'abonnement de la branche
+                    subscription = db.query(BranchSubscription).filter(
+                        BranchSubscription.branch_id == branch_id
+                    ).first()
+                    
+                    subscription_active = subscription.is_active() if subscription else False
                     
                     if not subscription_active:
-                        logger.warning(f"⚠️ Abonnement expiré pour tenant {tenant_id}, utilisateur {user_id}")
+                        logger.warning(f"⚠️ Abonnement expiré pour branche {branch_id}, utilisateur {user_id}")
                         
                         # Vérifier si le path est autorisé en lecture seule
                         is_readonly_allowed = any(
@@ -121,10 +128,11 @@ class SubscriptionCheckMiddleware(BaseHTTPMiddleware):
                                 status_code=403,
                                 content={
                                     "error": "subscription_expired_readonly",
-                                    "message": "Votre abonnement a expiré. Mode lecture seule uniquement.",
+                                    "message": "L'abonnement de votre succursale a expiré. Mode lecture seule uniquement.",
                                     "read_only_mode": True,
                                     "subscription_expired": True,
-                                    "action": "Renouvelez votre abonnement pour modifier vos données",
+                                    "branch_id": str(branch_id),
+                                    "action": "Renouvelez l'abonnement de votre succursale",
                                     "allowed_operations": ["GET", "HEAD", "OPTIONS"],
                                     "forbidden_operations": ["POST", "PUT", "PATCH", "DELETE"],
                                     "renewal_url": "/api/v1/subscriptions/plans"
