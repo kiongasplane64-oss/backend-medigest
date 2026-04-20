@@ -207,33 +207,27 @@ class SubscriptionDetailSchema(SubscriptionResponseSchema):
 # =======================
 # SCHÉMAS POUR CODES D'ABONNEMENT
 # =======================
-
 class SubscriptionCodeCreate(BaseModel):
     """
     Schéma pour la création d'un code d'abonnement.
+    Le code est lié à une BRANCHE spécifique.
     """
-    plan_type: str = Field(..., description="Type de plan (starter, pro, enterprise)")
-    billing_cycle: Optional[str] = Field("monthly", description="Cycle de facturation (monthly/yearly)")
-    duration_days: Optional[int] = Field(None, description="Durée en jours de l'abonnement")
-    price: Optional[float] = Field(None, description="Prix personnalisé (laisser vide pour prix par défaut)")
+    plan_type: str = Field(..., description="Type de plan (trial, starter, professional, enterprise)")
+    branch_id: UUID = Field(..., description="ID de la branche concernée")
+    duration_days: Optional[int] = Field(None, description="Durée en jours (défaut: 30)")
+    price: Optional[float] = Field(None, description="Prix personnalisé (en euros)")
     currency: Optional[str] = Field("EUR", description="Devise")
-    valid_from: Optional[datetime] = Field(None, description="Date de début de validité")
-    valid_until: Optional[datetime] = Field(None, description="Date de fin de validité")
+    valid_until: Optional[datetime] = Field(None, description="Date d'expiration du code")
     expiry_days: Optional[int] = Field(90, description="Durée de validité du code en jours")
-    code_length: Optional[int] = Field(8, description="Longueur du code")
-    notes: Optional[str] = Field(None, description="Notes additionnelles")
-    tenant_id: Optional[UUID] = Field(None, description="ID de la pharmacie associée")
-    user_id: Optional[UUID] = Field(None, description="ID de l'utilisateur associé")
+    notes: Optional[str] = Field(None, description="Notes")
     
     model_config = ConfigDict(from_attributes=True)
-
 
 class ActivateSubscriptionCode(BaseModel):
     """
     Schéma pour l'activation d'un code d'abonnement.
     """
     code: str = Field(..., description="Code à activer")
-    force: bool = Field(False, description="Forcer l'activation même si abonnement actif")
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -252,8 +246,8 @@ class SubscriptionCodeResponse(BaseModel):
     valid_until: Optional[datetime]
     created_at: datetime
     status: str
-    tenant_id: Optional[str] = None
-    user_id: Optional[str] = None
+    branch_id: Optional[str] = None
+    branch_name: Optional[str] = None
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -485,7 +479,71 @@ class SubscriptionStatusUpdate(BaseModel):
     
     model_config = ConfigDict(from_attributes=True)
 
+# =======================
+# SCHÉMAS POUR ABONNEMENT DE BRANCHE
+# =======================
 
+class BranchSubscriptionBase(BaseModel):
+    """Base pour l'abonnement d'une branche"""
+    plan: str = Field(..., description="Plan d'abonnement")
+    billing_cycle: str = Field("monthly", description="Cycle de facturation (monthly/yearly)")
+    auto_renew: bool = Field(True, description="Renouvellement automatique")
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class BranchSubscriptionCreate(BranchSubscriptionBase):
+    """Création d'un abonnement pour une branche"""
+    branch_id: UUID = Field(..., description="ID de la branche")
+    duration_days: int = Field(30, ge=1, le=3650, description="Durée en jours")
+    payment_method: Optional[str] = Field(None, description="Méthode de paiement")
+    payment_reference: Optional[str] = Field(None, description="Référence de paiement")
+
+
+class BranchSubscriptionResponse(BranchSubscriptionBase):
+    """Réponse pour l'abonnement d'une branche"""
+    id: UUID
+    branch_id: UUID
+    branch_name: Optional[str] = None
+    tenant_id: UUID
+    plan_name: str
+    start_date: datetime
+    end_date: datetime
+    trial_end_date: Optional[datetime] = None
+    status: str
+    price: float
+    currency: str
+    max_products: int
+    max_users: int
+    max_storage_mb: int
+    is_active: bool
+    is_trial: bool
+    days_remaining: int
+    trial_days_remaining: int
+    created_at: datetime
+    
+    model_config = ConfigDict(from_attributes=True)
+
+
+class BranchSubscriptionStatusResponse(BaseModel):
+    """Statut de l'abonnement pour une branche"""
+    branch_id: UUID
+    branch_name: str
+    has_active_subscription: bool
+    plan: Optional[str] = None
+    plan_name: Optional[str] = None
+    status: Optional[str] = None
+    days_remaining: int
+    is_trial: bool
+    trial_days_remaining: int
+    max_users: int
+    current_users: int
+    max_products: int
+    current_products: int
+    can_add_users: bool
+    can_add_products: bool
+    
+    model_config = ConfigDict(from_attributes=True)
 # =======================
 # SCHÉMAS DE RÉPONSE
 # =======================

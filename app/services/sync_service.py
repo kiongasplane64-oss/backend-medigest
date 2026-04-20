@@ -437,48 +437,49 @@ def get_changes_since(
                 'timestamp': (pharmacy.updated_at or pharmacy.created_at).isoformat() if (pharmacy.updated_at or pharmacy.created_at) else None
             })
         
-        # 10. Abonnements (PharmacySubscription)
-        from app.models.pharmacy_subscription import PharmacySubscription
-        from app.models.pharmacy import Pharmacy
+        # 10. Abonnements des branches (BranchSubscription)
+        from app.models.branch_subscription import BranchSubscription
+        from app.models.branch import Branch
 
-        # Récupérer toutes les pharmacies du tenant pour obtenir leurs abonnements
-        pharmacy_ids_query = db.query(Pharmacy.id).filter(Pharmacy.tenant_id == tenant_id)
-        pharmacy_ids = [p[0] for p in pharmacy_ids_query.all()]
+        # Récupérer toutes les branches du tenant
+        branches_query = db.query(Branch.id).filter(Branch.tenant_id == tenant_id)
+        branch_ids = [b[0] for b in branches_query.all()]
 
-        if pharmacy_ids:
-            query = db.query(PharmacySubscription).filter(
-                PharmacySubscription.pharmacy_id.in_(pharmacy_ids)
+        if branch_ids:
+            query = db.query(BranchSubscription).filter(
+                BranchSubscription.branch_id.in_(branch_ids),
+                BranchSubscription.tenant_id == tenant_id
             )
             if since:
                 query = query.filter(
-                    (PharmacySubscription.updated_at >= since) | 
-                    (PharmacySubscription.created_at >= since)
+                    (BranchSubscription.updated_at >= since) | 
+                    (BranchSubscription.created_at >= since)
                 )
             
             for sub in query.all():
-                # Récupérer le tenant_id via la pharmacie
-                pharmacy = db.query(Pharmacy).filter(Pharmacy.id == sub.pharmacy_id).first()
-                sub_tenant_id = pharmacy.tenant_id if pharmacy else tenant_id
-                
                 changes['subscriptions'].append({
                     'id': str(sub.id),
                     'action': 'update' if (sub.updated_at and since and sub.updated_at >= since) else 'create',
                     'data': {
                         'id': str(sub.id),
-                        'pharmacy_id': str(sub.pharmacy_id),
-                        'tenant_id': str(sub_tenant_id),
+                        'branch_id': str(sub.branch_id),
+                        'tenant_id': str(sub.tenant_id),
+                        'pharmacy_id': str(sub.pharmacy_id) if sub.pharmacy_id else None,
                         'plan_name': sub.plan_name,
-                        'plan_type': sub.plan.value if sub.plan else None,
-                        'status': sub.status.value if sub.status else None,
+                        'plan_type': sub.plan,
+                        'status': sub.status,
                         'max_users': sub.max_users,
                         'max_products': sub.max_products,
-                        'max_branches': sub.max_branches,
-                        'features': None,  # À définir selon vos besoins
+                        'max_storage_mb': sub.max_storage_mb,
                         'billing_cycle': sub.billing_cycle,
-                        'price': float(sub.price) if sub.price else 0,
+                        'price': sub.price,
                         'currency': sub.currency,
                         'current_period_start': sub.start_date.isoformat() if sub.start_date else None,
                         'current_period_end': sub.end_date.isoformat() if sub.end_date else None,
+                        'trial_end_date': sub.trial_end_date.isoformat() if sub.trial_end_date else None,
+                        'is_trial': sub.status == 'TRIAL',
+                        'days_remaining': sub.days_remaining(),
+                        'auto_renew': sub.auto_renew,
                         'cancel_at_period_end': not sub.auto_renew,
                         'is_active': sub.is_active(),
                         'created_at': sub.created_at.isoformat() if sub.created_at else None,
@@ -1222,116 +1223,138 @@ def _sync_pharmacy(db: Session, tenant_id: UUID, action: str, data: Dict[str, An
         return {'success': False, 'error': str(e)}
 
 def _sync_subscription(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    """Synchronise un abonnement (PharmacySubscription)"""
-    from app.models.pharmacy_subscription import PharmacySubscription, SubscriptionPlan, SubscriptionStatus
-    from app.models.pharmacy import Pharmacy
+    """Synchronise un abonnement de branche (BranchSubscription)"""
+    from app.models.branch_subscription import BranchSubscription, SubscriptionPlan, SubscriptionStatus
+    from app.models.branch import Branch
     from uuid import UUID as UUIDType
-    from datetime import datetime
+    from datetime import datetime, timedelta
     
     try:
         sub_id = data.get('id')
         if sub_id and isinstance(sub_id, str):
             sub_id = UUIDType(sub_id)
         
-        pharmacy_id = data.get('pharmacy_id')
-        if pharmacy_id and isinstance(pharmacy_id, str):
-            pharmacy_id = UUIDType(pharmacy_id)
+        branch_id = data.get('branch_id')
+        if branch_id and isinstance(branch_id, str):
+            branch_id = UUIDType(branch_id)
         
-        # Vérifier que la pharmacie existe et appartient au tenant
-        pharmacy = None
-        if pharmacy_id:
-            pharmacy = db.query(Pharmacy).filter(
-                Pharmacy.id == pharmacy_id,
-                Pharmacy.tenant_id == tenant_id
+        # Vérifier que la branche existe et appartient au tenant
+        branch = None
+        if branch_id:
+            branch = db.query(Branch).filter(
+                Branch.id == branch_id,
+                Branch.tenant_id == tenant_id
             ).first()
             
-            if not pharmacy:
-                return {'success': False, 'error': f'Pharmacie {pharmacy_id} non trouvée ou n\'appartient pas au tenant'}
+            if not branch:
+                return {'success': False, 'error': f'Branche {branch_id} non trouvée ou n\'appartient pas au tenant'}
         
         existing = None
         if sub_id:
-            existing = db.query(PharmacySubscription).filter(
-                PharmacySubscription.id == sub_id
+            existing = db.query(BranchSubscription).filter(
+                BranchSubscription.id == sub_id,
+                BranchSubscription.tenant_id == tenant_id
             ).first()
-            
-            # Vérifier que l'abonnement existant correspond à une pharmacie du tenant
-            if existing:
-                existing_pharmacy = db.query(Pharmacy).filter(
-                    Pharmacy.id == existing.pharmacy_id,
-                    Pharmacy.tenant_id == tenant_id
-                ).first()
-                if not existing_pharmacy:
-                    return {'success': False, 'error': 'Abonnement non autorisé pour ce tenant'}
-        elif pharmacy_id:
-            # Chercher l'abonnement actif de la pharmacie
-            existing = db.query(PharmacySubscription).filter(
-                PharmacySubscription.pharmacy_id == pharmacy_id
+        elif branch_id:
+            # Chercher l'abonnement de la branche
+            existing = db.query(BranchSubscription).filter(
+                BranchSubscription.branch_id == branch_id,
+                BranchSubscription.tenant_id == tenant_id
             ).first()
         
         action_upper = action.upper()
         
         if action_upper == 'DELETE':
             if existing:
-                # Soft delete: marquer comme inactif
-                existing.status = SubscriptionStatus.CANCELLED
+                # Soft delete: marquer comme annulé
+                existing.status = SubscriptionStatus.CANCELLED.value
+                existing.cancelled_at = datetime.utcnow()
                 existing.updated_at = datetime.utcnow()
                 db.flush()
                 return {'success': True, 'id': str(existing.id), 'action': 'cancelled'}
             return {'success': False, 'error': 'Abonnement non trouvé'}
         
         # Préparer les données
-        data['pharmacy_id'] = pharmacy_id
+        data['branch_id'] = branch_id
+        data['tenant_id'] = tenant_id
         data.pop('id', None)
         
-        # Convertir les enums
-        if 'plan' in data and isinstance(data['plan'], str):
-            try:
-                data['plan'] = SubscriptionPlan(data['plan'].lower())
-            except ValueError:
-                return {'success': False, 'error': f"Plan invalide: {data['plan']}"}
+        # Convertir les champs
+        if 'plan' in data:
+            plan_value = data['plan'].upper() if isinstance(data['plan'], str) else data['plan']
+            data['plan'] = plan_value
         
-        if 'status' in data and isinstance(data['status'], str):
-            try:
-                data['status'] = SubscriptionStatus(data['status'].lower())
-            except ValueError:
-                pass  # Garder la valeur par défaut
+        if 'status' in data:
+            status_value = data['status'].upper() if isinstance(data['status'], str) else data['status']
+            data['status'] = status_value
+        
+        # Gérer la période d'essai
+        if data.get('is_trial') and not data.get('trial_end_date'):
+            data['trial_end_date'] = datetime.utcnow() + timedelta(days=14)
+            if not data.get('end_date'):
+                data['end_date'] = data['trial_end_date']
         
         if existing and action_upper in ['UPDATE', 'UPSERT']:
-            # Mise à jour limitée (certains champs ne devraient pas être modifiés)
-            updatable_fields = ['status', 'auto_renew', 'billing_cycle', 'updated_at']
+            # Mise à jour limitée
+            updatable_fields = ['status', 'auto_renew', 'billing_cycle', 'plan', 'plan_name', 
+                                'max_products', 'max_users', 'max_storage_mb', 'end_date', 
+                                'trial_end_date', 'price', 'currency', 'cancelled_reason']
             for field in updatable_fields:
                 if field in data and hasattr(existing, field):
                     setattr(existing, field, data[field])
             existing.updated_at = datetime.utcnow()
+            
+            # Recalculer le statut si nécessaire
+            if existing.end_date and existing.end_date < datetime.utcnow():
+                existing.status = SubscriptionStatus.EXPIRED.value
+            
             db.flush()
             return {'success': True, 'id': str(existing.id), 'action': 'updated'}
         
         elif action_upper in ['CREATE', 'UPSERT']:
-            # Vérifier que la pharmacie a un tenant_id valide
-            if not pharmacy:
-                return {'success': False, 'error': 'pharmacy_id requis pour la création'}
+            # Vérifier que la branche existe
+            if not branch:
+                return {'success': False, 'error': 'branch_id requis pour la création'}
+            
+            # Vérifier qu'il n'y a pas déjà un abonnement pour cette branche
+            existing_for_branch = db.query(BranchSubscription).filter(
+                BranchSubscription.branch_id == branch_id,
+                BranchSubscription.tenant_id == tenant_id
+            ).first()
+            
+            if existing_for_branch:
+                # Mettre à jour l'existant au lieu de créer
+                for field, value in data.items():
+                    if hasattr(existing_for_branch, field):
+                        setattr(existing_for_branch, field, value)
+                existing_for_branch.updated_at = datetime.utcnow()
+                db.flush()
+                return {'success': True, 'id': str(existing_for_branch.id), 'action': 'updated'}
             
             # Créer un nouvel abonnement
-            subscription = PharmacySubscription(
-                pharmacy_id=pharmacy_id,
-                plan=data.get('plan', SubscriptionPlan.TRIAL),
+            subscription = BranchSubscription(
+                branch_id=branch_id,
+                tenant_id=tenant_id,
+                pharmacy_id=branch.parent_pharmacy_id if branch.parent_pharmacy_id else None,
+                plan=data.get('plan', SubscriptionPlan.TRIAL.value),
                 plan_name=data.get('plan_name', 'Essai'),
                 start_date=data.get('start_date', datetime.utcnow()),
                 end_date=data.get('end_date', datetime.utcnow() + timedelta(days=30)),
-                status=data.get('status', SubscriptionStatus.ACTIVE),
+                trial_end_date=data.get('trial_end_date'),
+                status=data.get('status', SubscriptionStatus.TRIAL.value if data.get('is_trial') else SubscriptionStatus.ACTIVE.value),
                 billing_cycle=data.get('billing_cycle', 'monthly'),
-                price=data.get('price', 0),
+                price=data.get('price', 0.0),
                 currency=data.get('currency', 'EUR'),
                 auto_renew=data.get('auto_renew', True),
-                max_products=data.get('max_products', 2000),
+                max_products=data.get('max_products', 100),
                 max_users=data.get('max_users', 5),
-                max_branches=data.get('max_branches', 0)
+                max_storage_mb=data.get('max_storage_mb', 100)
             )
             db.add(subscription)
             db.flush()
             
-            # Lier l'abonnement à la pharmacie
-            pharmacy.subscription_id = subscription.id
+            # Lier l'abonnement à la branche
+            branch.subscription_id = subscription.id
             db.flush()
             
             return {'success': True, 'id': str(subscription.id), 'action': 'created'}
@@ -1341,7 +1364,7 @@ def _sync_subscription(db: Session, tenant_id: UUID, action: str, data: Dict[str
     except Exception as e:
         logger.error(f"Erreur sync subscription: {e}", exc_info=True)
         return {'success': False, 'error': str(e)}
-
+    
 def _sync_stock_movement(db: Session, tenant_id: UUID, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
     """Synchronise un mouvement de stock"""
     from app.models.stock_movement import StockMovement

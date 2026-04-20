@@ -1,9 +1,9 @@
 # app/api/v1/subscriptions.py
 """
-Endpoints de gestion des abonnements (NOUVELLE VERSION).
-- Abonnement lié à la pharmacie/branche
-- Utilisateur hérite des droits de sa pharmacie active
-- Version utilisant UNIQUEMENT PharmacySubscription (pas de relation pharmacy.subscription)
+Endpoints de gestion des abonnements (VERSION BRANCHE).
+- Abonnement lié à la BRANCHE (pas à la pharmacie)
+- Utilisateur hérite des droits de sa branche active
+- Version utilisant BranchSubscription
 """
 
 from __future__ import annotations
@@ -18,9 +18,9 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, get_current_active_user, get_super_admin_user
 from app.models.user import User
-from app.models.pharmacy import Pharmacy
-from app.models.pharmacy_subscription import (
-    PharmacySubscription, 
+from app.models.branch import Branch
+from app.models.branch_subscription import (
+    BranchSubscription, 
     SubscriptionPlan, 
     SubscriptionStatus
 )
@@ -43,6 +43,7 @@ PLAN_CONFIG = {
         "price_yearly": 0,
         "max_products": 2000,
         "max_users": 5,
+        "max_storage_mb": 100,
         "trial_days": 14,
         "features": [
             "5 Utilisateurs",
@@ -57,6 +58,7 @@ PLAN_CONFIG = {
         "price_yearly": 48,
         "max_products": 1500,
         "max_users": 5,
+        "max_storage_mb": 500,
         "features": [
             "5 Utilisateurs",
             "1500 Produits",
@@ -69,6 +71,7 @@ PLAN_CONFIG = {
         "price_yearly": 76.8,
         "max_products": 3000,
         "max_users": 20,
+        "max_storage_mb": 2000,
         "features": [
             "20 Utilisateurs",
             "3000 Produits",
@@ -82,6 +85,7 @@ PLAN_CONFIG = {
         "price_yearly": 144,
         "max_products": 10000,
         "max_users": 20,
+        "max_storage_mb": 5000,
         "features": [
             "20 Utilisateurs",
             "10000 Produits",
@@ -95,6 +99,7 @@ PLAN_CONFIG = {
         "price_yearly": 288,
         "max_products": 0,  # 0 = illimité
         "max_users": 0,    # 0 = illimité
+        "max_storage_mb": 10000,
         "features": [
             "Utilisateurs illimités",
             "Produits illimités",
@@ -137,18 +142,18 @@ def format_unlimited(value: int) -> str:
     return str(value)
 
 
-def get_pharmacy_subscription_by_id(db: Session, pharmacy_id: UUID) -> Optional[PharmacySubscription]:
-    """Récupère l'abonnement d'une pharmacie par son ID (requête directe)."""
-    return db.query(PharmacySubscription).filter(
-        PharmacySubscription.pharmacy_id == pharmacy_id
+def get_branch_subscription_by_id(db: Session, branch_id: UUID) -> Optional[BranchSubscription]:
+    """Récupère l'abonnement d'une branche par son ID."""
+    return db.query(BranchSubscription).filter(
+        BranchSubscription.branch_id == branch_id
     ).first()
 
 
-def get_pharmacy_limits(db: Session, user: User) -> Dict[str, Any]:
-    """Récupère les limites de la pharmacie active."""
+def get_branch_limits(db: Session, user: User) -> Dict[str, Any]:
+    """Récupère les limites de la branche active."""
     
-    # Vérifier que user a une pharmacie active
-    if not user or not user.active_pharmacy_id:
+    # Vérifier que user a une branche active
+    if not user or not user.active_branch_id:
         return {
             "has_subscription": False,
             "is_active": False,
@@ -156,16 +161,18 @@ def get_pharmacy_limits(db: Session, user: User) -> Dict[str, Any]:
             "plan_name": "Aucun",
             "max_products": 0,
             "max_users": 0,
+            "max_storage_mb": 0,
             "is_unlimited_products": False,
             "is_unlimited_users": False,
+            "is_unlimited_storage": False,
             "access_mode": "read_only"
         }
     
     try:
-        # Récupérer la pharmacie
-        pharmacy = db.query(Pharmacy).filter(Pharmacy.id == user.active_pharmacy_id).first()
+        # Récupérer la branche
+        branch = db.query(Branch).filter(Branch.id == user.active_branch_id).first()
         
-        if not pharmacy:
+        if not branch:
             return {
                 "has_subscription": False,
                 "is_active": False,
@@ -173,13 +180,15 @@ def get_pharmacy_limits(db: Session, user: User) -> Dict[str, Any]:
                 "plan_name": "Aucun",
                 "max_products": 0,
                 "max_users": 0,
+                "max_storage_mb": 0,
                 "is_unlimited_products": False,
                 "is_unlimited_users": False,
+                "is_unlimited_storage": False,
                 "access_mode": "read_only"
             }
         
-        # REQUÊTE DIRECTE sur PharmacySubscription (pas via pharmacy.subscription)
-        subscription = get_pharmacy_subscription_by_id(db, pharmacy.id)
+        # REQUÊTE DIRECTE sur BranchSubscription
+        subscription = get_branch_subscription_by_id(db, branch.id)
         
         if not subscription:
             return {
@@ -189,15 +198,17 @@ def get_pharmacy_limits(db: Session, user: User) -> Dict[str, Any]:
                 "plan_name": "Aucun",
                 "max_products": 0,
                 "max_users": 0,
+                "max_storage_mb": 0,
                 "is_unlimited_products": False,
                 "is_unlimited_users": False,
+                "is_unlimited_storage": False,
                 "access_mode": "read_only"
             }
         
         # Vérifier si l'abonnement est actif
         is_active = subscription.is_active()
         
-        # Récupérer le nom du plan en toute sécurité
+        # Récupérer le nom du plan
         plan_value = subscription.plan.value if hasattr(subscription.plan, 'value') else str(subscription.plan)
         plan_config = get_plan_config(plan_value)
         
@@ -208,8 +219,10 @@ def get_pharmacy_limits(db: Session, user: User) -> Dict[str, Any]:
             "plan_name": subscription.plan_name or plan_config.get("name", plan_value.capitalize()),
             "max_products": subscription.max_products if subscription.max_products > 0 else 0,
             "max_users": subscription.max_users if subscription.max_users > 0 else 0,
+            "max_storage_mb": subscription.max_storage_mb if subscription.max_storage_mb > 0 else 0,
             "is_unlimited_products": subscription.max_products == 0,
             "is_unlimited_users": subscription.max_users == 0,
+            "is_unlimited_storage": subscription.max_storage_mb == 0,
             "price": subscription.price,
             "billing_cycle": subscription.billing_cycle,
             "end_date": subscription.end_date,
@@ -219,7 +232,7 @@ def get_pharmacy_limits(db: Session, user: User) -> Dict[str, Any]:
         }
         
     except Exception as e:
-        logger.error(f"Erreur dans get_pharmacy_limits: {e}", exc_info=True)
+        logger.error(f"Erreur dans get_branch_limits: {e}", exc_info=True)
         return {
             "has_subscription": False,
             "is_active": False,
@@ -227,26 +240,28 @@ def get_pharmacy_limits(db: Session, user: User) -> Dict[str, Any]:
             "plan_name": "Erreur",
             "max_products": 0,
             "max_users": 0,
+            "max_storage_mb": 0,
             "is_unlimited_products": False,
             "is_unlimited_users": False,
+            "is_unlimited_storage": False,
             "access_mode": "read_only"
         }
 
 
 def get_current_usage(db: Session, user: User) -> Dict[str, Any]:
-    """Récupère l'utilisation actuelle de la pharmacie active."""
-    if not user.active_pharmacy_id:
+    """Récupère l'utilisation actuelle de la branche active."""
+    if not user.active_branch_id:
         return {"products": 0, "users": 0}
     
     from app.models.product import Product
-    from app.models.user_pharmacy import UserPharmacy
+    from app.models.user import User as UserModel
     
     products_count = db.query(Product).filter(
-        Product.pharmacy_id == user.active_pharmacy_id
+        Product.branch_id == user.active_branch_id
     ).count()
     
-    users_count = db.query(UserPharmacy).filter(
-        UserPharmacy.pharmacy_id == user.active_pharmacy_id
+    users_count = db.query(UserModel).filter(
+        UserModel.branch_id == user.active_branch_id
     ).count()
     
     return {
@@ -255,10 +270,11 @@ def get_current_usage(db: Session, user: User) -> Dict[str, Any]:
     }
 
 
-def update_subscription_limits(subscription: PharmacySubscription, plan_config: Dict[str, Any]) -> None:
+def update_subscription_limits(subscription: BranchSubscription, plan_config: Dict[str, Any]) -> None:
     """Met à jour les limites d'un abonnement selon la config du plan."""
     subscription.max_products = plan_config["max_products"]
     subscription.max_users = plan_config["max_users"]
+    subscription.max_storage_mb = plan_config.get("max_storage_mb", 100)
 
 
 # =============================================================================
@@ -271,22 +287,22 @@ async def get_subscription_status(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
-    Statut détaillé de l'abonnement de la pharmacie active.
+    Statut détaillé de l'abonnement de la branche active.
     """
     logger.info("Demande du statut abonnement pour %s", current_user.email)
     
-    if not current_user.active_pharmacy_id:
+    if not current_user.active_branch_id:
         return {
             "success": True,
             "has_subscription": False,
             "is_active": False,
-            "message": "Aucune pharmacie active sélectionnée",
+            "message": "Aucune branche active sélectionnée",
             "access_mode": "read_only",
             "user": {
                 "id": str(current_user.id),
                 "email": current_user.email,
                 "role": current_user.role,
-                "active_pharmacy_id": None
+                "active_branch_id": None
             },
             "subscription": None,
             "limits": None,
@@ -297,7 +313,7 @@ async def get_subscription_status(
             }
         }
     
-    limits = get_pharmacy_limits(db, current_user)
+    limits = get_branch_limits(db, current_user)
     usage = get_current_usage(db, current_user)
     
     is_active = limits.get("is_active", False)
@@ -314,7 +330,6 @@ async def get_subscription_status(
             "id": str(current_user.id),
             "email": current_user.email,
             "role": current_user.role,
-            "active_pharmacy_id": str(current_user.active_pharmacy_id) if current_user.active_pharmacy_id else None,
             "active_branch_id": str(current_user.active_branch_id) if current_user.active_branch_id else None,
         },
         "subscription": {
@@ -330,6 +345,7 @@ async def get_subscription_status(
         "limits": {
             "max_products": format_unlimited(limits.get("max_products", 0)),
             "max_users": format_unlimited(limits.get("max_users", 0)),
+            "max_storage_mb": format_unlimited(limits.get("max_storage_mb", 0)),
             "features": limits.get("features", []),
         } if has_subscription else None,
         "usage": {
@@ -357,11 +373,11 @@ async def get_subscription_usage(
     """
     logger.info("Demande des statistiques d'utilisation pour %s", current_user.email)
     
-    if not current_user.active_pharmacy_id:
+    if not current_user.active_branch_id:
         return {
             "success": True,
             "has_subscription": False,
-            "message": "Aucune pharmacie active sélectionnée",
+            "message": "Aucune branche active sélectionnée",
             "access_mode": "read_only",
             "usage": {},
             "limits": {},
@@ -370,14 +386,14 @@ async def get_subscription_usage(
             "timestamp": utc_now_iso()
         }
     
-    limits = get_pharmacy_limits(db, current_user)
+    limits = get_branch_limits(db, current_user)
     usage = get_current_usage(db, current_user)
     
     if not limits.get("has_subscription"):
         return {
             "success": True,
             "has_subscription": False,
-            "message": "Aucun abonnement actif pour cette pharmacie",
+            "message": "Aucun abonnement actif pour cette branche",
             "access_mode": "read_only",
             "usage": {},
             "limits": {},
@@ -438,7 +454,8 @@ async def get_subscription_usage(
         },
         "limits": {
             "products": format_unlimited(max_products),
-            "users": format_unlimited(max_users)
+            "users": format_unlimited(max_users),
+            "storage_mb": format_unlimited(limits.get("max_storage_mb", 0))
         },
         "percentages": {
             "products": products_percentage,
@@ -448,13 +465,13 @@ async def get_subscription_usage(
         "timestamp": utc_now_iso()
     }
     
-    if detailed and current_user.active_pharmacy_id:
+    if detailed and current_user.active_branch_id:
         from app.models.product import Product
         
         # Produits par catégorie
         products_by_category = {}
         products = db.query(Product).filter(
-            Product.pharmacy_id == current_user.active_pharmacy_id
+            Product.branch_id == current_user.active_branch_id
         ).all()
         
         for product in products:
@@ -489,6 +506,7 @@ async def get_available_plans(
             "price_yearly": config["price_yearly"],
             "max_products": config["max_products"] if config["max_products"] > 0 else "Illimité",
             "max_users": config["max_users"] if config["max_users"] > 0 else "Illimité",
+            "max_storage_mb": config["max_storage_mb"] if config["max_storage_mb"] > 0 else "Illimité",
             "features": config.get("features", []),
             "is_trial": key == "trial",
             "is_popular": key == "professional"
@@ -508,15 +526,15 @@ async def get_my_subscription_status(
     """
     logger.info("Vérification rapide abonnement pour %s", current_user.email)
     
-    if not current_user.active_pharmacy_id:
+    if not current_user.active_branch_id:
         return {
             "has_subscription": False,
             "is_active": False,
             "access_mode": "read_only",
-            "message": "Aucune pharmacie active"
+            "message": "Aucune branche active"
         }
     
-    limits = get_pharmacy_limits(db, current_user)
+    limits = get_branch_limits(db, current_user)
     is_active = limits.get("is_active", False)
     
     return {
@@ -532,13 +550,13 @@ async def get_my_subscription_status(
 
 
 @router.post("/upgrade", response_model=Dict[str, Any])
-async def upgrade_pharmacy_subscription(
+async def upgrade_branch_subscription(
     data: UpgradeSubscriptionSchema,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
-    Met à niveau l'abonnement de la pharmacie active.
+    Met à niveau l'abonnement de la branche active.
     Réservé à l'admin.
     """
     if current_user.role != "admin":
@@ -548,10 +566,10 @@ async def upgrade_pharmacy_subscription(
             detail="Seuls les administrateurs peuvent changer d'abonnement."
         )
     
-    if not current_user.active_pharmacy_id:
+    if not current_user.active_branch_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Aucune pharmacie active sélectionnée."
+            detail="Aucune branche active sélectionnée."
         )
     
     if data.plan not in PLAN_CONFIG:
@@ -561,12 +579,12 @@ async def upgrade_pharmacy_subscription(
         )
     
     # Récupérer l'abonnement directement
-    subscription = get_pharmacy_subscription_by_id(db, current_user.active_pharmacy_id)
+    subscription = get_branch_subscription_by_id(db, current_user.active_branch_id)
     
     if not subscription:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Aucun abonnement trouvé pour cette pharmacie."
+            detail="Aucun abonnement trouvé pour cette branche."
         )
     
     plan_config = get_plan_config(data.plan)
@@ -593,14 +611,14 @@ async def upgrade_pharmacy_subscription(
     db.commit()
     db.refresh(subscription)
     
-    logger.info("Upgrade abonnement pour pharmacie %s vers %s", current_user.active_pharmacy_id, data.plan)
+    logger.info("Upgrade abonnement pour branche %s vers %s", current_user.active_branch_id, data.plan)
     
     return {
         "success": True,
         "message": f"Abonnement mis à niveau vers le plan {plan_config['name']}.",
         "subscription": {
             "id": str(subscription.id),
-            "pharmacy_id": str(subscription.pharmacy_id),
+            "branch_id": str(subscription.branch_id),
             "plan": subscription.plan.value,
             "plan_name": subscription.plan_name,
             "status": subscription.status.value,
@@ -622,9 +640,9 @@ async def check_feature_access(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
-    Vérifie l'accès à une fonctionnalité basé sur l'abonnement de la pharmacie active.
+    Vérifie l'accès à une fonctionnalité basé sur l'abonnement de la branche active.
     """
-    if not current_user.active_pharmacy_id:
+    if not current_user.active_branch_id:
         return {
             "feature": feature,
             "has_access": False,
@@ -633,11 +651,11 @@ async def check_feature_access(
             "plan": None,
             "mode": "READ_ONLY",
             "is_read_only": True,
-            "access_denied_reason": "Aucune pharmacie active sélectionnée",
+            "access_denied_reason": "Aucune branche active sélectionnée",
             "checked_at": utc_now_iso()
         }
     
-    limits = get_pharmacy_limits(db, current_user)
+    limits = get_branch_limits(db, current_user)
     is_active = limits.get("is_active", False)
     has_subscription = limits.get("has_subscription", False)
     plan = limits.get("plan")
@@ -648,16 +666,16 @@ async def check_feature_access(
     
     if not is_active and is_write_operation:
         has_access = False
-        denied_reason = "Opération non autorisée : abonnement inactif ou expiré."
+        denied_reason = "Operation non autorisee : abonnement inactif ou expire."
     elif not has_subscription:
         has_access = False
-        denied_reason = "Aucun abonnement actif pour cette pharmacie."
+        denied_reason = "Aucun abonnement actif pour cette branche."
     else:
         # Vérifier si la fonctionnalité est incluse dans le plan
         plan_config = get_plan_config(plan)
         features = plan_config.get("features", [])
         has_access = any(feature.lower() in f.lower() for f in features)
-        denied_reason = None if has_access else f"Fonctionnalité non incluse dans le plan {plan_config['name']}."
+        denied_reason = None if has_access else f"Fonctionnalite non incluse dans le plan {plan_config['name']}."
     
     return {
         "feature": feature,
@@ -673,7 +691,6 @@ async def check_feature_access(
         "checked_at": utc_now_iso()
     }
 
-
 @router.get("/billing-history", response_model=Dict[str, Any])
 async def get_billing_history(
     current_user: User = Depends(get_current_active_user),
@@ -684,15 +701,15 @@ async def get_billing_history(
     end_date: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
     """
-    Historique des factures de la pharmacie active.
+    Historique des factures de la branche active.
     """
     logger.info("Récupération de l'historique des factures pour %s", current_user.email)
     
-    if not current_user.active_pharmacy_id:
+    if not current_user.active_branch_id:
         return {
             "success": True,
             "has_billing_history": False,
-            "message": "Aucune pharmacie active sélectionnée",
+            "message": "Aucune branche active sélectionnée",
             "billing_history": [],
             "summary": {
                 "total_items": 0,
@@ -707,20 +724,27 @@ async def get_billing_history(
             "timestamp": utc_now_iso()
         }
     
-    from app.services.invoice_service import get_pharmacy_invoices
-    
-    # Convertir les dates
-    start_dt = datetime.fromisoformat(start_date) if start_date else None
-    end_dt = datetime.fromisoformat(end_date) if end_date else None
-    
-    invoices, total = get_pharmacy_invoices(
-        db=db,
-        pharmacy_id=current_user.active_pharmacy_id,
-        limit=limit,
-        offset=offset,
-        start_date=start_dt,
-        end_date=end_dt
+    # ✅ Utiliser branch_id maintenant disponible
+    query = db.query(Invoice).filter(
+        Invoice.branch_id == current_user.active_branch_id
     )
+    
+    if start_date:
+        try:
+            start_dt = datetime.fromisoformat(start_date)
+            query = query.filter(Invoice.issue_date >= start_dt)
+        except ValueError:
+            pass
+    
+    if end_date:
+        try:
+            end_dt = datetime.fromisoformat(end_date)
+            query = query.filter(Invoice.issue_date <= end_dt)
+        except ValueError:
+            pass
+    
+    total = query.count()
+    invoices = query.order_by(Invoice.issue_date.desc()).offset(offset).limit(limit).all()
     
     billing_items = []
     total_spent = 0
@@ -749,7 +773,7 @@ async def get_billing_history(
         billing_items.append({
             "id": str(invoice.id),
             "invoice_number": invoice.invoice_number,
-            "type": invoice.invoice_type.value,
+            "type": invoice.invoice_type.value if hasattr(invoice.invoice_type, 'value') else str(invoice.invoice_type),
             "period_start": invoice.period_start.isoformat(),
             "period_end": invoice.period_end.isoformat(),
             "subtotal": invoice.subtotal,
@@ -758,7 +782,7 @@ async def get_billing_history(
             "discount_amount": invoice.discount_amount,
             "total_amount": invoice.total_amount,
             "currency": invoice.currency,
-            "status": invoice.status.value,
+            "status": invoice.status.value if hasattr(invoice.status, 'value') else str(invoice.status),
             "is_paid": is_paid,
             "is_overdue": is_overdue,
             "issue_date": invoice.issue_date.isoformat(),
@@ -800,12 +824,10 @@ async def get_billing_history(
         "user": {
             "id": str(current_user.id),
             "email": current_user.email,
-            "active_pharmacy_id": str(current_user.active_pharmacy_id) if current_user.active_pharmacy_id else None
+            "active_branch_id": str(current_user.active_branch_id) if current_user.active_branch_id else None
         },
         "timestamp": utc_now_iso()
     }
-
-
 # =============================================================================
 # ENDPOINTS SUPER ADMIN
 # =============================================================================
@@ -813,19 +835,27 @@ async def get_billing_history(
 @router.get("/admin/overview", response_model=Dict[str, Any])
 async def get_subscriptions_overview(
     tenant_id: Optional[str] = Query(None),
+    branch_id: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_super_admin_user),
 ) -> Dict[str, Any]:
     """Vue d'ensemble des abonnements pour le super admin."""
     logger.info("Vue d'ensemble abonnements demandée par %s", current_user.email)
     
-    # Requête directe sur PharmacySubscription
-    query = db.query(PharmacySubscription)
+    # Requête directe sur BranchSubscription
+    query = db.query(BranchSubscription)
     
     if tenant_id:
         try:
             tenant_uuid = UUID(tenant_id)
-            query = query.join(Pharmacy).filter(Pharmacy.tenant_id == tenant_uuid)
+            query = query.filter(BranchSubscription.tenant_id == tenant_uuid)
+        except ValueError:
+            pass
+    
+    if branch_id:
+        try:
+            branch_uuid = UUID(branch_id)
+            query = query.filter(BranchSubscription.branch_id == branch_uuid)
         except ValueError:
             pass
     
@@ -848,7 +878,10 @@ async def get_subscriptions_overview(
         "subscriptions": [
             {
                 "id": str(s.id),
-                "pharmacy_id": str(s.pharmacy_id),
+                "branch_id": str(s.branch_id),
+                "branch_name": s.branch.name if s.branch else None,
+                "pharmacy_id": str(s.pharmacy_id) if s.pharmacy_id else None,
+                "tenant_id": str(s.tenant_id),
                 "plan": s.plan.value if hasattr(s.plan, 'value') else str(s.plan),
                 "plan_name": s.plan_name,
                 "status": s.status.value if hasattr(s.status, 'value') else str(s.status),
@@ -859,12 +892,13 @@ async def get_subscriptions_overview(
                 "billing_cycle": s.billing_cycle,
                 "max_products": s.max_products,
                 "max_users": s.max_users,
+                "max_storage_mb": s.max_storage_mb,
             }
             for s in subscriptions[:100]
         ],
         "requested_by": current_user.email,
         "requested_at": utc_now_iso(),
-        "filter": {"tenant_id": tenant_id} if tenant_id else None
+        "filters": {"tenant_id": tenant_id, "branch_id": branch_id}
     }
 
 
@@ -875,14 +909,14 @@ async def manual_activate_subscription(
     current_user: User = Depends(get_super_admin_user),
 ) -> Dict[str, Any]:
     """
-    Activation manuelle d'un abonnement pour une pharmacie.
+    Activation manuelle d'un abonnement pour une branche.
     """
-    logger.info("Activation manuelle par %s pour pharmacy_id=%s", current_user.email, data.user_id)
+    logger.info("Activation manuelle par %s pour branch_id=%s", current_user.email, data.branch_id)
     
     try:
-        pharmacy = db.query(Pharmacy).filter(Pharmacy.id == UUID(data.user_id)).first()
-        if not pharmacy:
-            raise HTTPException(status_code=404, detail="Pharmacie non trouvée")
+        branch = db.query(Branch).filter(Branch.id == data.branch_id).first()
+        if not branch:
+            raise HTTPException(status_code=404, detail="Branche non trouvée")
         
         plan_config = get_plan_config(data.plan)
         now = datetime.utcnow()
@@ -895,7 +929,7 @@ async def manual_activate_subscription(
             price = plan_config["price_monthly"]
         
         # Vérifier si un abonnement existe déjà
-        existing_subscription = get_pharmacy_subscription_by_id(db, pharmacy.id)
+        existing_subscription = get_branch_subscription_by_id(db, branch.id)
         
         if existing_subscription:
             # Mettre à jour l'existant
@@ -911,8 +945,10 @@ async def manual_activate_subscription(
             subscription = existing_subscription
         else:
             # Créer un nouvel abonnement
-            subscription = PharmacySubscription(
-                pharmacy_id=pharmacy.id,
+            subscription = BranchSubscription(
+                branch_id=branch.id,
+                tenant_id=branch.tenant_id,
+                pharmacy_id=branch.parent_pharmacy_id,
                 plan=SubscriptionPlan(data.plan),
                 plan_name=plan_config["name"],
                 start_date=now,
@@ -921,7 +957,8 @@ async def manual_activate_subscription(
                 billing_cycle=data.billing_cycle,
                 price=price,
                 max_products=plan_config["max_products"],
-                max_users=plan_config["max_users"]
+                max_users=plan_config["max_users"],
+                max_storage_mb=plan_config.get("max_storage_mb", 100)
             )
             db.add(subscription)
             db.flush()
@@ -930,10 +967,11 @@ async def manual_activate_subscription(
         
         return {
             "success": True,
-            "message": f"Abonnement activé manuellement pour la pharmacie {pharmacy.name}.",
+            "message": f"Abonnement active manuellement pour la branche {branch.name}.",
             "subscription": {
                 "id": str(subscription.id),
-                "pharmacy_id": str(subscription.pharmacy_id),
+                "branch_id": str(subscription.branch_id),
+                "branch_name": branch.name,
                 "plan": subscription.plan.value,
                 "plan_name": subscription.plan_name,
                 "status": subscription.status.value,
@@ -942,6 +980,9 @@ async def manual_activate_subscription(
                 "days_remaining": subscription.days_remaining(),
                 "price": subscription.price,
                 "billing_cycle": subscription.billing_cycle,
+                "max_products": subscription.max_products,
+                "max_users": subscription.max_users,
+                "max_storage_mb": subscription.max_storage_mb
             },
             "activated_by": current_user.email,
             "activated_at": utc_now_iso()
@@ -969,14 +1010,14 @@ async def force_subscription_sync(
     """
     logger.info(f"Force sync subscription for {current_user.email}")
     
-    if not current_user.active_pharmacy_id:
+    if not current_user.active_branch_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Aucune pharmacie active sélectionnée."
+            detail="Aucune branche active sélectionnée."
         )
     
-    # Requête directe sur PharmacySubscription
-    subscription = get_pharmacy_subscription_by_id(db, current_user.active_pharmacy_id)
+    # Requête directe sur BranchSubscription
+    subscription = get_branch_subscription_by_id(db, current_user.active_branch_id)
     
     if not subscription:
         return {
@@ -1006,7 +1047,8 @@ async def force_subscription_sync(
         },
         "limits": {
             "max_products": subscription.max_products if subscription.max_products > 0 else "Illimité",
-            "max_users": subscription.max_users if subscription.max_users > 0 else "Illimité"
+            "max_users": subscription.max_users if subscription.max_users > 0 else "Illimité",
+            "max_storage_mb": subscription.max_storage_mb if subscription.max_storage_mb > 0 else "Illimité"
         },
         "message": "Synchronisation forcée réussie" if is_active else "Abonnement expiré - mode lecture seule",
         "timestamp": utc_now_iso()
@@ -1022,8 +1064,8 @@ async def health_check() -> Dict[str, Any]:
     return {
         "status": "healthy",
         "service": "subscriptions-api",
-        "version": "2.0.0",
-        "architecture": "pharmacy_based",
+        "version": "3.0.0",
+        "architecture": "branch_based",
         "timestamp": utc_now_iso(),
         "plans_available": list(PLAN_CONFIG.keys()),
     }

@@ -32,6 +32,7 @@ from app.api.v1.endpoints.transfers import router as transfers_router
 from app.api.v1.orders import router as orders_router
 from app.api.v1.capital import router as capital_router
 from app.api.v1.endpoints.expenses import router as expenses_router
+from app.api.v1.endpoints.branches import router as branches_router
 
 from app.core.startup import init_storage
 
@@ -213,7 +214,6 @@ include_router_auto(app, saas_payments_router)
 include_router_auto(app, superadmin_router)
 include_router_auto(app, stock_router, tags=["Stock"])
 include_router_auto(app, inventory_router, tags=["Inventory"])
-include_router_auto(app, users.router, tags=["Users"])
 include_router_auto(app, subscription_codes_router)
 include_router_auto(app, categories_router)
 app.include_router(session.router, prefix="/api/v1")
@@ -222,7 +222,6 @@ include_router_auto(app, orders_router, tags=["orders"])
 include_router_auto(app, transfers_router, tags=["transfers"])
 include_router_auto(app, dashboard_router)
 include_router_auto(app, capital_router)
-include_router_auto(app, expenses_router)
 app.add_middleware(SubscriptionCheckMiddleware)
 app.add_middleware(SubscriptionMiddleware)
 
@@ -230,6 +229,8 @@ app.add_middleware(SubscriptionMiddleware)
 # ============================================================================
 # ROUTERS LEGACY / ADMIN
 # ============================================================================
-
+app.include_router(branches_router, prefix="/api/v1/branches", tags=["Branches"])
+app.include_router(expenses_router, prefix="/api/v1/expenses", tags=["Expenses"])
 app.include_router(pharmacies_router, prefix="/api/v1/pharmacies", tags=["Pharmacies"])
 include_router_auto(app, admin_tenants_router, default_prefix=None)
+include_router_auto(app, users.router, tags=["Users"])

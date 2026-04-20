@@ -76,13 +76,14 @@ class Branch(Base):
     parent_pharmacy = relationship("Pharmacy", back_populates="branches")
     manager = relationship("User", foreign_keys=[manager_id])
     creator = relationship("User", foreign_keys=[created_by])
-    
+    users = relationship("User", foreign_keys="User.branch_id", back_populates="branch")
     # Relations avec les autres modèles
     products = relationship("Product", back_populates="branch")
     sales = relationship("Sale", back_populates="branch")
     customers = relationship("Customer", back_populates="branch")
     capitals = relationship("Capital", back_populates="branch")
     expenses = relationship("Expense", back_populates="branch", cascade="all, delete-orphan")
+    subscription = relationship("BranchSubscription", back_populates="branch", uselist=False)
     # =========================
     # Méthodes
     # =========================

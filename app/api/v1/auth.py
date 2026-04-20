@@ -13,7 +13,7 @@ from jose import jwt
 import string
 import secrets
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, get_current_active_user 
 from app.core.security import (
     create_access_token,
     hash_password,
@@ -308,75 +308,95 @@ def generate_unique_tenant_code(nom_pharmacie: str, db: Session) -> str:
         if counter > 10:
             return f"PH{str(uuid.uuid4())[:8].upper()}"
 
-def is_subscription_active(db: Session, tenant_id: str) -> bool:
-    """Vérifie si l'abonnement est actif pour un tenant donné"""
+def is_subscription_active(db: Session, branch_id: str) -> bool:
+    """Vérifie si l'abonnement est actif pour une branche donnée"""
     try:
-        if not tenant_id:
-            logger.warning("is_subscription_active appelé avec tenant_id None")
+        if not branch_id:
+            logger.warning("is_subscription_active appelé avec branch_id None")
             return True
         
-        tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
-        if not tenant:
-            logger.warning(f"Tenant non trouvé: {tenant_id}")
+        branch = db.query(Branch).filter(Branch.id == branch_id).first()
+        if not branch:
+            logger.warning(f"Branche non trouvée: {branch_id}")
             return True
         
-        # 1. Vérifier la période d'essai
-        current_plan = (tenant.current_plan or "TRIAL").upper()
+        from app.models.branch_subscription import BranchSubscription, SubscriptionStatus
         
-        if current_plan == "TRIAL":
-            if tenant.trial_end_date and tenant.trial_end_date > datetime.utcnow():
-                logger.info(f"✅ Tenant {tenant_id} en période d'essai jusqu'au {tenant.trial_end_date}")
-                return True
-            logger.warning(f"⚠️ Tenant {tenant_id} période d'essai expirée")
-            return False  # ← Retourner False pour indiquer expiré
-        
-        # 2. Pour les autres plans, chercher l'abonnement
-        from app.models.pharmacy import Pharmacy
-        from app.models.pharmacy_subscription import PharmacySubscription, SubscriptionStatus
-        
-        main_pharmacy = db.query(Pharmacy).filter(
-            Pharmacy.tenant_id == tenant_id,
-            Pharmacy.is_main == True,
-            Pharmacy.is_active == True
-        ).first()
-        
-        if not main_pharmacy:
-            logger.warning(f"⚠️ Aucune pharmacie principale trouvée pour tenant {tenant_id}")
-            return True
-        
-        subscription = db.query(PharmacySubscription).filter(
-            PharmacySubscription.pharmacy_id == main_pharmacy.id
+        subscription = db.query(BranchSubscription).filter(
+            BranchSubscription.branch_id == branch.id
         ).first()
         
         if not subscription:
-            logger.warning(f"⚠️ Aucun abonnement trouvé pour pharmacy {main_pharmacy.id}")
+            logger.warning(f"⚠️ Aucun abonnement trouvé pour branche {branch.id}")
             return True
         
-        # Vérifier si actif
+        # ✅ CORRIGÉ: subscription.plan est maintenant une string, pas un enum
         is_active = subscription.is_active()
         
         # Vérifier aussi le statut
-        status_active = subscription.status == SubscriptionStatus.ACTIVE
+        status_active = subscription.status_enum == SubscriptionStatus.ACTIVE or subscription.status_enum == SubscriptionStatus.TRIAL
         
         result = is_active and status_active
         
-        logger.info(f"📊 Abonnement pour {tenant_id}: plan={subscription.plan.value}, actif={result}, fin={subscription.end_date}")
+        # ✅ CORRIGÉ: Utiliser subscription.plan directement (c'est une string)
+        logger.info(f"📊 Abonnement pour branche {branch.id}: plan={subscription.plan}, actif={result}, fin={subscription.end_date}")
         
         return result
         
     except Exception as e:
         logger.error(f"❌ Erreur lors de la vérification de l'abonnement: {e}", exc_info=True)
-        # En cas d'erreur, retourner True pour ne pas bloquer
         return True
+
+@router.post("/reset-active-branch")
+async def reset_active_branch(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Réinitialise la branche active de l'utilisateur vers la branche principale.
+    Utile quand l'utilisateur a une branche invalide.
+    """
+    # Trouver la branche principale du tenant
+    main_branch = db.query(Branch).filter(
+        Branch.tenant_id == current_user.tenant_id,
+        Branch.is_main_branch == True,
+        Branch.is_active == True
+    ).first()
+    
+    if not main_branch:
+        # Si pas de branche principale, prendre la première branche active
+        main_branch = db.query(Branch).filter(
+            Branch.tenant_id == current_user.tenant_id,
+            Branch.is_active == True
+        ).first()
+    
+    if not main_branch:
+        raise HTTPException(
+            status_code=404,
+            detail="Aucune branche trouvée pour ce compte"
+        )
+    
+    # Mettre à jour l'utilisateur
+    old_branch_id = current_user.active_branch_id
+    current_user.active_branch_id = main_branch.id
+    db.commit()
+    
+    return {
+        "success": True,
+        "message": "Branche active réinitialisée avec succès",
+        "old_branch_id": str(old_branch_id) if old_branch_id else None,
+        "new_branch_id": str(main_branch.id),
+        "new_branch_name": main_branch.name
+    }
 
 @router.get("/subscription/readonly-status")
 def get_readonly_status(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Retourne le statut de l'abonnement et indique si on est en mode lecture seule"""
+    """Retourne le statut de l'abonnement de la branche active"""
     
-    if not current_user.tenant_id:
+    if not current_user.active_branch_id:
         return {
             "subscription_active": True,
             "read_only_mode": False,
@@ -385,27 +405,30 @@ def get_readonly_status(
             "allowed_operations": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
         }
     
-    subscription_active = is_subscription_active(db, str(current_user.tenant_id))
+    subscription_active = is_subscription_active(db, str(current_user.active_branch_id))
     
-    tenant = db.query(Tenant).filter(Tenant.id == current_user.tenant_id).first()
+    branch = db.query(Branch).filter(Branch.id == current_user.active_branch_id).first()
+    subscription = None
+    
+    if branch:
+        from app.models.branch_subscription import BranchSubscription
+        subscription = db.query(BranchSubscription).filter(
+            BranchSubscription.branch_id == branch.id
+        ).first()
     
     days_remaining = None
-    if tenant and tenant.trial_end_date:
-        if subscription_active:
-            days_remaining = (tenant.trial_end_date - datetime.utcnow()).days
-        else:
-            days_remaining = (datetime.utcnow() - tenant.trial_end_date).days
-            days_remaining = -days_remaining if days_remaining < 0 else days_remaining
+    if subscription:
+        days_remaining = subscription.days_remaining()
     
     return {
         "subscription_active": subscription_active,
         "read_only_mode": not subscription_active,
         "subscription_expired": not subscription_active,
         "message": "Mode lecture seule - Renouvelez votre abonnement pour modifier vos données" if not subscription_active else "Abonnement actif",
-        "expiry_date": tenant.trial_end_date.isoformat() if tenant and tenant.trial_end_date else None,
+        "expiry_date": subscription.end_date.isoformat() if subscription and subscription.end_date else None,
         "days_remaining": days_remaining,
-        "current_plan": tenant.current_plan if tenant else None,
-        "tenant_status": tenant.status if tenant else None,
+        "current_plan": subscription.plan.value if subscription else None,
+        "branch_name": branch.name if branch else None,
         "allowed_operations": ["GET", "HEAD", "OPTIONS"] if not subscription_active else ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
         "renewal_url": "/api/v1/subscriptions/plans",
         "suggestions": [
@@ -432,7 +455,7 @@ def create_refresh_token(data: dict, expires_delta: Optional[timedelta] = None) 
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
-def create_token_pair(user: User, subscription_active: bool, pharmacy_id: Optional[str] = None) -> dict:
+def create_token_pair(user: User, subscription_active: bool, branch_id: Optional[str] = None) -> dict:  # CHANGÉ: pharmacy_id -> branch_id
     """Génère un couple access_token + refresh_token cohérent."""
     
     # Récupérer la durée d'expiration depuis settings
@@ -445,7 +468,7 @@ def create_token_pair(user: User, subscription_active: bool, pharmacy_id: Option
         "role": user.role,
         "email": user.email,
         "subscription_active": subscription_active,
-        "pharmacy_id": pharmacy_id,
+        "branch_id": branch_id,  # CHANGÉ: pharmacy_id -> branch_id
         "type": "access"
     }
 
@@ -471,7 +494,7 @@ def create_token_pair(user: User, subscription_active: bool, pharmacy_id: Option
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
-        "expires_in": access_expire_minutes * 60,  # conversion en secondes
+        "expires_in": access_expire_minutes * 60,
         "refresh_expires_in": refresh_expire_days * 24 * 60 * 60
     }
 
@@ -981,14 +1004,16 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
         except Exception as e:
             logger.error(f"Erreur envoi SMS de bienvenue à {email}: {e}")
 
-    # Récupération du tenant et des pharmacies
+    # ============================================================
+    # RÉCUPÉRATION DU TENANT ET DES BRANCHES (MODIFIÉ)
+    # ============================================================
     tenant = None
     tenant_data = None
-    pharmacies = []
-    main_pharmacy = None
+    branches = []
+    main_branch = None
     subscription_active = False
     
-    # Récupérer la branche principale par défaut
+    # Variables pour la branche par défaut
     default_branch_id = None
     default_branch_name = None
 
@@ -996,40 +1021,30 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
         tenant = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
 
         if tenant:
-            pharmacies = db.query(Pharmacy).filter(
-                Pharmacy.tenant_id == tenant.id,
-                Pharmacy.is_active == True
-            ).order_by(Pharmacy.is_main.desc(), Pharmacy.name).all()
+            # Récupérer TOUTES les branches du tenant (au lieu des pharmacies)
+            branches = db.query(Branch).filter(
+                Branch.tenant_id == tenant.id,
+                Branch.is_active == True
+            ).order_by(Branch.is_main_branch.desc(), Branch.name).all()
 
-            main_pharmacy = next(
-                (pharmacy for pharmacy in pharmacies if pharmacy.is_main),
-                pharmacies[0] if pharmacies else None
+            # Trouver la branche principale
+            main_branch = next(
+                (branch for branch in branches if branch.is_main_branch),
+                branches[0] if branches else None
             )
             
             # Récupérer la branche principale par défaut si l'utilisateur n'en a pas
-            if main_pharmacy and not user.active_branch_id:
-                # Chercher la branche principale de la pharmacie
-                main_branch = db.query(Branch).filter(
-                    Branch.parent_pharmacy_id == main_pharmacy.id,
-                    Branch.is_main_branch == True,
-                    Branch.is_active == True
-                ).first()
-                
-                if main_branch:
-                    default_branch_id = str(main_branch.id)
-                    default_branch_name = main_branch.name
-                else:
-                    # Si pas de branche principale, prendre la première branche active
-                    first_branch = db.query(Branch).filter(
-                        Branch.parent_pharmacy_id == main_pharmacy.id,
-                        Branch.is_active == True
-                    ).first()
-                    if first_branch:
-                        default_branch_id = str(first_branch.id)
-                        default_branch_name = first_branch.name
+            if main_branch and not user.active_branch_id:
+                default_branch_id = str(main_branch.id)
+                default_branch_name = main_branch.name
 
-            subscription_active = is_subscription_active(db, str(user.tenant_id))
+            # Vérifier l'abonnement pour la branche principale
+            if main_branch:
+                subscription_active = is_subscription_active(db, str(main_branch.id))
+            else:
+                subscription_active = False
 
+            # Données du tenant (inchangées)
             tenant_data = {
                 "id": str(tenant.id),
                 "tenant_code": tenant.tenant_code,
@@ -1059,10 +1074,11 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
     user.last_login = datetime.utcnow()
     db.commit()
 
+    # Générer les tokens avec branch_id au lieu de pharmacy_id
     token_pair = create_token_pair(
         user=user,
         subscription_active=subscription_active,
-        pharmacy_id=str(main_pharmacy.id) if main_pharmacy else None
+        branch_id=str(main_branch.id) if main_branch else None
     )
 
     # Déterminer l'ID de branche actif
@@ -1075,10 +1091,37 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
     else:
         active_branch_name = default_branch_name or "Succursale principale"
 
+    # Récupérer la pharmacie associée à la branche principale (pour compatibilité frontend)
+    main_pharmacy = None
+    if main_branch:
+        main_pharmacy = db.query(Pharmacy).filter(Pharmacy.id == main_branch.parent_pharmacy_id).first()
+    
+    # Vérifier si la branche active est valide
+    if user.active_branch_id:
+        branch_exists = db.query(Branch).filter(Branch.id == user.active_branch_id).first()
+        if not branch_exists:
+            logger.warning(f"Branche active invalide pour {email}: {user.active_branch_id}, réinitialisation...")
+            # Réinitialiser vers la branche principale
+            main_branch = db.query(Branch).filter(
+                Branch.tenant_id == user.tenant_id,
+                Branch.is_main_branch == True,
+                Branch.is_active == True
+            ).first()
+            
+            if main_branch:
+                user.active_branch_id = main_branch.id
+                db.commit()
+                logger.info(f"Branche active réinitialisée pour {email} vers {main_branch.name}")
+                active_branch_name = main_branch.name
+                active_branch_id = str(main_branch.id)
+
+    # ============================================================
+    # CONSTRUCTION DE LA RÉPONSE (MODIFIÉE)
+    # ============================================================
     response_data = {
         **token_pair,
         "subscription_active": subscription_active,
-        "read_only_mode": not subscription_active,  # ← AJOUTER
+        "read_only_mode": not subscription_active,
         "subscription_expired": not subscription_active, 
         "is_first_login": is_first_login,
         "user": {
@@ -1089,47 +1132,79 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
             "tenant_id": str(user.tenant_id) if user.tenant_id else None,
             "actif": user.actif,
             "telephone": user.telephone,
-            "active_branch_id": active_branch_id,  # AJOUTÉ
-            "branch_name": active_branch_name        # AJOUTÉ
+            "active_branch_id": active_branch_id,
+            "active_branch_name": active_branch_name,
+            "active_pharmacy_id": str(user.active_pharmacy_id) if user.active_pharmacy_id else None
         },
         "tenant": tenant_data,
-        "pharmacies": [
+        # LISTE DES BRANCHES (remplace pharmacies)
+        "branches": [
             {
-                "id": str(pharmacy.id),
-                "name": pharmacy.name,
-                "address": pharmacy.address,
-                "city": pharmacy.city,
-                "phone": pharmacy.phone,
-                "email": pharmacy.email,
-                "is_active": pharmacy.is_active,
-                "is_main": pharmacy.is_main,
-                "pharmacy_code": pharmacy.pharmacy_code,
-                "created_at": pharmacy.created_at.isoformat() if pharmacy.created_at else None
+                "id": str(branch.id),
+                "name": branch.name,
+                "code": branch.code,
+                "address": branch.address,
+                "city": branch.city,
+                "phone": branch.phone,
+                "email": branch.email,
+                "is_active": branch.is_active,
+                "is_main_branch": branch.is_main_branch,
+                "parent_pharmacy_id": str(branch.parent_pharmacy_id) if branch.parent_pharmacy_id else None,
+                "created_at": branch.created_at.isoformat() if branch.created_at else None
             }
-            for pharmacy in pharmacies
-        ]
+            for branch in branches
+        ],
+        # Pharmacie principale (pour compatibilité)
+        "current_pharmacy": {
+            "id": str(main_pharmacy.id) if main_pharmacy else None,
+            "name": main_pharmacy.name if main_pharmacy else None,
+            "address": main_pharmacy.address if main_pharmacy else None,
+            "city": main_pharmacy.city if main_pharmacy else None,
+            "phone": main_pharmacy.phone if main_pharmacy else None,
+            "email": main_pharmacy.email if main_pharmacy else None,
+            "is_main": main_pharmacy.is_main if main_pharmacy else None,
+            "pharmacy_code": main_pharmacy.pharmacy_code if main_pharmacy else None
+        } if main_pharmacy else None,
+        # Branche courante (NOUVEAU)
+        "current_branch": {
+            "id": str(main_branch.id) if main_branch else None,
+            "name": main_branch.name if main_branch else None,
+            "code": main_branch.code if main_branch else None,
+            "address": main_branch.address if main_branch else None,
+            "city": main_branch.city if main_branch else None,
+            "phone": main_branch.phone if main_branch else None,
+            "email": main_branch.email if main_branch else None,
+            "is_main_branch": main_branch.is_main_branch if main_branch else None,
+            "parent_pharmacy_id": str(main_branch.parent_pharmacy_id) if main_branch and main_branch.parent_pharmacy_id else None
+        } if main_branch else None
     }
 
-    if main_pharmacy:
-        response_data["current_pharmacy"] = {
-            "id": str(main_pharmacy.id),
-            "name": main_pharmacy.name,
-            "address": main_pharmacy.address,
-            "city": main_pharmacy.city,
-            "phone": main_pharmacy.phone,
-            "email": main_pharmacy.email,
-            "is_main": main_pharmacy.is_main,
-            "pharmacy_code": main_pharmacy.pharmacy_code
-        }
+    # Ajouter les informations de renouvellement si abonnement inactif
+    if not subscription_active and main_branch:
+        from app.models.branch_subscription import BranchSubscription
+        
+        subscription = db.query(BranchSubscription).filter(
+            BranchSubscription.branch_id == main_branch.id
+        ).first()
+        
+        if subscription:
+            response_data["renewal_info"] = {
+                "required": True,
+                "message": "Votre abonnement a expiré. Veuillez le renouveler.",
+                "url": "/api/v1/subscriptions/plans",
+                "expiry_date": subscription.end_date.isoformat() if subscription.end_date else None,
+                "days_overdue": abs(subscription.days_remaining()) if not subscription.is_active() else 0
+            }
+        elif tenant and tenant.trial_end_date:
+            # Fallback pour compatibilité
+            response_data["renewal_info"] = {
+                "required": True,
+                "message": "Votre période d'essai a expiré. Veuillez souscrire un abonnement.",
+                "url": "/api/v1/subscriptions/plans",
+                "expiry_date": tenant.trial_end_date.isoformat() if tenant.trial_end_date else None,
+                "days_overdue": abs((tenant.trial_end_date - datetime.utcnow()).days) if tenant.trial_end_date else 0
+            }
 
-    if not subscription_active and tenant:
-        response_data["renewal_info"] = {
-            "required": True,
-            "message": "Votre abonnement a expiré. Veuillez le renouveler.",
-            "url": "/api/v1/subscriptions/plans",
-            "expiry_date": tenant.trial_end_date.isoformat() if tenant.trial_end_date else None,
-            "days_overdue": abs((tenant.trial_end_date - datetime.utcnow()).days) if tenant.trial_end_date else 0
-        }
     logger.info(f"Login réussi pour: {email} (branche: {active_branch_name})")
     return response_data
 
@@ -1876,10 +1951,12 @@ def refresh_token(data: TokenRefreshSchema, db: Session = Depends(get_db)):
         )
 
     # ===========================================
-    # NOUVEAU : VÉRIFIER L'ABONNEMENT AVANT DE RAFRAÎCHIR
+    # VÉRIFIER L'ABONNEMENT DE LA BRANCHE (CHANGÉ)
     # ===========================================
-    if user.tenant_id:
-        subscription_active = is_subscription_active(db, str(user.tenant_id))
+    subscription_active = True
+    
+    if user.active_branch_id:
+        subscription_active = is_subscription_active(db, str(user.active_branch_id))
         
         # Si l'abonnement est inactif, ne PAS permettre le refresh
         if not subscription_active:
@@ -1892,21 +1969,40 @@ def refresh_token(data: TokenRefreshSchema, db: Session = Depends(get_db)):
                     "requires_relogin": True
                 }
             )
-    else:
-        subscription_active = True
+    elif user.tenant_id:
+        # Fallback: prendre la branche principale du tenant
+        main_branch = db.query(Branch).filter(
+            Branch.tenant_id == user.tenant_id,
+            Branch.is_main_branch == True,
+            Branch.is_active == True
+        ).first()
+        
+        if main_branch:
+            subscription_active = is_subscription_active(db, str(main_branch.id))
+            
+            if not subscription_active:
+                logger.warning(f"Tentative de refresh token pour abonnement expiré: {user.email}")
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "error": "subscription_expired",
+                        "message": "Votre abonnement a expiré. Veuillez vous reconnecter après renouvellement.",
+                        "requires_relogin": True
+                    }
+                )
 
-    main_pharmacy = None
+    main_branch = None
     if user.tenant_id:
-        main_pharmacy = db.query(Pharmacy).filter(
-            Pharmacy.tenant_id == user.tenant_id,
-            Pharmacy.is_main == True,
-            Pharmacy.is_active == True
+        main_branch = db.query(Branch).filter(
+            Branch.tenant_id == user.tenant_id,
+            Branch.is_main_branch == True,
+            Branch.is_active == True
         ).first()
 
     token_pair = create_token_pair(
         user=user,
         subscription_active=subscription_active,
-        pharmacy_id=str(main_pharmacy.id) if main_pharmacy else None
+        branch_id=str(main_branch.id) if main_branch else None  # CHANGÉ
     )
 
     logger.info(f"Refresh token réussi pour {user.email}")
@@ -2040,13 +2136,18 @@ def refresh_user_data(
         if active_branch:
             branch_name = active_branch.name
     
-    # Récupérer la pharmacie active
+    # Récupérer la pharmacie active (pour compatibilité)
     pharmacy = None
     pharmacy_name = "Ma Pharmacie"
     if current_user.active_pharmacy_id:
         pharmacy = db.query(Pharmacy).filter(Pharmacy.id == current_user.active_pharmacy_id).first()
         if pharmacy:
             pharmacy_name = pharmacy.name
+    
+    # Récupérer l'abonnement actif
+    subscription_active = True
+    if current_user.active_branch_id:
+        subscription_active = is_subscription_active(db, str(current_user.active_branch_id))
     
     return {
         "user": {
@@ -2062,12 +2163,12 @@ def refresh_user_data(
             "tenant_name": tenant.nom_pharmacie if tenant else "Ma Pharmacie",
             "telephone": current_user.telephone or ""
         },
-        "subscription_active": True,
+        "subscription_active": subscription_active,
         "subscription_data": {
             "has_subscription": True,
-            "is_active": True,
-            "plan": "active",
-            "status": "active",
-            "access_mode": "full"
+            "is_active": subscription_active,
+            "plan": "active" if subscription_active else "expired",
+            "status": "active" if subscription_active else "expired",
+            "access_mode": "full" if subscription_active else "read_only"
         }
     }

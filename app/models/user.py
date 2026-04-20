@@ -38,7 +38,7 @@ class User(Base):
     activated_at = Column(DateTime, nullable=True)
 
     # =========================
-    # Dates (CORRIGÉ - une seule colonne création)
+    # Dates
     # =========================
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     last_login = Column(DateTime, nullable=True)
@@ -52,12 +52,11 @@ class User(Base):
         ForeignKey("pharmacies.id", ondelete="SET NULL"),
         nullable=True
     )
-    active_branch_id = Column(
-        UUID(as_uuid=True), 
-        ForeignKey("branches.id", ondelete="SET NULL"),
-        nullable=True
-    )
-
+    active_branch_id = Column(UUID(as_uuid=True), ForeignKey("branches.id", ondelete="SET NULL"), nullable=True)
+    
+    # Branche directe (où l'utilisateur travaille)
+    branch_id = Column(UUID(as_uuid=True), ForeignKey("branches.id", ondelete="SET NULL"), nullable=True)
+    
     # =========================
     # Relations
     # =========================
@@ -74,10 +73,19 @@ class User(Base):
     active_branch = relationship(
         "Branch",
         foreign_keys=[active_branch_id],
+        lazy="joined",
+        overlaps="branch"
+    )
+    
+    # Branche directe
+    branch = relationship(
+        "Branch",
+        foreign_keys=[branch_id],
+        back_populates="users",
         lazy="joined"
     )
     
-    # Relation Many-to-Many directe vers les pharmacies
+    # Relation Many-to-Many vers les pharmacies
     pharmacies = relationship(
         "Pharmacy",
         secondary="user_pharmacy",
@@ -111,7 +119,7 @@ class User(Base):
     expenses = relationship("Expense", foreign_keys="Expense.user_id", back_populates="user")
     expenses_approved = relationship("Expense", foreign_keys="Expense.approved_by")
     user_expenses = relationship("UserExpense", back_populates="user", foreign_keys="UserExpense.user_id")
-
+    
     # =========================
     # Méthodes utilitaires
     # =========================
@@ -131,7 +139,6 @@ class User(Base):
 
     def set_active_pharmacy(self, pharmacy_id):
         """Définit la pharmacie active pour l'utilisateur"""
-        # Vérifier que l'utilisateur a accès à cette pharmacie
         if self.has_access_to_pharmacy(pharmacy_id):
             self.active_pharmacy_id = pharmacy_id
             return True
@@ -139,13 +146,8 @@ class User(Base):
     
     def set_active_branch(self, branch_id):
         """Définit la branche active pour l'utilisateur"""
-        # Vérifier que la branche existe et appartient à la pharmacie active
-        if self.active_pharmacy_id:
-            from app.models.branch import Branch
-            # La vérification se fera via le service
-            self.active_branch_id = branch_id
-            return True
-        return False
+        self.active_branch_id = branch_id
+        return True
 
     def has_access_to_pharmacy(self, pharmacy_id) -> bool:
         """Vérifie si l'utilisateur est lié à une pharmacie spécifique"""
@@ -164,7 +166,7 @@ class User(Base):
         """Retour JSON-safe sans données sensibles"""
         data = {
             "id": str(self.id),
-            "tenant_id": str(self.tenant_id),
+            "tenant_id": str(self.tenant_id) if self.tenant_id else None,
             "nom_complet": self.nom_complet,
             "email": self.email,
             "role": self.role,
@@ -176,6 +178,7 @@ class User(Base):
             "last_login": self.last_login.isoformat() if self.last_login else None,
             "active_pharmacy_id": str(self.active_pharmacy_id) if self.active_pharmacy_id else None,
             "active_branch_id": str(self.active_branch_id) if self.active_branch_id else None,
+            "branch_id": str(self.branch_id) if self.branch_id else None,
         }
 
         if include_tenant and self.tenant:
@@ -212,61 +215,85 @@ class User(Base):
     
     # ========== MÉTHODES D'ABONNEMENT PAR BRANCHE ==========
     
-    def get_active_pharmacy_subscription_status(self, db_session=None):
+    def get_active_branch_subscription_status(self, db_session=None):
         """
-        Retourne le statut de l'abonnement de la pharmacie active de l'utilisateur.
-        Si aucune pharmacie active, retourne un statut inactif.
+        Retourne le statut de l'abonnement de la BRANCHE active de l'utilisateur.
+        Basé sur BranchSubscription (nouvelle architecture).
         """
-        if not self.active_pharmacy_id:
+        if not self.active_branch_id:
             return {
                 "has_subscription": False,
                 "mode": "READ_ONLY",
-                "message": "Aucune pharmacie active sélectionnée"
+                "message": "Aucune branche active sélectionnée"
             }
         
         if not db_session:
             from app.db.session import SessionLocal
             db_session = SessionLocal()
             try:
-                return self._get_pharmacy_subscription_status(db_session)
+                return self._get_branch_subscription_status(db_session)
             finally:
                 db_session.close()
         
-        return self._get_pharmacy_subscription_status(db_session)
+        return self._get_branch_subscription_status(db_session)
     
-    def _get_pharmacy_subscription_status(self, db_session):
-        """Méthode interne pour récupérer le statut d'abonnement d'une pharmacie"""
-        from app.services.pharmacy_subscription_service import check_pharmacy_subscription
+    def _get_branch_subscription_status(self, db_session):
+        """Méthode interne pour récupérer le statut d'abonnement d'une branche"""
+        from app.models.branch_subscription import BranchSubscription, SubscriptionStatus
+        from datetime import datetime
         
         try:
-            result = check_pharmacy_subscription(
-                db_session, 
-                self.active_pharmacy_id, 
-                raise_if_inactive=False
-            )
+            subscription = db_session.query(BranchSubscription).filter(
+                BranchSubscription.branch_id == self.active_branch_id
+            ).first()
             
-            if not result.get("has_subscription") or not result.get("is_active"):
+            if not subscription:
                 return {
                     "has_subscription": False,
                     "mode": "READ_ONLY",
-                    "message": "Abonnement de la pharmacie inactif ou expiré",
-                    "plan": result.get("plan"),
-                    "days_remaining": result.get("days_remaining", 0)
+                    "message": "Aucun abonnement trouvé pour cette branche",
+                    "plan": None,
+                    "days_remaining": 0
+                }
+            
+            # Vérifier si l'abonnement est actif
+            is_active = subscription.is_active()
+            days_remaining = subscription.days_remaining()
+            
+            if not is_active:
+                return {
+                    "has_subscription": True,
+                    "is_active": False,
+                    "mode": "READ_ONLY",
+                    "message": "Abonnement de la branche inactif ou expiré",
+                    "plan": subscription.plan.value if hasattr(subscription.plan, 'value') else str(subscription.plan),
+                    "plan_name": subscription.plan_name,
+                    "days_remaining": days_remaining,
+                    "end_date": subscription.end_date.isoformat() if subscription.end_date else None,
+                    "max_products": subscription.max_products,
+                    "max_users": subscription.max_users,
+                    "max_storage_mb": subscription.max_storage_mb,
+                    "is_unlimited_products": subscription.max_products == 0,
+                    "is_unlimited_users": subscription.max_users == 0,
+                    "is_unlimited_storage": subscription.max_storage_mb == 0
                 }
             
             return {
                 "has_subscription": True,
-                "mode": "FULL",
-                "plan": result.get("plan"),
-                "plan_name": result.get("plan_name"),
                 "is_active": True,
-                "days_remaining": result.get("days_remaining", 0),
-                "end_date": result.get("end_date"),
-                "max_products": result.get("max_products"),
-                "max_users": result.get("max_users"),
-                "is_unlimited_products": result.get("is_unlimited_products", False),
-                "is_unlimited_users": result.get("is_unlimited_users", False)
+                "mode": "FULL",
+                "plan": subscription.plan.value if hasattr(subscription.plan, 'value') else str(subscription.plan),
+                "plan_name": subscription.plan_name,
+                "days_remaining": days_remaining,
+                "end_date": subscription.end_date.isoformat() if subscription.end_date else None,
+                "max_products": subscription.max_products,
+                "max_users": subscription.max_users,
+                "max_storage_mb": subscription.max_storage_mb,
+                "is_unlimited_products": subscription.max_products == 0,
+                "is_unlimited_users": subscription.max_users == 0,
+                "is_unlimited_storage": subscription.max_storage_mb == 0
             }
+            
         except Exception as e:
             return {
                 "has_subscription": False,
@@ -277,58 +304,104 @@ class User(Base):
     def get_subscription_mode(self, db_session=None) -> str:
         """
         Retourne le mode d'accès: "FULL" ou "READ_ONLY"
-        Basé sur l'abonnement de la pharmacie active.
+        Basé sur l'abonnement de la branche active.
         """
-        status = self.get_active_pharmacy_subscription_status(db_session)
+        status = self.get_active_branch_subscription_status(db_session)
         return status.get("mode", "READ_ONLY")
     
     def can_create_product(self, db_session=None) -> bool:
         """
-        Vérifie si l'utilisateur peut créer un produit dans sa pharmacie active.
-        Basé sur l'abonnement de la pharmacie et les limites.
+        Vérifie si l'utilisateur peut créer un produit dans sa branche active.
+        Basé sur l'abonnement de la branche et les limites.
         """
-        if not self.active_pharmacy_id:
+        if not self.active_branch_id:
             return False
-        
-        from app.services.pharmacy_subscription_service import can_add_product
         
         if not db_session:
             from app.db.session import SessionLocal
             db_session = SessionLocal()
             try:
-                return can_add_product(db_session, self.active_pharmacy_id)
+                return self._check_can_create_product(db_session)
             finally:
                 db_session.close()
         
-        return can_add_product(db_session, self.active_pharmacy_id)
+        return self._check_can_create_product(db_session)
     
-    def can_add_user_to_pharmacy(self, db_session=None) -> bool:
+    def _check_can_create_product(self, db_session):
+        """Vérification interne pour la création de produit"""
+        from app.models.branch_subscription import BranchSubscription
+        from app.models.product import Product
+        
+        subscription = db_session.query(BranchSubscription).filter(
+            BranchSubscription.branch_id == self.active_branch_id
+        ).first()
+        
+        if not subscription or not subscription.is_active():
+            return False
+        
+        # Si max_products = 0, illimité
+        if subscription.max_products == 0:
+            return True
+        
+        # Compter les produits existants
+        product_count = db_session.query(Product).filter(
+            Product.branch_id == self.active_branch_id
+        ).count()
+        
+        return product_count < subscription.max_products
+    
+    def can_add_user_to_branch(self, db_session=None) -> bool:
         """
-        Vérifie si l'admin peut ajouter un utilisateur à la pharmacie active.
+        Vérifie si l'admin peut ajouter un utilisateur à la branche active.
         """
         if self.role != "admin":
             return False
         
-        if not self.active_pharmacy_id:
+        if not self.active_branch_id:
             return False
-        
-        from app.services.pharmacy_subscription_service import can_add_user_to_pharmacy
         
         if not db_session:
             from app.db.session import SessionLocal
             db_session = SessionLocal()
             try:
-                return can_add_user_to_pharmacy(db_session, self.active_pharmacy_id)
+                return self._check_can_add_user(db_session)
             finally:
                 db_session.close()
         
-        return can_add_user_to_pharmacy(db_session, self.active_pharmacy_id)
+        return self._check_can_add_user(db_session)
+    
+    def _check_can_add_user(self, db_session):
+        """Vérification interne pour l'ajout d'utilisateur"""
+        from app.models.branch_subscription import BranchSubscription
+        from app.models.user import User
+        
+        subscription = db_session.query(BranchSubscription).filter(
+            BranchSubscription.branch_id == self.active_branch_id
+        ).first()
+        
+        if not subscription or not subscription.is_active():
+            return False
+        
+        # Si max_users = 0, illimité
+        if subscription.max_users == 0:
+            return True
+        
+        # Compter les utilisateurs de la branche
+        user_count = db_session.query(User).filter(
+            User.branch_id == self.active_branch_id
+        ).count()
+        
+        return user_count < subscription.max_users
+    
+    def can_add_user(self, db_session=None) -> bool:
+        """
+        Alias pour can_add_user_to_branch (compatibilité)
+        """
+        return self.can_add_user_to_branch(db_session)
     
     def can_create_pharmacy(self) -> bool:
         """
         Vérifie si l'admin peut créer une nouvelle pharmacie.
-        Note: Dans la nouvelle architecture, le nombre de pharmacies est illimité,
-        donc toujours True pour les admins actifs.
         """
         if self.role != "admin":
             return False
@@ -337,9 +410,28 @@ class User(Base):
             return False
         
         return True
-
-    def can_add_user(self, db_session=None) -> bool:
+    
+    def get_current_branch_subscription(self, db_session=None):
         """
-        Alias pour can_add_user_to_pharmacy (compatibilité)
+        Récupère l'objet abonnement de la branche active.
         """
-        return self.can_add_user_to_pharmacy(db_session)
+        if not self.active_branch_id:
+            return None
+        
+        if not db_session:
+            from app.db.session import SessionLocal
+            db_session = SessionLocal()
+            try:
+                return self._get_branch_subscription(db_session)
+            finally:
+                db_session.close()
+        
+        return self._get_branch_subscription(db_session)
+    
+    def _get_branch_subscription(self, db_session):
+        """Récupère l'objet BranchSubscription"""
+        from app.models.branch_subscription import BranchSubscription
+        
+        return db_session.query(BranchSubscription).filter(
+            BranchSubscription.branch_id == self.active_branch_id
+        ).first()

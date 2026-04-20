@@ -67,7 +67,10 @@ def sync_data(
                     'factures': 'invoices', 'facture': 'invoices',
                     'utilisateurs': 'users', 'utilisateur': 'users',
                     'tenants': 'tenants', 'tenant': 'tenants',
-                    'subscriptions': 'subscriptions', 'abonnements': 'subscriptions', 'abonnement': 'subscriptions',
+                    'subscriptions': 'branch_subscriptions',  
+                    'abonnements': 'branch_subscriptions',
+                    'abonnement': 'branch_subscriptions',
+                    'branch_subscriptions': 'branch_subscriptions',
                     'ventes': 'sales', 'vente': 'sales', 'sales': 'sales',
                     'dettes': 'debts', 'dette': 'debts', 'debts': 'debts',
                     'retours': 'returns', 'retour': 'returns', 'returns': 'returns',
@@ -81,7 +84,7 @@ def sync_data(
 
             allowed_tables = [
                     'products', 'categories', 'sales', 'customers', 
-                    'invoices', 'users', 'tenants', 'subscriptions',
+                    'invoices', 'users', 'tenants', 'branch_subscriptions',
                     'debts', 'returns', 'branches', 'pharmacies', 
                     'stock_movements', 'debt_payments',
                     'expenses'
@@ -454,68 +457,77 @@ def get_subscription_status(
     user = Depends(get_current_user)
 ):
     """
-    Récupère le statut de l'abonnement pour une branche/pharmacie
-    Utilise le vrai système d'abonnement PharmacySubscription
+    Récupère le statut de l'abonnement pour une branche
+    Utilise le vrai système d'abonnement BranchSubscription
     """
-    from app.services.pharmacy_subscription_service import check_pharmacy_subscription
+    from app.models.branch_subscription import BranchSubscription
     from app.models.branch import Branch
     
-    # Déterminer la pharmacie
-    pharmacy_id = None
+    # Déterminer la branche
+    target_branch_id = None
     
     if branch_id:
-        # Chercher via la branche
-        branch = db.query(Branch).filter(
-            Branch.id == branch_id,
-            Branch.tenant_id == user.tenant_id
+        target_branch_id = branch_id
+    elif hasattr(user, 'active_branch_id') and user.active_branch_id:
+        target_branch_id = user.active_branch_id
+    
+    # Fallback: chercher la première branche du tenant
+    if not target_branch_id:
+        first_branch = db.query(Branch).filter(
+            Branch.tenant_id == user.tenant_id,
+            Branch.is_active == True
         ).first()
-        if branch:
-            pharmacy_id = branch.parent_pharmacy_id
+        if first_branch:
+            target_branch_id = first_branch.id
     
-    # Fallback: utiliser la pharmacie active de l'utilisateur
-    if not pharmacy_id and hasattr(user, 'active_pharmacy_id') and user.active_pharmacy_id:
-        pharmacy_id = user.active_pharmacy_id
-    
-    # Fallback: chercher la première pharmacie du tenant
-    if not pharmacy_id:
-        from app.models.pharmacy import Pharmacy
-        first_pharmacy = db.query(Pharmacy).filter(
-            Pharmacy.tenant_id == user.tenant_id
-        ).first()
-        if first_pharmacy:
-            pharmacy_id = first_pharmacy.id
-    
-    if not pharmacy_id:
+    if not target_branch_id:
         return {
             "has_subscription": False,
             "is_active": True,  # Mode par défaut
             "access_mode": "full",
-            "error": "Aucune pharmacie trouvée pour ce tenant"
+            "error": "Aucune branche trouvée pour ce tenant"
         }
     
     try:
-        # Utiliser le vrai service d'abonnement
-        sub_status = check_pharmacy_subscription(
-            db, 
-            pharmacy_id, 
-            raise_if_inactive=False
-        )
+        # Récupérer l'abonnement de la branche
+        subscription = db.query(BranchSubscription).filter(
+            BranchSubscription.branch_id == target_branch_id,
+            BranchSubscription.tenant_id == user.tenant_id
+        ).first()
+        
+        if not subscription:
+            return {
+                "has_subscription": False,
+                "is_active": True,  # Mode par défaut sans abonnement
+                "access_mode": "full",
+                "branch_id": str(target_branch_id)
+            }
+        
+        # Vérifier si l'abonnement est actif
+        is_active = subscription.is_active()
         
         return {
-            "has_subscription": sub_status.get("has_subscription", False),
-            "is_active": sub_status.get("is_active", True),
-            "access_mode": "full" if sub_status.get("is_active", True) else "read_only",
+            "has_subscription": True,
+            "is_active": is_active,
+            "access_mode": "full" if is_active else "read_only",
             "subscription": {
-                "id": None,  # Optionnel: récupérer depuis la base
-                "plan_name": sub_status.get("plan_name"),
-                "plan_type": sub_status.get("plan"),
-                "status": "active" if sub_status.get("is_active") else "expired",
-                "current_period_end": sub_status.get("end_date").isoformat() if sub_status.get("end_date") else None,
-                "days_remaining": sub_status.get("days_remaining", 30),
-                "max_products": sub_status.get("max_products"),
-                "max_users": sub_status.get("max_users"),
-                "is_unlimited_products": sub_status.get("is_unlimited_products", False),
-                "is_unlimited_users": sub_status.get("is_unlimited_users", False)
+                "id": str(subscription.id),
+                "branch_id": str(subscription.branch_id),
+                "plan_name": subscription.plan_name,
+                "plan_type": subscription.plan,
+                "status": subscription.status,
+                "current_period_start": subscription.start_date.isoformat() if subscription.start_date else None,
+                "current_period_end": subscription.end_date.isoformat() if subscription.end_date else None,
+                "days_remaining": subscription.days_remaining(),
+                "max_products": subscription.max_products,
+                "max_users": subscription.max_users,
+                "max_storage_mb": subscription.max_storage_mb,
+                "is_trial": subscription.is_trial(),
+                "trial_days_remaining": subscription.trial_days_remaining(),
+                "auto_renew": subscription.auto_renew,
+                "billing_cycle": subscription.billing_cycle,
+                "price": subscription.price,
+                "currency": subscription.currency
             }
         }
         
@@ -527,7 +539,7 @@ def get_subscription_status(
             "access_mode": "full",
             "error": str(e)
         }
-    
+        
 @router.get("/status")
 def sync_status(
     db: Session = Depends(get_db),

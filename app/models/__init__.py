@@ -43,6 +43,7 @@ from .stock_movement import StockMovement, InventoryCount, InventoryCountItem
 from app.models.stock_adjustment import StockAdjustment, StockAdjustmentItem
 from app.models.customer import Customer  
 from app.models.branch import Branch 
+from app.models.branch_subscription import BranchSubscription
 from app.models.subscription_code import SubscriptionCode, SubscriptionCodeStatus
 from app.models.category import Category
 from app.models.user_session import UserSession
@@ -110,5 +111,6 @@ __all__ = [
     "UserHistory",
     "TrashBin",
     "PharmacyConfig",
+    "BranchSubscription",
     "UserExpense"
 ]

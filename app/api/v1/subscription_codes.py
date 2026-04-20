@@ -1,7 +1,7 @@
 # app/api/v1/subscription_codes.py
 """
-Gestion des codes d'abonnement pour les pharmacies/branches.
-Un abonnement est lié à une pharmacie (branche), pas à un utilisateur.
+Gestion des codes d'abonnement pour les BRANCHES.
+Un abonnement est lié à une branche, et tous ses utilisateurs en bénéficient.
 """
 
 import logging
@@ -14,15 +14,17 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db, get_current_active_user, get_super_admin_user
+from app.api.deps import get_db, get_current_active_user, get_super_admin_user, get_current_branch
 from app.config.plans import PLAN_CONFIG, get_plan_config
 from app.models.subscription_code import SubscriptionCode, SubscriptionCodeStatus
-from app.models.pharmacy_subscription import PharmacySubscription, SubscriptionPlan, SubscriptionStatus
-from app.models.pharmacy import Pharmacy
+from app.models.branch_subscription import BranchSubscription, SubscriptionPlan, SubscriptionStatus
+from app.models.branch import Branch
 from app.models.user import User
 from app.schemas.subscription import (
     SubscriptionCodeCreate,
-    ActivateSubscriptionCode
+    ActivateSubscriptionCode,
+    BranchSubscriptionResponse,
+    BranchSubscriptionStatusResponse
 )
 
 logger = logging.getLogger(__name__)
@@ -33,7 +35,6 @@ router = APIRouter(prefix="/subscription-codes", tags=["Subscription Codes"])
 def generate_unique_code(length: int = 8) -> str:
     """Génère un code unique alphanumérique"""
     chars = string.ascii_uppercase + string.digits
-    # Exclure les caractères ambigus O, 0, I, 1
     chars = chars.replace('O', '').replace('0', '').replace('I', '').replace('1', '')
     return ''.join(random.choices(chars, k=length))
 
@@ -46,119 +47,8 @@ def format_code_with_dashes(code: str) -> str:
     return code
 
 
-def validate_code_logic(db: Session, code: str) -> Dict[str, Any]:
-    """
-    Logique de validation du code (utilisée par GET et POST)
-    """
-    # Nettoyer le code
-    clean_code = code.strip().upper().replace('-', '').replace(' ', '')
-    
-    # Essayer différentes formats pour la recherche
-    search_variations = [
-        code.strip().upper(),
-        format_code_with_dashes(clean_code),
-        clean_code,
-    ]
-    
-    code_obj = None
-    for search_code in search_variations:
-        code_obj = db.query(SubscriptionCode).filter(
-            SubscriptionCode.code == search_code
-        ).first()
-        if code_obj:
-            break
-    
-    if not code_obj:
-        return {
-            "valid": False,
-            "message": "Code invalide."
-        }
-    
-    if not code_obj.is_valid():
-        status_text = "expiré" if code_obj.valid_until and datetime.utcnow() > code_obj.valid_until else "déjà utilisé"
-        return {
-            "valid": False,
-            "message": f"Code {status_text}.",
-            "status": code_obj.status,
-            "valid_until": code_obj.valid_until.isoformat() if code_obj.valid_until else None
-        }
-    
-    return {
-        "valid": True,
-        "message": "Code valide.",
-        "plan": {
-            "type": code_obj.plan_type,
-            "name": code_obj.plan_name,
-            "duration_days": code_obj.duration_days
-        },
-        "price": float(code_obj.price) if code_obj.price else 0,
-        "currency": code_obj.currency or "EUR",
-        "valid_until": code_obj.valid_until.isoformat() if code_obj.valid_until else None,
-        "code": code_obj.code,
-        "pharmacy_id": str(code_obj.pharmacy_id) if code_obj.pharmacy_id else None
-    }
-
-
-def activate_pharmacy_subscription_with_code(
-    db: Session,
-    pharmacy: Pharmacy,
-    code: SubscriptionCode,
-    activated_by: User
-) -> PharmacySubscription:
-    """
-    Active un abonnement pour une pharmacie avec un code.
-    """
-    # Obtenir la configuration du plan
-    plan_config = get_plan_config(code.plan_type)
-    now = datetime.utcnow()
-    end_date = now + timedelta(days=code.duration_days)
-    
-    # Vérifier si la pharmacie a déjà un abonnement
-    existing_sub = db.query(PharmacySubscription).filter(
-        PharmacySubscription.pharmacy_id == pharmacy.id
-    ).first()
-    
-    # Convertir le prix (stocké en cents) en float
-    price_value = float(code.price / 100) if code.price else 0.0
-    
-    if existing_sub:
-        # Mettre à jour l'abonnement existant
-        existing_sub.plan = SubscriptionPlan(code.plan_type)
-        existing_sub.plan_name = plan_config["name"]
-        existing_sub.start_date = now
-        existing_sub.end_date = end_date
-        existing_sub.status = SubscriptionStatus.ACTIVE
-        existing_sub.billing_cycle = "yearly" if code.duration_days >= 365 else "monthly"
-        existing_sub.price = price_value
-        existing_sub.max_products = plan_config.get("max_products", 0) or 0
-        existing_sub.max_users = plan_config.get("max_users", 0) or 0
-        existing_sub.max_branches = plan_config.get("max_branches", 0) or 0
-        existing_sub.updated_at = now
-        subscription = existing_sub
-    else:
-        # Créer un nouvel abonnement
-        subscription = PharmacySubscription(
-            pharmacy_id=pharmacy.id,
-            plan=SubscriptionPlan(code.plan_type),
-            plan_name=plan_config["name"],
-            start_date=now,
-            end_date=end_date,
-            status=SubscriptionStatus.ACTIVE,
-            billing_cycle="yearly" if code.duration_days >= 365 else "monthly",
-            price=price_value,
-            currency=code.currency or "EUR",
-            max_products=plan_config.get("max_products", 0) or 0,
-            max_users=plan_config.get("max_users", 0) or 0,
-            max_branches=plan_config.get("max_branches", 0) or 0
-        )
-        db.add(subscription)
-    
-    db.flush()
-    return subscription
-
-
 # =============================================================================
-# ENDPOINTS SUPER ADMIN - GESTION DES CODES
+# SUPER ADMIN - GESTION DES CODES
 # =============================================================================
 
 @router.post("/admin/generate", response_model=Dict[str, Any])
@@ -168,37 +58,25 @@ async def generate_subscription_code(
     current_user: User = Depends(get_super_admin_user),
 ) -> Any:
     """
-    Génère un code d'abonnement pour une pharmacie/branche.
+    Génère un code d'abonnement pour une BRANCHE spécifique.
     Accessible uniquement aux super admins.
-    
-    Peut être associé à :
-    - Une pharmacie spécifique
-    - Aucune (code générique)
     """
-    logger.info(f"Génération de code abonnement par {current_user.email} pour plan {data.plan_type}")
+    logger.info(f"Génération de code par {current_user.email} pour branche {data.branch_id} plan {data.plan_type}")
     
     # Vérifier que le plan existe
     if data.plan_type not in PLAN_CONFIG:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "error": "invalid_plan",
-                "message": f"Le plan {data.plan_type} n'existe pas. Plans disponibles: {list(PLAN_CONFIG.keys())}"
-            }
+            detail={"error": "invalid_plan", "message": f"Le plan {data.plan_type} n'existe pas."}
         )
     
-    # Vérifier la pharmacie si spécifiée
-    assigned_pharmacy = None
-    if data.pharmacy_id:
-        assigned_pharmacy = db.query(Pharmacy).filter(Pharmacy.id == data.pharmacy_id).first()
-        if not assigned_pharmacy:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={
-                    "error": "pharmacy_not_found",
-                    "message": "La pharmacie spécifiée n'existe pas."
-                }
-            )
+    # ✅ Vérifier que la branche existe
+    branch = db.query(Branch).filter(Branch.id == data.branch_id).first()
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "branch_not_found", "message": "La branche spécifiée n'existe pas."}
+        )
     
     plan_config = get_plan_config(data.plan_type)
     
@@ -208,7 +86,7 @@ async def generate_subscription_code(
     generated_code = None
     
     while attempts < max_attempts:
-        raw_code = generate_unique_code(data.code_length or 8)
+        raw_code = generate_unique_code(8)
         formatted_code = format_code_with_dashes(raw_code)
         
         existing = db.query(SubscriptionCode).filter(
@@ -223,42 +101,40 @@ async def generate_subscription_code(
     if not generated_code:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "error": "code_generation_failed",
-                "message": "Impossible de générer un code unique après plusieurs tentatives."
-            }
+            detail={"error": "code_generation_failed", "message": "Impossible de générer un code unique."}
         )
     
-    # Calculer la durée en jours
-    duration_days = data.duration_days or (365 if data.billing_cycle == "yearly" else 30)
+    # Durée en jours
+    duration_days = data.duration_days or 30
     
-    # Calculer le prix (en cents)
+    # Prix (en cents)
     price = data.price
     if not price:
-        price_key = f"price_{data.billing_cycle or 'monthly'}"
-        price = plan_config.get(price_key, 0)
+        price = plan_config.get("price_monthly", 0)
     
     # Créer le code
     code = SubscriptionCode(
         code=generated_code,
+        branch_id=data.branch_id,  # ✅ Lié à la branche
+        tenant_id=branch.tenant_id,
+        pharmacy_id=branch.parent_pharmacy_id,
         plan_type=data.plan_type,
         plan_name=plan_config["name"],
         duration_days=duration_days,
-        price=int(price * 100) if price else 0,  # Stocker en cents
+        price=int(price * 100) if price else 0,
         currency=data.currency or "EUR",
-        valid_from=data.valid_from or datetime.utcnow(),
+        valid_from=datetime.utcnow(),
         valid_until=data.valid_until or (datetime.utcnow() + timedelta(days=data.expiry_days or 90)),
         notes=data.notes,
         created_by_user_id=current_user.id,
         status=SubscriptionCodeStatus.PENDING,
-        pharmacy_id=data.pharmacy_id  # Lier à la pharmacie
     )
     
     db.add(code)
     db.commit()
     db.refresh(code)
     
-    logger.info(f"Code généré avec succès: {generated_code} pour pharmacie: {data.pharmacy_id}")
+    logger.info(f"Code généré: {generated_code} pour branche {branch.name}")
     
     return {
         "success": True,
@@ -268,27 +144,26 @@ async def generate_subscription_code(
         "price": price,
         "currency": code.currency,
         "duration_days": code.duration_days,
-        "valid_until": code.valid_until.isoformat() if code.valid_until else None,
-        "created_at": code.created_at.isoformat() if code.created_at else None,
-        "status": code.status.value if hasattr(code.status, 'value') else code.status,
-        "pharmacy_id": str(code.pharmacy_id) if code.pharmacy_id else None,
-        "pharmacy_name": assigned_pharmacy.name if assigned_pharmacy else None
+        "valid_until": code.valid_until.isoformat(),
+        "created_at": code.created_at.isoformat(),
+        "status": code.status.value,
+        "branch_id": str(code.branch_id),
+        "branch_name": branch.name,
+        "pharmacy_id": str(branch.parent_pharmacy_id),
+        "pharmacy_name": branch.parent_pharmacy.name if branch.parent_pharmacy else None
     }
 
 
 @router.get("/admin/list", response_model=Dict[str, Any])
 async def list_subscription_codes(
     status: Optional[str] = Query(None),
-    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
+    branch_id: Optional[UUID] = Query(None, description="Filtrer par branche"),
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_super_admin_user),
 ) -> Any:
-    """
-    Liste tous les codes d'abonnement générés.
-    Possibilité de filtrer par pharmacie.
-    """
+    """Liste tous les codes d'abonnement générés."""
     query = db.query(SubscriptionCode)
     
     if status:
@@ -298,11 +173,10 @@ async def list_subscription_codes(
         except ValueError:
             pass
     
-    if pharmacy_id:
-        query = query.filter(SubscriptionCode.pharmacy_id == pharmacy_id)
+    if branch_id:
+        query = query.filter(SubscriptionCode.branch_id == branch_id)
     
     total = query.count()
-    
     codes = query.order_by(SubscriptionCode.created_at.desc())\
                  .offset((page - 1) * limit)\
                  .limit(limit)\
@@ -318,198 +192,114 @@ async def list_subscription_codes(
                 "code": code.code,
                 "plan_type": code.plan_type,
                 "plan_name": code.plan_name,
-                "price": float(code.price) if code.price else 0,
-                "currency": code.currency or "EUR",
+                "price": float(code.price / 100) if code.price else 0,
+                "currency": code.currency,
                 "duration_days": code.duration_days,
-                "status": code.status.value if hasattr(code.status, 'value') else code.status,
+                "status": code.status.value,
                 "valid_until": code.valid_until.isoformat() if code.valid_until else None,
-                "created_at": code.created_at.isoformat() if code.created_at else None,
-                "activated_by": code.activated_by_user.email if code.activated_by_user else None,
-                "activated_at": code.activated_at.isoformat() if code.activated_at else None,
-                "created_by": code.created_by_user.email if code.created_by_user else None,
-                "pharmacy_id": str(code.pharmacy_id) if code.pharmacy_id else None,
-                "pharmacy_name": code.pharmacy.name if code.pharmacy else None
+                "created_at": code.created_at.isoformat(),
+                "branch_id": str(code.branch_id) if code.branch_id else None,
+                "branch_name": code.branch.name if code.branch else None,
+                "created_by": code.created_by_user.email if code.created_by_user else None
             }
             for code in codes
         ]
     }
 
 
-@router.get("/admin/{code_id}", response_model=Dict[str, Any])
-async def get_subscription_code_details(
-    code_id: UUID,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_super_admin_user),
-) -> Any:
-    """
-    Détails d'un code spécifique.
-    """
-    code = db.query(SubscriptionCode).filter(SubscriptionCode.id == code_id).first()
-    if not code:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "error": "code_not_found",
-                "message": "Code d'abonnement non trouvé."
-            }
-        )
-    
-    return {
-        "id": str(code.id),
-        "code": code.code,
-        "plan_type": code.plan_type,
-        "plan_name": code.plan_name,
-        "price": float(code.price) if code.price else 0,
-        "currency": code.currency or "EUR",
-        "duration_days": code.duration_days,
-        "status": code.status.value if hasattr(code.status, 'value') else code.status,
-        "valid_from": code.valid_from.isoformat() if code.valid_from else None,
-        "valid_until": code.valid_until.isoformat() if code.valid_until else None,
-        "created_at": code.created_at.isoformat() if code.created_at else None,
-        "created_by": code.created_by_user.email if code.created_by_user else None,
-        "activated_by": code.activated_by_user.email if code.activated_by_user else None,
-        "activated_at": code.activated_at.isoformat() if code.activated_at else None,
-        "notes": code.notes,
-        "is_valid": code.is_valid(),
-        "days_remaining": code.days_remaining(),
-        "pharmacy_id": str(code.pharmacy_id) if code.pharmacy_id else None,
-        "pharmacy_name": code.pharmacy.name if code.pharmacy else None
-    }
+# =============================================================================
+# ACTIVATION PAR L'UTILISATEUR
+# =============================================================================
 
-
-@router.post("/admin/manual-activate/{pharmacy_id}")
-async def manual_activate_pharmacy(
-    pharmacy_id: UUID,
-    plan_type: str = Query(..., description="Type de plan"),
-    duration_days: int = Query(30, ge=1, le=3650, description="Durée en jours"),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_super_admin_user),
-) -> Any:
+def activate_branch_subscription(
+    db: Session,
+    branch: Branch,
+    code: SubscriptionCode,
+    activated_by: User
+) -> BranchSubscription:
     """
-    Activation manuelle d'une pharmacie (paiement cash sans code).
-    Le super admin peut activer directement une pharmacie.
+    Active un abonnement pour une branche avec un code.
     """
-    logger.info(f"Activation manuelle de la pharmacie {pharmacy_id} par {current_user.email}")
-    
-    pharmacy = db.query(Pharmacy).filter(Pharmacy.id == pharmacy_id).first()
-    if not pharmacy:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "error": "pharmacy_not_found",
-                "message": "Pharmacie non trouvée."
-            }
-        )
-    
-    # Vérifier que le plan existe
-    if plan_type not in PLAN_CONFIG:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "error": "invalid_plan",
-                "message": f"Le plan {plan_type} n'existe pas. Plans disponibles: {list(PLAN_CONFIG.keys())}"
-            }
-        )
-    
-    plan_config = get_plan_config(plan_type)
+    plan_config = get_plan_config(code.plan_type)
     now = datetime.utcnow()
-    end_date = now + timedelta(days=duration_days)
+    end_date = now + timedelta(days=code.duration_days)
     
-    # Vérifier si la pharmacie a déjà un abonnement
-    existing_sub = db.query(PharmacySubscription).filter(
-        PharmacySubscription.pharmacy_id == pharmacy.id
+    # Vérifier si la branche a déjà un abonnement
+    existing_sub = db.query(BranchSubscription).filter(
+        BranchSubscription.branch_id == branch.id
     ).first()
     
+    price_value = float(code.price / 100) if code.price else 0.0
+    
     if existing_sub:
-        existing_sub.plan = SubscriptionPlan(plan_type)
+        # Mettre à jour l'abonnement existant
+        existing_sub.plan = SubscriptionPlan(code.plan_type)
         existing_sub.plan_name = plan_config["name"]
         existing_sub.start_date = now
         existing_sub.end_date = end_date
         existing_sub.status = SubscriptionStatus.ACTIVE
-        existing_sub.billing_cycle = "yearly" if duration_days >= 365 else "monthly"
-        existing_sub.price = float(plan_config.get("price_monthly", 0))
-        existing_sub.max_products = plan_config.get("max_products", 0) or 0
-        existing_sub.max_users = plan_config.get("max_users", 0) or 0
-        existing_sub.max_branches = plan_config.get("max_branches", 0) or 0
+        existing_sub.billing_cycle = "yearly" if code.duration_days >= 365 else "monthly"
+        existing_sub.price = price_value
+        existing_sub.currency = code.currency or "EUR"
+        existing_sub.max_products = plan_config.get("max_products", 100)
+        existing_sub.max_users = plan_config.get("max_users", 5)
         existing_sub.updated_at = now
         subscription = existing_sub
     else:
-        subscription = PharmacySubscription(
-            pharmacy_id=pharmacy.id,
-            plan=SubscriptionPlan(plan_type),
+        # Créer un nouvel abonnement
+        subscription = BranchSubscription(
+            branch_id=branch.id,
+            tenant_id=branch.tenant_id,
+            pharmacy_id=branch.parent_pharmacy_id,
+            plan=SubscriptionPlan(code.plan_type),
             plan_name=plan_config["name"],
             start_date=now,
             end_date=end_date,
             status=SubscriptionStatus.ACTIVE,
-            billing_cycle="yearly" if duration_days >= 365 else "monthly",
-            price=float(plan_config.get("price_monthly", 0)),
-            currency="EUR",
-            max_products=plan_config.get("max_products", 0) or 0,
-            max_users=plan_config.get("max_users", 0) or 0,
-            max_branches=plan_config.get("max_branches", 0) or 0
+            billing_cycle="yearly" if code.duration_days >= 365 else "monthly",
+            price=price_value,
+            currency=code.currency or "EUR",
+            max_products=plan_config.get("max_products", 100),
+            max_users=plan_config.get("max_users", 5),
+            max_storage_mb=plan_config.get("max_storage_mb", 100)
         )
         db.add(subscription)
     
-    db.commit()
-    db.refresh(subscription)
-    
-    return {
-        "success": True,
-        "message": f"Pharmacie {pharmacy.name} activée manuellement pour {duration_days} jours.",
-        "pharmacy": {
-            "id": str(pharmacy.id),
-            "name": pharmacy.name
-        },
-        "subscription": {
-            "id": str(subscription.id),
-            "plan": subscription.plan.value,
-            "plan_name": subscription.plan_name,
-            "start_date": subscription.start_date.isoformat(),
-            "end_date": subscription.end_date.isoformat(),
-            "days_remaining": subscription.days_remaining()
-        },
-        "activated_by": current_user.email,
-        "activated_at": datetime.utcnow().isoformat()
-    }
+    db.flush()
+    return subscription
 
-
-# =============================================================================
-# ENDPOINTS UTILISATEUR - ACTIVATION POUR UNE PHARMACIE
-# =============================================================================
 
 @router.post("/activate", response_model=Dict[str, Any])
-async def activate_code_for_pharmacy(
+async def activate_code_for_branch(
     data: ActivateSubscriptionCode,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
 ) -> Any:
     """
-    Active un abonnement pour la pharmacie active de l'utilisateur.
-    Le code est lié à la pharmacie (branche), pas à l'utilisateur.
+    Active un abonnement pour la BRANCHE active de l'utilisateur.
+    Le code est lié à la branche.
+    Tous les utilisateurs de la branche bénéficieront de cet abonnement.
     """
     logger.info(f"Activation de code par {current_user.email}")
     
-    # Vérifier que l'utilisateur a une pharmacie active
-    if not current_user.active_pharmacy_id:
+    # ✅ Vérifier que l'utilisateur a une branche active
+    if not current_user.active_branch_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
-                "error": "no_active_pharmacy",
-                "message": "Aucune pharmacie active sélectionnée."
+                "error": "no_active_branch",
+                "message": "Aucune branche active sélectionnée. Veuillez d'abord sélectionner une branche."
             }
         )
     
-    pharmacy = db.query(Pharmacy).filter(Pharmacy.id == current_user.active_pharmacy_id).first()
-    if not pharmacy:
+    branch = db.query(Branch).filter(Branch.id == current_user.active_branch_id).first()
+    if not branch:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "error": "pharmacy_not_found",
-                "message": "Pharmacie non trouvée."
-            }
+            detail={"error": "branch_not_found", "message": "Branche non trouvée."}
         )
     
-    # Nettoyer et chercher le code
+    # Chercher le code
     clean_code = data.code.strip().upper().replace('-', '').replace(' ', '')
     search_variations = [
         data.code.strip().upper(),
@@ -529,19 +319,16 @@ async def activate_code_for_pharmacy(
     if not code:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "error": "invalid_code",
-                "message": "Code invalide ou déjà utilisé."
-            }
+            detail={"error": "invalid_code", "message": "Code invalide ou déjà utilisé."}
         )
     
-    # Vérifier que le code peut être utilisé pour cette pharmacie
-    if code.pharmacy_id and code.pharmacy_id != pharmacy.id:
+    # ✅ Vérifier que le code correspond à cette branche
+    if code.branch_id and code.branch_id != branch.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
-                "error": "wrong_pharmacy",
-                "message": "Ce code est réservé à une autre pharmacie."
+                "error": "wrong_branch",
+                "message": f"Ce code est réservé à une autre branche. Contactez votre administrateur."
             }
         )
     
@@ -549,18 +336,14 @@ async def activate_code_for_pharmacy(
         status_text = "expiré" if code.valid_until and datetime.utcnow() > code.valid_until else "non disponible"
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "error": "code_expired",
-                "message": f"Ce code est {status_text}.",
-                "valid_until": code.valid_until.isoformat() if code.valid_until else None
-            }
+            detail={"error": "code_expired", "message": f"Ce code est {status_text}."}
         )
     
     try:
-        # Activer l'abonnement pour la pharmacie
-        subscription = activate_pharmacy_subscription_with_code(
+        # Activer l'abonnement pour la branche
+        subscription = activate_branch_subscription(
             db=db,
-            pharmacy=pharmacy,
+            branch=branch,
             code=code,
             activated_by=current_user
         )
@@ -569,22 +352,23 @@ async def activate_code_for_pharmacy(
         code.status = SubscriptionCodeStatus.ACTIVATED
         code.activated_by_user_id = current_user.id
         code.activated_at = datetime.utcnow()
-        code.pharmacy_id = pharmacy.id
         
         db.commit()
         
         return {
             "success": True,
-            "message": f"Abonnement activé pour la pharmacie {pharmacy.name}",
+            "message": f"Abonnement activé pour la branche {branch.name}",
             "subscription": {
                 "id": str(subscription.id),
-                "pharmacy_id": str(pharmacy.id),
-                "pharmacy_name": pharmacy.name,
+                "branch_id": str(branch.id),
+                "branch_name": branch.name,
                 "plan": subscription.plan.value,
                 "plan_name": subscription.plan_name,
                 "start_date": subscription.start_date.isoformat(),
                 "end_date": subscription.end_date.isoformat(),
-                "days_remaining": subscription.days_remaining()
+                "days_remaining": subscription.days_remaining(),
+                "max_users": subscription.max_users,
+                "max_products": subscription.max_products
             },
             "code": {
                 "code": code.code,
@@ -598,122 +382,84 @@ async def activate_code_for_pharmacy(
         logger.error(f"Erreur activation: {exc}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "error": "activation_failed",
-                "message": "Erreur lors de l'activation. Veuillez contacter le support."
-            }
-        )
-
-
-@router.post("/activate-pharmacy/{pharmacy_id}", response_model=Dict[str, Any])
-async def activate_pharmacy_with_code(
-    pharmacy_id: UUID,
-    data: ActivateSubscriptionCode,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_super_admin_user),
-) -> Any:
-    """
-    Active un abonnement pour une pharmacie spécifique avec un code.
-    Réservé aux super admins.
-    """
-    logger.info(f"Activation de pharmacie {pharmacy_id} avec code par {current_user.email}")
-    
-    pharmacy = db.query(Pharmacy).filter(Pharmacy.id == pharmacy_id).first()
-    if not pharmacy:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "error": "pharmacy_not_found",
-                "message": "Pharmacie non trouvée."
-            }
-        )
-    
-    # Nettoyer le code
-    clean_code = data.code.strip().upper().replace('-', '').replace(' ', '')
-    
-    search_variations = [
-        data.code.strip().upper(),
-        format_code_with_dashes(clean_code),
-        clean_code
-    ]
-    
-    code = None
-    for search_code in search_variations:
-        code = db.query(SubscriptionCode).filter(
-            SubscriptionCode.code == search_code,
-            SubscriptionCode.status == SubscriptionCodeStatus.PENDING
-        ).first()
-        if code:
-            break
-    
-    if not code:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "error": "invalid_code",
-                "message": "Code d'abonnement invalide ou déjà utilisé."
-            }
-        )
-    
-    if not code.is_valid():
-        status_text = "expiré" if code.valid_until and datetime.utcnow() > code.valid_until else "non disponible"
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "error": "code_expired",
-                "message": f"Ce code est {status_text}."
-            }
-        )
-    
-    try:
-        subscription = activate_pharmacy_subscription_with_code(
-            db=db,
-            pharmacy=pharmacy,
-            code=code,
-            activated_by=current_user
-        )
-        
-        code.status = SubscriptionCodeStatus.ACTIVATED
-        code.activated_by_user_id = current_user.id
-        code.activated_at = datetime.utcnow()
-        
-        db.commit()
-        
-        return {
-            "success": True,
-            "message": f"Abonnement activé pour la pharmacie {pharmacy.name}",
-            "pharmacy": {
-                "id": str(pharmacy.id),
-                "name": pharmacy.name
-            },
-            "subscription": {
-                "id": str(subscription.id),
-                "plan": subscription.plan.value,
-                "plan_name": subscription.plan_name,
-                "start_date": subscription.start_date.isoformat(),
-                "end_date": subscription.end_date.isoformat(),
-                "days_remaining": subscription.days_remaining()
-            },
-            "code": {
-                "code": code.code,
-                "plan": code.plan_type
-            }
-        }
-        
-    except Exception as exc:
-        db.rollback()
-        logger.error(f"Erreur activation pharmacie: {exc}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "error": "activation_failed",
-                "message": "Erreur lors de l'activation."
-            }
+            detail={"error": "activation_failed", "message": "Erreur lors de l'activation."}
         )
 
 
 # =============================================================================
-# ENDPOINTS DE VALIDATION (GET ET POST)
+# STATUT DE L'ABONNEMENT D'UNE BRANCHE
+# =============================================================================
+
+@router.get("/branch/{branch_id}/status", response_model=BranchSubscriptionStatusResponse)
+async def get_branch_subscription_status(
+    branch_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> Any:
+    """
+    Récupère le statut de l'abonnement d'une branche.
+    L'utilisateur doit appartenir à cette branche.
+    """
+    branch = db.query(Branch).filter(Branch.id == branch_id).first()
+    if not branch:
+        raise HTTPException(status_code=404, detail="Branche non trouvée")
+    
+    # Vérifier que l'utilisateur appartient à cette branche
+    if current_user.branch_id != branch_id and current_user.role != "super_admin":
+        raise HTTPException(status_code=403, detail="Accès non autorisé")
+    
+    subscription = db.query(BranchSubscription).filter(
+        BranchSubscription.branch_id == branch_id
+    ).first()
+    
+    # Compter les utilisateurs de la branche
+    from app.models.user import User
+    current_users = db.query(User).filter(User.branch_id == branch_id, User.is_active == True).count()
+    
+    # Compter les produits de la branche
+    from app.models.product import Product
+    current_products = db.query(Product).filter(Product.branch_id == branch_id, Product.is_active == True).count()
+    
+    if not subscription or not subscription.is_active():
+        return BranchSubscriptionStatusResponse(
+            branch_id=branch.id,
+            branch_name=branch.name,
+            has_active_subscription=False,
+            plan=None,
+            plan_name=None,
+            status=None,
+            days_remaining=0,
+            is_trial=False,
+            trial_days_remaining=0,
+            max_users=0,
+            current_users=current_users,
+            max_products=0,
+            current_products=current_products,
+            can_add_users=False,
+            can_add_products=False
+        )
+    
+    return BranchSubscriptionStatusResponse(
+        branch_id=branch.id,
+        branch_name=branch.name,
+        has_active_subscription=True,
+        plan=subscription.plan.value,
+        plan_name=subscription.plan_name,
+        status=subscription.status.value,
+        days_remaining=subscription.days_remaining(),
+        is_trial=subscription.is_trial(),
+        trial_days_remaining=subscription.trial_days_remaining(),
+        max_users=subscription.max_users,
+        current_users=current_users,
+        max_products=subscription.max_products,
+        current_products=current_products,
+        can_add_users=current_users < subscription.max_users,
+        can_add_products=subscription.max_products == 0 or current_products < subscription.max_products
+    )
+
+
+# =============================================================================
+# VALIDATION DU CODE
 # =============================================================================
 
 @router.get("/validate", response_model=Dict[str, Any])
@@ -723,83 +469,53 @@ async def validate_code(
     db: Session = Depends(get_db),
     data: Optional[ActivateSubscriptionCode] = None,
 ) -> Any:
-    """
-    Valide un code sans l'activer.
-    Accepte GET (avec query param) ou POST (avec body).
-    """
-    # Déterminer le code à valider
-    code_to_validate = None
-    if data:
-        code_to_validate = data.code
-    elif code:
-        code_to_validate = code
+    """Valide un code sans l'activer."""
+    code_to_validate = data.code if data else code
     
     if not code_to_validate:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "error": "missing_code",
-                "message": "Code d'abonnement requis."
-            }
+            detail={"error": "missing_code", "message": "Code d'abonnement requis."}
         )
     
-    logger.info(f"Validation de code: {code_to_validate}")
-    result = validate_code_logic(db, code_to_validate)
+    clean_code = code_to_validate.strip().upper().replace('-', '').replace(' ', '')
+    search_variations = [
+        code_to_validate.strip().upper(),
+        format_code_with_dashes(clean_code),
+        clean_code,
+    ]
     
-    if not result["valid"]:
-        logger.warning(f"Code invalide: {code_to_validate} - {result['message']}")
+    code_obj = None
+    for search_code in search_variations:
+        code_obj = db.query(SubscriptionCode).filter(
+            SubscriptionCode.code == search_code
+        ).first()
+        if code_obj:
+            break
     
-    return result
-
-
-# =============================================================================
-# ENDPOINT DE DÉBOGAGE
-# =============================================================================
-
-@router.post("/debug/generate-test", include_in_schema=False)
-async def debug_generate_test_code(
-    plan_type: str = "professional",
-    pharmacy_id: Optional[UUID] = None,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
-) -> Any:
-    """
-    Endpoint de débogage pour générer un code de test.
-    (Non documenté, accessible seulement en développement)
-    """
-    if plan_type not in PLAN_CONFIG:
-        plan_type = "professional"
+    if not code_obj:
+        return {"valid": False, "message": "Code invalide."}
     
-    raw_code = generate_unique_code(8)
-    formatted_code = format_code_with_dashes(raw_code)
-    
-    plan_config = get_plan_config(plan_type)
-    
-    code = SubscriptionCode(
-        code=formatted_code,
-        plan_type=plan_type,
-        plan_name=plan_config["name"],
-        duration_days=30,
-        price=int(plan_config.get("price_monthly", 0) * 100),
-        currency="EUR",
-        valid_from=datetime.utcnow(),
-        valid_until=datetime.utcnow() + timedelta(days=90),
-        created_by_user_id=current_user.id,
-        status=SubscriptionCodeStatus.PENDING,
-        notes="Code de test généré automatiquement",
-        pharmacy_id=pharmacy_id
-    )
-    
-    db.add(code)
-    db.commit()
-    db.refresh(code)
+    if not code_obj.is_valid():
+        status_text = "expiré" if code_obj.valid_until and datetime.utcnow() > code_obj.valid_until else "déjà utilisé"
+        return {
+            "valid": False,
+            "message": f"Code {status_text}.",
+            "status": code_obj.status.value,
+            "valid_until": code_obj.valid_until.isoformat() if code_obj.valid_until else None
+        }
     
     return {
-        "success": True,
-        "message": "Code d'abonnement généré",
-        "code": code.code,
-        "plan_type": code.plan_type,
-        "plan_name": code.plan_name,
-        "valid_until": code.valid_until.isoformat() if code.valid_until else None,
-        "pharmacy_id": str(code.pharmacy_id) if code.pharmacy_id else None
+        "valid": True,
+        "message": "Code valide.",
+        "plan": {
+            "type": code_obj.plan_type,
+            "name": code_obj.plan_name,
+            "duration_days": code_obj.duration_days
+        },
+        "price": float(code_obj.price / 100) if code_obj.price else 0,
+        "currency": code_obj.currency or "EUR",
+        "valid_until": code_obj.valid_until.isoformat() if code_obj.valid_until else None,
+        "code": code_obj.code,
+        "branch_id": str(code_obj.branch_id) if code_obj.branch_id else None
     }

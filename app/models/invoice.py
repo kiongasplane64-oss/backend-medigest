@@ -8,6 +8,9 @@ import enum
 
 from app.db.base import Base
 
+# ✅ Importer InvoicePayment depuis son propre fichier
+from app.models.invoice_payment import InvoicePayment
+
 class InvoiceStatus(str, enum.Enum):
     DRAFT = "draft"
     SENT = "sent"
@@ -24,7 +27,12 @@ class Invoice(Base):
     __tablename__ = "invoices"
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    pharmacy_id = Column(UUID(as_uuid=True), ForeignKey("pharmacies.id", ondelete="CASCADE"), nullable=False)
+    
+    # Lien direct avec la branche
+    branch_id = Column(UUID(as_uuid=True), ForeignKey("branches.id", ondelete="CASCADE"), nullable=True, index=True)
+    
+    # Pour compatibilité
+    pharmacy_id = Column(UUID(as_uuid=True), ForeignKey("pharmacies.id", ondelete="CASCADE"), nullable=True)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
     
     # Numéro de facture unique
@@ -60,7 +68,7 @@ class Invoice(Base):
     payment_method = Column(String(50), nullable=True)
     payment_reference = Column(String(100), nullable=True)
     
-    # Configuration JSON pour flexibilité
+    # Configuration JSON
     invoice_metadata = Column(JSON, default=dict)
     
     # Timestamps
@@ -68,8 +76,11 @@ class Invoice(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     # Relations
+    branch = relationship("Branch", foreign_keys=[branch_id])
     pharmacy = relationship("Pharmacy", foreign_keys=[pharmacy_id])
     tenant = relationship("Tenant", foreign_keys=[tenant_id])
+    
+    # ✅ Utiliser la relation vers InvoicePayment importée
     payments = relationship("InvoicePayment", back_populates="invoice", cascade="all, delete-orphan")
     
     def is_overdue(self) -> bool:
@@ -94,3 +105,6 @@ class Invoice(Base):
     def is_fully_paid(self) -> bool:
         """Vérifie si la facture est entièrement payée"""
         return self.remaining_amount <= 0 and self.status == InvoiceStatus.PAID
+    
+    def __repr__(self):
+        return f"<Invoice {self.invoice_number} - {self.status.value}>"
