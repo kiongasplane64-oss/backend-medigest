@@ -92,7 +92,7 @@ class BranchSubscription(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # Relations
-    branch = relationship("Branch", back_populates="subscription")
+    branch = relationship("Branch", back_populates="branch_subscription", foreign_keys="[Branch.subscription_id]")
     tenant = relationship("Tenant")
     pharmacy = relationship("Pharmacy")
 

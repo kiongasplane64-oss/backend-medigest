@@ -10,6 +10,7 @@ from app.models.tenant import Tenant
 from app.models.branch import Branch
 from app.models.pharmacy import Pharmacy
 from app.schemas.branch import BranchResponse, BranchCreate, BranchUpdate, BranchListResponse
+from app.utils.config_resolver import ConfigResolver
 
 router = APIRouter(tags=["Branches"])  
 
@@ -173,4 +174,164 @@ async def get_branch_statistics(
         "products_low_stock": low_stock,
         "products_out_of_stock": out_of_stock,
         "period": period
+    }
+
+@router.get("/{branch_id}/resolved-config")
+def get_branch_resolved_config(
+    branch_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """
+    Récupère la configuration résolue pour une branche
+    (fusionne branche + pharmacie + defaults)
+    """
+    branch = db.query(Branch).filter(
+        Branch.id == branch_id,
+        Branch.tenant_id == current_tenant.id
+    ).first()
+    
+    if not branch:
+        raise HTTPException(status_code=404, detail="Branche non trouvée")
+    
+    pharmacy = db.query(Pharmacy).filter(Pharmacy.id == branch.parent_pharmacy_id).first()
+    
+    resolved_config = {
+        "working_hours": ConfigResolver.resolve_working_hours(branch, pharmacy),
+        "currencies": ConfigResolver.resolve_currencies(branch, pharmacy),
+        "low_stock_threshold": ConfigResolver.resolve_config(
+            branch, pharmacy, "lowStockThreshold", 10
+        ),
+        "expiry_warning_days": ConfigResolver.resolve_config(
+            branch, pharmacy, "expiryWarningDays", 90
+        ),
+        "allow_negative_stock": ConfigResolver.resolve_config(
+            branch, pharmacy, "allowNegativeStock", False
+        ),
+        "tax_rate": ConfigResolver.resolve_config(
+            branch, pharmacy, "taxRate", 16
+        ),
+        "sales_type": ConfigResolver.resolve_config(
+            branch, pharmacy, "salesType", "both"
+        ),
+        "subscription_features": ConfigResolver.get_active_subscription_features(branch)
+    }
+    
+    return resolved_config
+
+
+@router.patch("/{branch_id}/operational-config")
+def update_branch_operational_config(
+    branch_id: str,
+    config_update: dict,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """
+    Met à jour la configuration opérationnelle d'une branche
+    (surcharge la configuration de la pharmacie)
+    """
+    branch = db.query(Branch).filter(
+        Branch.id == branch_id,
+        Branch.tenant_id == current_tenant.id
+    ).first()
+    
+    if not branch:
+        raise HTTPException(status_code=404, detail="Branche non trouvée")
+    
+    # Mettre à jour la config opérationnelle
+    if not branch.operational_config:
+        branch.operational_config = {}
+    
+    for key, value in config_update.items():
+        branch.operational_config[key] = value
+    
+    branch.updated_at = datetime.utcnow()
+    db.commit()
+    
+    return {
+        "message": "Configuration opérationnelle mise à jour",
+        "operational_config": branch.operational_config
+    }
+
+
+@router.delete("/{branch_id}/operational-config/{key}")
+def reset_branch_operational_config(
+    branch_id: str,
+    key: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """
+    Réinitialise une clé de configuration opérationnelle
+    (revient à la valeur de la pharmacie)
+    """
+    branch = db.query(Branch).filter(
+        Branch.id == branch_id,
+        Branch.tenant_id == current_tenant.id
+    ).first()
+    
+    if not branch:
+        raise HTTPException(status_code=404, detail="Branche non trouvée")
+    
+    if branch.operational_config and key in branch.operational_config:
+        del branch.operational_config[key]
+        branch.updated_at = datetime.utcnow()
+        db.commit()
+    
+    return {"message": f"Configuration '{key}' réinitialisée"}
+
+
+@router.get("/{branch_id}/subscription/features")
+def get_branch_features(
+    branch_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Tenant = Depends(get_current_tenant)
+):
+    """
+    Récupère les fonctionnalités disponibles pour une branche selon son abonnement
+    """
+    branch = db.query(Branch).filter(
+        Branch.id == branch_id,
+        Branch.tenant_id == current_tenant.id
+    ).first()
+    
+    if not branch:
+        raise HTTPException(status_code=404, detail="Branche non trouvée")
+    
+    features = ConfigResolver.get_active_subscription_features(branch)
+    
+    # Ajouter les limites actuelles
+    from app.models.user import User
+    from app.models.product import Product
+    from app.models.sale import Sale
+    
+    current_users = db.query(User).filter(User.branch_id == branch.id, User.actif == True).count()
+    current_products = db.query(Product).filter(Product.branch_id == branch.id).count()
+    
+    month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    current_transactions = db.query(Sale).filter(
+        Sale.branch_id == branch.id,
+        Sale.created_at >= month_start
+    ).count()
+    
+    return {
+        "branch_id": str(branch.id),
+        "branch_name": branch.name,
+        "subscription_status": branch.subscription_status,
+        "features": features,
+        "usage": {
+            "current_users": current_users,
+            "max_users": features.get("max_users", float('inf')),
+            "current_products": current_products,
+            "max_products": features.get("max_products", float('inf')),
+            "current_transactions_this_month": current_transactions,
+            "max_transactions_per_month": features.get("max_transactions_per_month", float('inf'))
+        },
+        "can_add_user": current_users < features.get("max_users", float('inf')),
+        "can_add_product": current_products < features.get("max_products", float('inf'))
     }

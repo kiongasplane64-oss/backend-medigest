@@ -964,6 +964,7 @@ def _create_sale_force_stock(
             movement = StockMovement(
                 tenant_id=tenant_id,
                 product_id=product.id,
+                product_code=product.code, 
                 pharmacy_id=pharmacy_id,
                 branch_id=branch_id,
                 quantity_before=old_quantity,

@@ -33,6 +33,7 @@ from app.api.v1.orders import router as orders_router
 from app.api.v1.capital import router as capital_router
 from app.api.v1.endpoints.expenses import router as expenses_router
 from app.api.v1.endpoints.branches import router as branches_router
+from app.api.v1.endpoints.profit import router as profit_router
 
 from app.core.startup import init_storage
 
@@ -217,6 +218,7 @@ include_router_auto(app, inventory_router, tags=["Inventory"])
 include_router_auto(app, subscription_codes_router)
 include_router_auto(app, categories_router)
 app.include_router(session.router, prefix="/api/v1")
+include_router_auto(app, profit_router, tags=["Bénéfices"]) 
 app.include_router(sync_router, prefix="/api/v1", tags=["Synchronization"])
 include_router_auto(app, orders_router, tags=["orders"])
 include_router_auto(app, transfers_router, tags=["transfers"])

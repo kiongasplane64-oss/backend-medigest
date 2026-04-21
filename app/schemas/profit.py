@@ -25,6 +25,18 @@ class ProfitStatsResponse(BaseModel):
     period_end: Optional[str] = None
 
 
+class ProfitBreakdownResponse(BaseModel):
+    """Détail de la répartition des bénéfices"""
+    total_profit: float = Field(..., description="Bénéfice total")
+    by_category: Dict[str, float] = Field(default_factory=dict, description="Par catégorie de produit")
+    by_product: List[Dict[str, Any]] = Field(default_factory=list, description="Par produit")
+    by_branch: List[Dict[str, Any]] = Field(default_factory=list, description="Par succursale")
+    by_user: List[Dict[str, Any]] = Field(default_factory=list, description="Par utilisateur")
+    by_payment_method: Dict[str, float] = Field(default_factory=dict, description="Par méthode de paiement")
+    by_hour: Dict[int, float] = Field(default_factory=dict, description="Par heure de la journée")
+    by_weekday: Dict[str, float] = Field(default_factory=dict, description="Par jour de la semaine")
+
+
 class DailyProfitResponse(BaseModel):
     """Bénéfices journaliers"""
     date: str

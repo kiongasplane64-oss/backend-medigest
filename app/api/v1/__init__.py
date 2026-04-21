@@ -17,6 +17,7 @@ from app.api.v1.dashboard import router as dashboard_router
 from app.api.v1.endpoints.transfers import router as transfers_router
 from app.api.v1.capital import router as capital_router
 from app.api.v1.endpoints.expenses import router as expenses_router
+from app.api.v1.endpoints.profit import router as profit_router
 
 
 
@@ -33,6 +34,7 @@ api_router.include_router(subscription_codes_router)
 api_router.include_router(auth.router, prefix="/auth", tags=["Authentication"])
 api_router.include_router(users.router, prefix="/users", tags=["Users"])
 api_router.include_router(sales.router, prefix="/sales", tags=["Sales"])
+api_router.include_router(profit_router, prefix="/profit", tags=["Bénéfices"])
 api_router.include_router(categories.router, prefix="/categories", tags=["Categories"])
 api_router.include_router(pharmacies.router, prefix="/pharmacies", tags=["Pharmacies"])
 api_router.include_router(sync_router, prefix="/sync", tags=["Synchronization"]) 

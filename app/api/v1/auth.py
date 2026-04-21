@@ -292,11 +292,11 @@ def generate_unique_slug(nom_pharmacie: str, db: Session) -> str:
 
 
 def generate_unique_tenant_code(nom_pharmacie: str, db: Session) -> str:
-    """Génère un code unique pour un tenant avec vérification"""
     prefix = nom_pharmacie[:3].upper().replace(' ', '')
     if len(prefix) < 3:
         prefix = prefix + 'PH'
     
+    counter = 0  # ✅ Définir counter
     while True:
         random_suffix = str(random.randint(100, 999))
         tenant_code = f"{prefix}{random_suffix}"
@@ -310,6 +310,7 @@ def generate_unique_tenant_code(nom_pharmacie: str, db: Session) -> str:
 
 def is_subscription_active(db: Session, branch_id: str) -> bool:
     """Vérifie si l'abonnement est actif pour une branche donnée"""
+    logger.info(f"🔍 Vérification abonnement pour branch_id: {branch_id}")
     try:
         if not branch_id:
             logger.warning("is_subscription_active appelé avec branch_id None")
