@@ -66,7 +66,7 @@ class Branch(Base):
     subscription_config = Column(JSON, default=lambda: {
         "plan": "essential",  # essential, professional, enterprise
         "max_users": 5,
-        "max_products": 1500,
+        "max_products": 2000,
         "max_transactions_per_month": 1000,
         "features": {
             "inventory_management": True,
@@ -202,7 +202,7 @@ class Branch(Base):
         return self.subscription_config or {
             "plan": "essential",
             "max_users": 5,
-            "max_products": 1500,
+            "max_products": 3000,
             "max_transactions_per_month": 1000,
             "features": {
                 "inventory_management": True,

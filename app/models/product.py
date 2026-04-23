@@ -57,6 +57,10 @@ class Product(Base):
     branch_id = sa.Column(sa.UUID, sa.ForeignKey("branches.id"), nullable=True)
     stock_version = Column(Integer, default=1, nullable=False)
     last_sync_at = Column(DateTime, nullable=True)
+    synced_quantity = Column(Integer, nullable=False, default=0, 
+                            comment="Dernière quantité synchronisée connue")
+    pending_quantity_change = Column(Integer, nullable=False, default=0,
+                                    comment="Changement de stock en attente de synchro")
     
     # =====================================
     # IDENTIFICATION DU PRODUIT
@@ -291,6 +295,15 @@ class Product(Base):
         self.last_sync_at = datetime.utcnow()
         self.refresh_statuses()
         return True
+    
+    def apply_pending_changes(self):
+        """Applique les changements de stock en attente"""
+        if self.pending_quantity_change != 0:
+            self.quantity += self.pending_quantity_change
+            self.pending_quantity_change = 0
+            self.stock_version += 1
+            self.last_sync_at = datetime.utcnow()
+            self.refresh_statuses()
 
     # =====================================
     # PROPRIÉTÉS CALCULÉES

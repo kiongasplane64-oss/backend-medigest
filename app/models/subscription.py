@@ -356,7 +356,7 @@ def create_default_plans() -> dict:
             "monthly_price": Decimal('49.99'),
             "annual_price": Decimal('479.99'),  # ~20% de réduction
             "max_users": 3,
-            "max_products": 500,
+            "max_products": 3000,
             "max_storage_mb": 1024,  # 1GB
             "features": [
                 "Gestion des stocks",

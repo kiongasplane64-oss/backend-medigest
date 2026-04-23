@@ -18,6 +18,7 @@ from app.api.v1.endpoints.transfers import router as transfers_router
 from app.api.v1.capital import router as capital_router
 from app.api.v1.endpoints.expenses import router as expenses_router
 from app.api.v1.endpoints.profit import router as profit_router
+from app.api.v1.endpoints.admin_sync import router as admin_sync
 
 
 

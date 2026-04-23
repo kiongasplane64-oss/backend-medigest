@@ -308,6 +308,7 @@ class SaleResponse(BaseModel):
     alerts: Optional[List[Dict[str, Any]]] = None
     receipt_available: bool = False
     receipt_url: Optional[str] = None
+    generated_invoice_number: Optional[str] = None
 
 
 # ============================

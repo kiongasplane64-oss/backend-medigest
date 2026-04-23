@@ -182,11 +182,17 @@ async def create_sale(
     current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_user: User = Depends(get_current_active_user),
     current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
-    background_tasks: BackgroundTasks = BackgroundTasks()
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    force_invoice_number: Optional[str] = Query(None, description="Force un numéro de facture spécifique (réservé admin)")
 ):
     """
     Crée une nouvelle vente avec gestion complète par pharmacie
     et mise à jour automatique du stock avec traçabilité.
+    
+    GESTION DES NUMÉROS DE FACTURE:
+    - Si invoice_number est fourni dans sale_data et qu'il est unique, il est utilisé
+    - Sinon, le serveur génère automatiquement un numéro unique
+    - En cas de conflit (numéro déjà existant), un nouveau numéro est généré
     
     IMPORTANT:
     - Le prix de vente est TOUJOURS celui défini dans le stock (product.selling_price)
@@ -194,21 +200,17 @@ async def create_sale(
     - Les champs unit_price et tva_rate dans SaleItemCreate sont ignorés
     - Seule la remise (discount_percent) peut être appliquée par l'utilisateur
     """
-    # Dans create_sale, avant la vérification :
-    logger.info(f"🔍 Type du rôle: {type(current_user.role)}")
-    logger.info(f"🔍 Valeur du rôle: {current_user.role}")
-    logger.info(f"🔍 Attributs du rôle: {dir(current_user.role)}")
-
-# Puis adaptez la vérification en conséquence
+    
     # Vérifier les permissions
     user_role = (current_user.role).lower() if current_user.role else ""
     allowed_roles = ["admin", "super_admin", "superadmin", "vendeur", "gerant", "caissier"]
     
+    logger.info(f"🔍 Rôle utilisateur: {user_role}")
+    
     if user_role not in allowed_roles:
-        logger.error(f"❌ Rôle insuffisant: {user_role} (attendu: {allowed_roles})")
-        logger.error(f"📋 Rôle original: {current_user.role}")
+        logger.error(f"❌ Rôle insuffisant: {user_role}")
         raise HTTPException(
-            status_code=HTTPStatus.FORBIDDEN,  # Utiliser 403 au lieu de 500
+            status_code=HTTPStatus.FORBIDDEN,
             detail=f"Rôle insuffisant pour créer une vente. Rôles autorisés: {allowed_roles}, rôle actuel: {user_role}"
         )
     
@@ -249,7 +251,6 @@ async def create_sale(
         inventory_service = InventoryService(db, tenant_id)
 
         # Vérification des stocks et récupération des produits avec leurs prix
-        # PAS DE AWAIT car la fonction est synchrone
         available_items, unavailable_items = check_stock_availability_with_prices(
             db=db,
             tenant_id=tenant_id,
@@ -321,7 +322,38 @@ async def create_sale(
                         detail=f"Crédit insuffisant. Disponible: {float(credit_available):.2f}, Requis: {float(temp_total):.2f}"
                     )
 
-        # Génération référence
+        # ========================
+        # GESTION DU NUMÉRO DE FACTURE
+        # ========================
+        
+        final_invoice_number = None
+        
+        # Vérifier si un numéro de facture a été fourni
+        if sale_data.invoice_number:
+            # Vérifier si ce numéro existe déjà
+            existing_sale = db.query(Sale).filter(
+                Sale.invoice_number == sale_data.invoice_number,
+                Sale.tenant_id == tenant_id
+            ).first()
+            
+            if existing_sale:
+                # Conflit détecté - générer un nouveau numéro
+                logger.warning(f"⚠️ Conflit numéro facture {sale_data.invoice_number} - Génération automatique")
+                final_invoice_number = await generate_unique_invoice_number(
+                    db, tenant_id, pharmacy.id
+                )
+            else:
+                # Numéro valide et unique
+                final_invoice_number = sale_data.invoice_number
+                logger.info(f"📋 Utilisation du numéro facture client: {final_invoice_number}")
+        else:
+            # Aucun numéro fourni - génération automatique
+            final_invoice_number = await generate_unique_invoice_number(
+                db, tenant_id, pharmacy.id
+            )
+            logger.info(f"📋 Numéro facture généré automatiquement: {final_invoice_number}")
+
+        # Génération référence vente
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         pharmacy_code = getattr(pharmacy, 'pharmacy_code', 'PHARM')
         reference = f"VNT-{timestamp}-{pharmacy_code}"
@@ -376,7 +408,7 @@ async def create_sale(
             total_discount += global_discount_amount
             total_amount -= global_discount_amount
 
-        # Créer la vente
+        # Créer la vente avec le numéro de facture final
         sale = Sale(
             tenant_id=tenant_id,
             pharmacy_id=pharmacy.id,
@@ -401,7 +433,7 @@ async def create_sale(
             total_tva=total_tva,
             total_amount=total_amount,
             status="pending" if sale_data.is_credit else "completed",
-            invoice_number=sale_data.invoice_number,
+            invoice_number=final_invoice_number,  # ← Numéro de facture unique
             cancelled_at=None,
             cancelled_by=None,
             cancel_reason=None
@@ -486,6 +518,9 @@ async def create_sale(
             if sale_data.is_credit:
                 client.dette_actuelle = (getattr(client, 'dette_actuelle', Decimal('0')) or Decimal('0')) + total_amount
 
+        # Incrémenter le compteur de factures
+        await increment_invoice_counter(db, tenant_id, pharmacy.id, final_invoice_number)
+
         # Validation automatique si configuré
         if getattr(settings, 'AUTO_VALIDATE_SALES', False) and current_user.role in ["admin", "super_admin", "superadmin", "gerant"]:
             sale.status = "completed"
@@ -500,8 +535,8 @@ async def create_sale(
         background_tasks.add_task(update_sales_statistics, tenant_id, pharmacy.id, datetime.now().date(), db)
 
         logger.info(
-            f"Vente créée: {sale.reference} - {len(sale_items)} articles - "
-            f"Pharmacie: {pharmacy.name} par {current_user.email}"
+            f"Vente créée: {sale.reference} - Facture: {final_invoice_number} - "
+            f"{len(sale_items)} articles - Pharmacie: {pharmacy.name} par {current_user.email}"
         )
 
         # Construction de la réponse
@@ -514,7 +549,8 @@ async def create_sale(
                 "code": getattr(pharmacy, 'pharmacy_code', None)
             },
             receipt_available=True,
-            receipt_url=f"/api/v1/sales/{sale.id}/receipt"
+            receipt_url=f"/api/v1/sales/{sale.id}/receipt",
+            generated_invoice_number=final_invoice_number  # Ajouter ce champ à SaleResponse
         )
 
     except HTTPException:
@@ -524,10 +560,267 @@ async def create_sale(
         db.rollback()
         logger.error(f"Erreur création vente: {str(e)}", exc_info=True)
         raise HTTPException(
-            
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             detail=f"Erreur création vente: {str(e)}"
         )
+
+
+# ========================
+# FONCTIONS UTILITAIRES POUR LES NUMÉROS DE FACTURE
+# ========================
+
+async def generate_unique_invoice_number(
+    db: Session,
+    tenant_id: UUID,
+    pharmacy_id: UUID,
+    max_attempts: int = 5
+) -> str:
+    """
+    Génère un numéro de facture unique pour une pharmacie.
+    Format: INV-YYYYMMDD-XXXX (ex: INV-20260423-0042)
+    """
+    from app.models.invoice_counter import InvoiceCounter
+    
+    today = datetime.now().date()
+    date_str = today.strftime("%Y%m%d")
+    
+    for attempt in range(max_attempts):
+        # Récupérer ou créer le compteur
+        counter = db.query(InvoiceCounter).filter(
+            InvoiceCounter.tenant_id == tenant_id,
+            InvoiceCounter.pharmacy_id == pharmacy_id,
+            InvoiceCounter.date == today
+        ).first()
+        
+        if not counter:
+            counter = InvoiceCounter(
+                tenant_id=tenant_id,
+                pharmacy_id=pharmacy_id,
+                date=today,
+                current_number=1
+            )
+            db.add(counter)
+            db.flush()
+        
+        # Générer le numéro
+        sequence = counter.current_number
+        invoice_number = f"INV-{date_str}-{sequence:04d}"
+        
+        # Vérifier l'unicité
+        existing = db.query(Sale).filter(
+            Sale.invoice_number == invoice_number,
+            Sale.tenant_id == tenant_id
+        ).first()
+        
+        if not existing:
+            # Incrémenter le compteur pour la prochaine fois
+            counter.current_number += 1
+            db.flush()
+            return invoice_number
+        
+        # Conflit - incrémenter et réessayer
+        counter.current_number += 1
+        logger.warning(f"⚠️ Conflit sur {invoice_number}, tentative {attempt + 2}/{max_attempts}")
+    
+    # Fallback avec timestamp
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    return f"INV-{timestamp}"
+
+
+async def increment_invoice_counter(
+    db: Session,
+    tenant_id: UUID,
+    pharmacy_id: UUID,
+    used_invoice_number: str
+) -> None:
+    """
+    Incrémente le compteur après utilisation réussie d'un numéro.
+    Utile pour la synchronisation avec les clients.
+    """
+    from app.models.invoice_counter import InvoiceCounter
+    
+    # Extraire la date du numéro de facture
+    try:
+        parts = used_invoice_number.split('-')
+        if len(parts) >= 3 and parts[0] == 'INV':
+            date_str = parts[1]
+            sequence = int(parts[2])
+            
+            # S'assurer que le compteur est au moins à séquence + 1
+            today = datetime.now().date()
+            counter = db.query(InvoiceCounter).filter(
+                InvoiceCounter.tenant_id == tenant_id,
+                InvoiceCounter.pharmacy_id == pharmacy_id,
+                InvoiceCounter.date == today
+            ).first()
+            
+            if counter and counter.current_number <= sequence:
+                counter.current_number = sequence + 1
+                db.flush()
+    except Exception as e:
+        logger.error(f"Erreur incrémentation compteur: {e}")
+
+
+# ========================
+# ENDPOINTS POUR SYNCHRONISATION DES FACTURES
+# ========================
+
+@router.get("/next-invoice-number")
+async def get_next_invoice_number(
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
+):
+    """
+    Récupère le prochain numéro de facture disponible.
+    Les clients doivent appeler cet endpoint AVANT chaque vente en ligne.
+    """
+    tenant_id = current_tenant.id if current_tenant else None
+    pharmacy_id = current_pharmacy.id if current_pharmacy else None
+    
+    if not pharmacy_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Aucune pharmacie sélectionnée"
+        )
+    
+    next_number = await generate_unique_invoice_number(db, tenant_id, pharmacy_id)
+    
+    return {
+        "invoice_number": next_number,
+        "pharmacy_id": str(pharmacy_id),
+        "tenant_id": str(tenant_id) if tenant_id else None,
+        "generated_at": datetime.utcnow().isoformat()
+    }
+
+
+@router.post("/sync-invoice-counter")
+async def sync_invoice_counter(
+    sync_data: dict,
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+):
+    """
+    Synchronise le compteur de factures depuis un client.
+    Utile pour la reprise après mode offline.
+    """
+    from app.models.invoice_counter import InvoiceCounter
+    
+    tenant_id = current_tenant.id if current_tenant else None
+    pharmacy_id = UUID(sync_data.get("pharmacy_id"))
+    last_invoice_number = sync_data.get("last_invoice_number")
+    max_sequence = sync_data.get("max_sequence", 0)
+    
+    today = datetime.now().date()
+    
+    counter = db.query(InvoiceCounter).filter(
+        InvoiceCounter.tenant_id == tenant_id,
+        InvoiceCounter.pharmacy_id == pharmacy_id,
+        InvoiceCounter.date == today
+    ).first()
+    
+    if not counter:
+        counter = InvoiceCounter(
+            tenant_id=tenant_id,
+            pharmacy_id=pharmacy_id,
+            date=today,
+            current_number=1
+        )
+        db.add(counter)
+    
+    # Prendre le maximum entre le compteur local et celui du client
+    if max_sequence > counter.current_number:
+        counter.current_number = max_sequence
+        logger.info(f"Compteur mis à jour: {counter.current_number} (client: {max_sequence})")
+    
+    db.commit()
+    
+    return {
+        "success": True,
+        "new_counter": counter.current_number,
+        "next_invoice": f"INV-{today.strftime('%Y%m%d')}-{counter.current_number:04d}"
+    }
+
+@router.get("/next-invoice-number")
+async def get_next_invoice_number(
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
+):
+    """
+    Récupère le prochain numéro de facture disponible depuis le serveur.
+    Le client doit appeler cet endpoint avant de créer une vente en ligne.
+    """
+    from app.models.invoice_counter import InvoiceCounter
+    
+    tenant_id = current_tenant.id if current_tenant else None
+    pharmacy_id = current_pharmacy.id if current_pharmacy else None
+    
+    # Récupérer ou créer le compteur pour cette pharmacie
+    counter = db.query(InvoiceCounter).filter(
+        InvoiceCounter.tenant_id == tenant_id,
+        InvoiceCounter.pharmacy_id == pharmacy_id
+    ).first()
+    
+    if not counter:
+        counter = InvoiceCounter(
+            tenant_id=tenant_id,
+            pharmacy_id=pharmacy_id,
+            current_number=1,
+            last_invoice_date=datetime.now().date()
+        )
+        db.add(counter)
+        db.commit()
+        db.refresh(counter)
+    
+    # Vérifier si on a changé de jour
+    today = datetime.now().date()
+    if counter.last_invoice_date != today:
+        counter.current_number = 1
+        counter.last_invoice_date = today
+        db.commit()
+    
+    next_number = counter.current_number
+    date_str = today.strftime("%Y%m%d")
+    pharmacy_code = getattr(current_pharmacy, 'pharmacy_code', 'PHARM')
+    
+    return {
+        "invoice_number": f"INV-{date_str}-{next_number:04d}",
+        "sequence_number": next_number,
+        "date": date_str,
+        "pharmacy_code": pharmacy_code
+    }
+
+@router.post("/confirm-invoice-number")
+async def confirm_invoice_number(
+    invoice_number: str,
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
+):
+    """
+    Confirme l'utilisation d'un numéro de facture et incrémente le compteur.
+    À appeler APRÈS une vente réussie.
+    """
+    from app.models.invoice_counter import InvoiceCounter
+    
+    tenant_id = current_tenant.id if current_tenant else None
+    pharmacy_id = current_pharmacy.id if current_pharmacy else None
+    
+    counter = db.query(InvoiceCounter).filter(
+        InvoiceCounter.tenant_id == tenant_id,
+        InvoiceCounter.pharmacy_id == pharmacy_id
+    ).first()
+    
+    if counter:
+        counter.current_number += 1
+        db.commit()
+    
+    return {"success": True, "new_sequence": counter.current_number if counter else 1}
 
 
 # =======================

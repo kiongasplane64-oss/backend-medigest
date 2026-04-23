@@ -578,9 +578,9 @@ def register_tenant(data: TenantRegisterSchema, db: Session = Depends(get_db)):
 
     plan_limits = {
         "trial": {"max_users": 5, "max_products": 2000, "max_pharmacies": 1},
-        "starter": {"max_users": 5, "max_products": 1500, "max_pharmacies": 1},
-        "professional": {"max_users": 20, "max_products": 3000, "max_pharmacies": 3},
-        "enterprise": {"max_users": 20, "max_products": 10000, "max_pharmacies": 0},
+        "starter": {"max_users": 5, "max_products": 3000, "max_pharmacies": 1},
+        "professional": {"max_users": 20, "max_products": 4000, "max_pharmacies": 3},
+        "enterprise": {"max_users": 20, "max_products": 15000, "max_pharmacies": 0},
         "infinite": {"max_users": 0, "max_products": 0, "max_pharmacies": 0}
     }
 

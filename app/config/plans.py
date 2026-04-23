@@ -27,7 +27,7 @@ PLAN_CONFIG = {
         "name": "Starter",
         "price_monthly": 5,
         "price_yearly": 50,
-        "max_products": 1500,
+        "max_products": 3000,
         "max_users": 5,
         "max_branches": None,
         "max_storage_mb": 1024,
@@ -46,7 +46,7 @@ PLAN_CONFIG = {
         "name": "Professional",
         "price_monthly": 8,
         "price_yearly": 72,
-        "max_products": 3000,
+        "max_products": 4000,
         "max_users": 20,
         "max_branches": None,
         "max_storage_mb": 5120,
@@ -68,7 +68,7 @@ PLAN_CONFIG = {
         "name": "Enterprise",
         "price_monthly": 15,
         "price_yearly": 120,
-        "max_products": 10000,  
+        "max_products": 15000,  
         "max_users": None,  # Illimité
         "max_branches": None,  # Illimité
         "max_storage_mb": 10240,

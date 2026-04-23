@@ -273,29 +273,34 @@ async def get_profit_stats(
             total_cost += cost
             gross_profit += revenue - cost
         
-        # Valeur du stock actuel
+        # Valeur du stock actuel - Convertir en Decimal pour cohérence
         current_products = db.query(Product).filter(
             Product.tenant_id == tenant_id,
             Product.pharmacy_id.in_(pharmacy_ids),
             Product.is_active == True
         ).all()
         
-        purchase_value = sum(float(p.purchase_value) for p in current_products)
-        selling_value = sum(float(p.selling_value) for p in current_products)
+        purchase_value = Decimal(str(sum(float(p.purchase_value) for p in current_products)))
+        selling_value = Decimal(str(sum(float(p.selling_value) for p in current_products)))
         
         # Bénéfice attendu (marge sur stock actuel)
         expected_profit = selling_value - purchase_value
         
-        margin_rate = (gross_profit / total_revenue * 100) if total_revenue > 0 else 0
+        # Convertir gross_profit en Decimal pour la comparaison
+        margin_rate = (gross_profit / total_revenue * 100) if total_revenue > 0 else Decimal('0')
+        
+        # Convertir les valeurs pour la réponse
+        gross_profit_float = float(gross_profit)
+        expected_profit_float = float(expected_profit)
         
         return ProfitStatsResponse(
-            gross_profit=float(gross_profit),
-            net_profit=float(gross_profit),  # À ajuster avec les frais
+            gross_profit=gross_profit_float,
+            net_profit=gross_profit_float,
             total_revenue=float(total_revenue),
             total_cost=float(total_cost),
-            expected_profit=float(expected_profit),
-            actual_profit=float(gross_profit),
-            remaining_profit=float(expected_profit - gross_profit) if expected_profit > gross_profit else 0,
+            expected_profit=expected_profit_float,
+            actual_profit=gross_profit_float,
+            remaining_profit=expected_profit_float - gross_profit_float if expected_profit_float > gross_profit_float else 0,
             margin_rate=float(margin_rate),
             purchase_value=float(purchase_value),
             selling_value=float(selling_value),
@@ -311,7 +316,6 @@ async def get_profit_stats(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur récupération stats: {str(e)}"
         )
-
 
 @router.get("/daily", response_model=List[DailyProfitResponse], summary="Bénéfices journaliers")
 async def get_daily_profit(

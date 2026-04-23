@@ -327,6 +327,45 @@ def get_optional_current_user(
     except HTTPException:
         return None
 
+def get_current_admin_user(
+    current_user: User = Depends(get_current_active_user),
+) -> User:
+    """
+    Vérifie que l'utilisateur courant a un rôle administrateur (admin ou super_admin).
+    À utiliser pour les endpoints d'administration.
+    """
+    user_role = getattr(current_user, "role", None)
+    
+    # Normaliser le rôle (gérer les enums ou strings)
+    if hasattr(user_role, 'value'):
+        user_role = user_role.value
+    elif hasattr(user_role, 'name'):
+        user_role = user_role.name
+    
+    # Liste des rôles admin autorisés
+    admin_roles = {"admin", "super_admin", "superadmin"}
+    
+    if not user_role or user_role.lower() not in admin_roles:
+        logger.warning(
+            "⛔ Accès admin refusé pour %s (rôle: %s)",
+            getattr(current_user, "email", None),
+            user_role,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "admin_access_required",
+                "message": "Accès réservé aux administrateurs",
+                "current_role": user_role,
+                "required_roles": list(admin_roles),
+            },
+        )
+    
+    logger.debug("✅ Accès admin autorisé pour %s (rôle: %s)", 
+                 getattr(current_user, "email", None), 
+                 user_role)
+    return current_user
+
 
 def get_super_admin_user(
     current_user: User = Depends(get_current_active_user),
@@ -1739,6 +1778,7 @@ __all__ = [
     "get_pagination_params",
     "get_date_range_params",
     "subscription_required",
+    "get_current_admin_user"
     "get_current_active_pharmacy",
     "get_current_active_branch",
     "get_current_active_pharmacy_dict",

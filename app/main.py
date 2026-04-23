@@ -18,6 +18,7 @@ from app.api.v1.subscriptions import router as subscriptions_router
 from app.api.v1.subscription_codes import router as subscription_codes_router
 from app.api.v1.payments import router as payment_router
 from app.api.v1.superadmin import router as superadmin_router
+from app.api.v1.endpoints.admin_sync import router as admin_sync_router
 from app.api.v1.sync import router as sync_router
 from app.api.v1.sales import router as sales_router
 from app.api.v1.customers import router as customers_router
@@ -226,6 +227,7 @@ include_router_auto(app, dashboard_router)
 include_router_auto(app, capital_router)
 app.add_middleware(SubscriptionCheckMiddleware)
 app.add_middleware(SubscriptionMiddleware)
+include_router_auto(app, admin_sync_router)
 
 
 # ============================================================================
