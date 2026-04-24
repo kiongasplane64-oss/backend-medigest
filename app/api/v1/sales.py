@@ -794,9 +794,9 @@ async def get_next_invoice_number(
         "pharmacy_code": pharmacy_code
     }
 
-@router.post("/confirm-invoice-number")
+@router.post("/confirm-invoice-number", status_code=status.HTTP_200_OK)
 async def confirm_invoice_number(
-    invoice_number: str,
+    request: dict,  # Accepter dict pour plus de flexibilité
     db: Session = Depends(get_db),
     current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_user: User = Depends(get_current_active_user),
@@ -804,25 +804,80 @@ async def confirm_invoice_number(
 ):
     """
     Confirme l'utilisation d'un numéro de facture et incrémente le compteur.
-    À appeler APRÈS une vente réussie.
+    Accepte soit invoice_number soit pharmacy_id dans le body.
     """
     from app.models.invoice_counter import InvoiceCounter
     
-    tenant_id = current_tenant.id if current_tenant else None
-    pharmacy_id = current_pharmacy.id if current_pharmacy else None
+    # Extraire les paramètres (supporte plusieurs formats)
+    invoice_number = request.get("invoice_number") or request.get("invoiceNumber")
+    pharmacy_id = request.get("pharmacy_id") or request.get("pharmacyId")
     
+    # Si pharmacy_id non fourni, utiliser celui de la session
+    if not pharmacy_id and current_pharmacy:
+        pharmacy_id = current_pharmacy.id
+    elif not pharmacy_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="pharmacy_id requis"
+        )
+    
+    tenant_id = current_tenant.id if current_tenant else None
+    
+    today = datetime.now().date()
+    
+    # Chercher le compteur
     counter = db.query(InvoiceCounter).filter(
         InvoiceCounter.tenant_id == tenant_id,
-        InvoiceCounter.pharmacy_id == pharmacy_id
+        InvoiceCounter.pharmacy_id == pharmacy_id,
+        InvoiceCounter.date == today
     ).first()
     
     if counter:
-        counter.current_number += 1
+        # Si un numéro spécifique est fourni, s'assurer que le compteur est au moins à ce niveau
+        if invoice_number:
+            try:
+                # Extraire le numéro séquentiel de INV-20260424-0042
+                parts = invoice_number.split('-')
+                if len(parts) >= 3:
+                    sequence = int(parts[2])
+                    if counter.current_number <= sequence:
+                        counter.current_number = sequence + 1
+                        db.commit()
+            except Exception as e:
+                logger.warning(f"Erreur extraction séquence: {e}")
+        else:
+            # Sinon, simplement incrémenter
+            counter.current_number += 1
+            db.commit()
+    else:
+        # Créer un nouveau compteur
+        if invoice_number:
+            sequence = 2  # Valeur par défaut
+            try:
+                parts = invoice_number.split('-')
+                if len(parts) >= 3:
+                    sequence = int(parts[2]) + 1
+            except:
+                pass
+        else:
+            sequence = 2
+            
+        counter = InvoiceCounter(
+            tenant_id=tenant_id,
+            pharmacy_id=pharmacy_id,
+            date=today,
+            current_number=sequence
+        )
+        db.add(counter)
         db.commit()
     
-    return {"success": True, "new_sequence": counter.current_number if counter else 1}
-
-
+    return {
+        "success": True,
+        "invoice_number": invoice_number,
+        "new_sequence": counter.current_number,
+        "pharmacy_id": str(pharmacy_id),
+        "date": today.isoformat()
+    }
 # =======================
 # Endpoint: Impact des ventes sur le stock
 # =======================
