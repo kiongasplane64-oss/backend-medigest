@@ -1,15 +1,17 @@
-# app/services/expense_service.py (version complète corrigée)
+# app/services/expense_service.py (version corrigée - champs valides uniquement)
+
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import date, datetime
 from decimal import Decimal
 from uuid import UUID
 from sqlalchemy import func, and_, or_
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session
 
 from app.models.finance import Expense
 from app.models.branch import Branch
 from app.models.user import User
 from app.schemas.expense import ExpenseCreate, ExpenseUpdate, ExpenseFilters
+
 
 class ExpenseService:
     """Service complet pour la gestion des dépenses"""
@@ -27,14 +29,22 @@ class ExpenseService:
             return default
     
     @staticmethod
+    def _safe_str(value, default='') -> str:
+        """Convertit une valeur en string de manière sécurisée"""
+        if value is None:
+            return default
+        return str(value)
+    
+    @staticmethod
     def create_expense(
         db: Session,
         tenant_id: UUID,
         user_id: UUID,
         expense_data: ExpenseCreate
     ) -> Expense:
-        """Crée une nouvelle dépense avec gestion des valeurs None"""
-        # ✅ Vérifier que la branche existe si fournie
+        """Crée une nouvelle dépense - utilise uniquement les champs du modèle Expense"""
+        
+        # Vérifier que la branche existe si fournie
         if expense_data.branch_id:
             branch = db.query(Branch).filter(
                 Branch.id == expense_data.branch_id,
@@ -44,42 +54,47 @@ class ExpenseService:
             if not branch:
                 raise ValueError("Branche non trouvée ou inactive")
         
-        # ✅ Convertir les données en dictionnaire
-        data_dict = expense_data.model_dump(exclude_unset=True)
-        
-        # ✅ S'assurer que amount et tax_amount sont des Decimal valides
-        amount = ExpenseService._safe_decimal(data_dict.get('amount'), Decimal('0'))
-        tax_amount = ExpenseService._safe_decimal(data_dict.get('tax_amount'), Decimal('0'))
-        
-        # ✅ Calculer total_amount
+        # ✅ Convertir les valeurs Decimal de manière sécurisée
+        amount = ExpenseService._safe_decimal(expense_data.amount, Decimal('0'))
+        tax_amount = ExpenseService._safe_decimal(expense_data.tax_amount, Decimal('0'))
         total_amount = amount + tax_amount
         
-        # ✅ Créer l'expense avec les valeurs sécurisées
+        # Si total_amount est fourni dans les données, l'utiliser sinon le calculer
+        if expense_data.total_amount is not None:
+            total_amount = ExpenseService._safe_decimal(expense_data.total_amount, total_amount)
+        
+        # ✅ Créer l'expense avec UNIQUEMENT les champs qui existent dans le modèle
+        # Modèle Expense attend: id, tenant_id, user_id, branch_id, expense_type, amount, 
+        # tax_amount, total_amount, description, expense_date, payment_method, supplier,
+        # payee, payment_reference, notes, invoice_number, invoice_date, is_recurring,
+        # recurrence_interval, next_due_date, approval_status, approved_by, rejection_reason,
+        # cost_center, project_code, created_at, updated_at
+        
         expense = Expense(
             tenant_id=tenant_id,
             user_id=user_id,
+            branch_id=expense_data.branch_id,
+            expense_type=expense_data.expense_type,
             amount=amount,
             tax_amount=tax_amount,
             total_amount=total_amount,
-            expense_type=data_dict.get('expense_type', 'other'),
-            description=data_dict.get('description', ''),
-            expense_date=data_dict.get('expense_date', datetime.now().date()),
-            branch_id=data_dict.get('branch_id'),
-            payment_method=data_dict.get('payment_method', 'cash'),
-            status=data_dict.get('status', 'pending'),
+            description=ExpenseService._safe_str(expense_data.description),
+            expense_date=expense_data.expense_date or datetime.now().date(),
+            payment_method=expense_data.payment_method or "cash",
+            supplier=expense_data.supplier,
+            payee=expense_data.payee,
+            payment_reference=expense_data.payment_reference,
+            notes=expense_data.notes,
+            invoice_number=expense_data.invoice_number,
+            invoice_date=expense_data.invoice_date,
+            is_recurring=expense_data.is_recurring or False,
+            recurrence_interval=expense_data.recurrence_interval,
+            next_due_date=expense_data.next_due_date,
+            # ✅ approval_status par défaut à 'pending' (pas 'status')
             approval_status='pending',
-            supplier=data_dict.get('supplier'),
-            notes=data_dict.get('notes'),
-            invoice_number=data_dict.get('invoice_number'),
-            reference=data_dict.get('reference'),
-            payee=data_dict.get('payee'),
-            payment_reference=data_dict.get('payment_reference'),
-            invoice_date=data_dict.get('invoice_date'),
-            is_recurring=data_dict.get('is_recurring', False),
-            recurrence_interval=data_dict.get('recurrence_interval'),
-            next_due_date=data_dict.get('next_due_date'),
-            cost_center=data_dict.get('cost_center'),
-            project_code=data_dict.get('project_code')
+            cost_center=expense_data.cost_center,
+            project_code=expense_data.project_code,
+            # Les champs created_at/updated_at sont auto-gérés par le modèle
         )
         
         db.add(expense)
@@ -181,16 +196,30 @@ class ExpenseService:
         if expense.approval_status == "approved":
             raise ValueError("Impossible de modifier une dépense déjà approuvée")
         
-        # Mettre à jour les champs
+        # Mettre à jour les champs (uniquement ceux qui existent dans le modèle)
         update_data = expense_data.model_dump(exclude_unset=True)
         
-        for field, value in update_data.items():
-            setattr(expense, field, value)
+        # ✅ Champs autorisés dans le modèle Expense
+        allowed_fields = {
+            'branch_id', 'expense_type', 'amount', 'tax_amount', 'total_amount',
+            'description', 'expense_date', 'payment_method', 'supplier', 'payee',
+            'payment_reference', 'notes', 'invoice_number', 'invoice_date',
+            'is_recurring', 'recurrence_interval', 'next_due_date',
+            'cost_center', 'project_code'
+        }
         
-        # ✅ Recalculer le total avec gestion des None
-        amount = ExpenseService._safe_decimal(getattr(expense, 'amount', Decimal('0')))
-        tax_amount = ExpenseService._safe_decimal(getattr(expense, 'tax_amount', Decimal('0')))
-        expense.total_amount = amount + tax_amount
+        for field, value in update_data.items():
+            if field in allowed_fields and value is not None:
+                # Conversion spéciale pour les Decimal
+                if field in ['amount', 'tax_amount', 'total_amount']:
+                    value = ExpenseService._safe_decimal(value)
+                setattr(expense, field, value)
+        
+        # Recalculer total_amount si amount ou tax_amount a changé
+        if 'amount' in update_data or 'tax_amount' in update_data:
+            amount = ExpenseService._safe_decimal(expense.amount, Decimal('0'))
+            tax_amount = ExpenseService._safe_decimal(expense.tax_amount, Decimal('0'))
+            expense.total_amount = amount + tax_amount
         
         db.commit()
         db.refresh(expense)
@@ -277,7 +306,6 @@ class ExpenseService:
             Branch.id, Branch.name
         ).all()
         
-        # ✅ Calculer le total général avec gestion des None
         total_all = sum(float(r.total_expenses or 0) for r in results)
         
         return [
@@ -320,7 +348,6 @@ class ExpenseService:
             User.id, User.nom_complet, User.email
         ).all()
         
-        # ✅ Calculer le total général
         total_all = sum(float(r.total_expenses or 0) for r in results)
         
         return [
@@ -344,7 +371,6 @@ class ExpenseService:
         end_date: date
     ) -> Dict[str, Any]:
         """Récupère un résumé des dépenses"""
-        # ✅ Statistiques générales avec coalesce pour éviter None
         stats = db.query(
             func.coalesce(func.sum(Expense.total_amount), 0).label('total'),
             func.coalesce(func.count(Expense.id), 0).label('count'),
@@ -354,7 +380,6 @@ class ExpenseService:
             Expense.expense_date.between(start_date, end_date)
         ).first()
         
-        # Par catégorie
         by_category = db.query(
             Expense.expense_type,
             func.coalesce(func.sum(Expense.total_amount), 0).label('total'),
@@ -364,7 +389,6 @@ class ExpenseService:
             Expense.expense_date.between(start_date, end_date)
         ).group_by(Expense.expense_type).all()
         
-        # Par statut d'approbation
         by_status = db.query(
             Expense.approval_status,
             func.coalesce(func.sum(Expense.total_amount), 0).label('total'),
