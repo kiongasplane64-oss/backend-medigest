@@ -673,9 +673,11 @@ async def get_next_invoice_number(
     current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
 ):
     """
-    Récupère le prochain numéro de facture disponible.
-    Les clients doivent appeler cet endpoint AVANT chaque vente en ligne.
+    Récupère le prochain numéro de facture disponible depuis le serveur.
+    Le client doit appeler cet endpoint avant de créer une vente en ligne.
     """
+    from app.models.invoice_counter import InvoiceCounter
+    
     tenant_id = current_tenant.id if current_tenant else None
     pharmacy_id = current_pharmacy.id if current_pharmacy else None
     
@@ -685,15 +687,41 @@ async def get_next_invoice_number(
             detail="Aucune pharmacie sélectionnée"
         )
     
-    next_number = await generate_unique_invoice_number(db, tenant_id, pharmacy_id)
+    # Récupérer ou créer le compteur pour cette pharmacie
+    counter = db.query(InvoiceCounter).filter(
+        InvoiceCounter.tenant_id == tenant_id,
+        InvoiceCounter.pharmacy_id == pharmacy_id
+    ).first()
+    
+    if not counter:
+        counter = InvoiceCounter(
+            tenant_id=tenant_id,
+            pharmacy_id=pharmacy_id,
+            current_number=1,
+            last_invoice_date=datetime.now().date()
+        )
+        db.add(counter)
+        db.commit()
+        db.refresh(counter)
+    
+    # Vérifier si on a changé de jour
+    today = datetime.now().date()
+    if counter.last_invoice_date != today:
+        counter.current_number = 1
+        counter.last_invoice_date = today
+        db.commit()
+    
+    next_number = counter.current_number
+    date_str = today.strftime("%Y%m%d")
+    invoice_number = f"INV-{date_str}-{next_number:04d}"
     
     return {
-        "invoice_number": next_number,
+        "invoice_number": invoice_number,
+        "sequence_number": next_number,
+        "date": date_str,
         "pharmacy_id": str(pharmacy_id),
-        "tenant_id": str(tenant_id) if tenant_id else None,
-        "generated_at": datetime.utcnow().isoformat()
+        "tenant_id": str(tenant_id) if tenant_id else None
     }
-
 
 @router.post("/sync-invoice-counter")
 async def sync_invoice_counter(
@@ -743,56 +771,6 @@ async def sync_invoice_counter(
         "next_invoice": f"INV-{today.strftime('%Y%m%d')}-{counter.current_number:04d}"
     }
 
-@router.get("/next-invoice-number")
-async def get_next_invoice_number(
-    db: Session = Depends(get_db),
-    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
-    current_user: User = Depends(get_current_active_user),
-    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
-):
-    """
-    Récupère le prochain numéro de facture disponible depuis le serveur.
-    Le client doit appeler cet endpoint avant de créer une vente en ligne.
-    """
-    from app.models.invoice_counter import InvoiceCounter
-    
-    tenant_id = current_tenant.id if current_tenant else None
-    pharmacy_id = current_pharmacy.id if current_pharmacy else None
-    
-    # Récupérer ou créer le compteur pour cette pharmacie
-    counter = db.query(InvoiceCounter).filter(
-        InvoiceCounter.tenant_id == tenant_id,
-        InvoiceCounter.pharmacy_id == pharmacy_id
-    ).first()
-    
-    if not counter:
-        counter = InvoiceCounter(
-            tenant_id=tenant_id,
-            pharmacy_id=pharmacy_id,
-            current_number=1,
-            last_invoice_date=datetime.now().date()
-        )
-        db.add(counter)
-        db.commit()
-        db.refresh(counter)
-    
-    # Vérifier si on a changé de jour
-    today = datetime.now().date()
-    if counter.last_invoice_date != today:
-        counter.current_number = 1
-        counter.last_invoice_date = today
-        db.commit()
-    
-    next_number = counter.current_number
-    date_str = today.strftime("%Y%m%d")
-    pharmacy_code = getattr(current_pharmacy, 'pharmacy_code', 'PHARM')
-    
-    return {
-        "invoice_number": f"INV-{date_str}-{next_number:04d}",
-        "sequence_number": next_number,
-        "date": date_str,
-        "pharmacy_code": pharmacy_code
-    }
 
 @router.post("/confirm-invoice-number", status_code=status.HTTP_200_OK)
 async def confirm_invoice_number(
