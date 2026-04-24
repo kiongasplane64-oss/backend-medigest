@@ -674,8 +674,8 @@ async def get_next_invoice_number(
 ):
     """
     Récupère le prochain numéro de facture disponible depuis le serveur.
-    Le client doit appeler cet endpoint avant de créer une vente en ligne.
     """
+    from sqlalchemy import text
     from app.models.invoice_counter import InvoiceCounter
     
     tenant_id = current_tenant.id if current_tenant else None
@@ -687,42 +687,82 @@ async def get_next_invoice_number(
             detail="Aucune pharmacie sélectionnée"
         )
     
-    # Récupérer ou créer le compteur pour cette pharmacie
-    counter = db.query(InvoiceCounter).filter(
-        InvoiceCounter.tenant_id == tenant_id,
-        InvoiceCounter.pharmacy_id == pharmacy_id
-    ).first()
-    
-    if not counter:
-        counter = InvoiceCounter(
-            tenant_id=tenant_id,
-            pharmacy_id=pharmacy_id,
-            current_number=1,
-            last_invoice_date=datetime.now().date()
-        )
-        db.add(counter)
-        db.commit()
-        db.refresh(counter)
-    
-    # Vérifier si on a changé de jour
     today = datetime.now().date()
-    if counter.last_invoice_date != today:
-        counter.current_number = 1
-        counter.last_invoice_date = today
-        db.commit()
-    
-    next_number = counter.current_number
     date_str = today.strftime("%Y%m%d")
-    invoice_number = f"INV-{date_str}-{next_number:04d}"
     
-    return {
-        "invoice_number": invoice_number,
-        "sequence_number": next_number,
-        "date": date_str,
-        "pharmacy_id": str(pharmacy_id),
-        "tenant_id": str(tenant_id) if tenant_id else None
-    }
-
+    try:
+        # Utiliser SQL raw pour éviter les problèmes de comparaison TEXT/UUID
+        check_query = text("""
+            SELECT current_number FROM invoice_counter 
+            WHERE tenant_id::text = :tenant_id 
+            AND pharmacy_id::text = :pharmacy_id 
+            AND date = :date
+        """)
+        
+        result = db.execute(check_query, {
+            "tenant_id": str(tenant_id) if tenant_id else None,
+            "pharmacy_id": str(pharmacy_id),
+            "date": today
+        }).first()
+        
+        if result:
+            current_number = result[0]
+            # Incrémenter pour la prochaine fois
+            update_query = text("""
+                UPDATE invoice_counter 
+                SET current_number = current_number + 1
+                WHERE tenant_id::text = :tenant_id 
+                AND pharmacy_id::text = :pharmacy_id 
+                AND date = :date
+            """)
+            db.execute(update_query, {
+                "tenant_id": str(tenant_id) if tenant_id else None,
+                "pharmacy_id": str(pharmacy_id),
+                "date": today
+            })
+            next_number = current_number
+        else:
+            # Premier compteur de la journée
+            next_number = 1
+            insert_query = text("""
+                INSERT INTO invoice_counter (tenant_id, pharmacy_id, date, current_number)
+                VALUES (:tenant_id, :pharmacy_id, :date, 2)
+            """)
+            db.execute(insert_query, {
+                "tenant_id": tenant_id,
+                "pharmacy_id": pharmacy_id,
+                "date": today
+            })
+        
+        db.commit()
+        
+        invoice_number = f"INV-{date_str}-{next_number:04d}"
+        
+        return {
+            "invoice_number": invoice_number,
+            "sequence_number": next_number,
+            "date": date_str,
+            "pharmacy_id": str(pharmacy_id),
+            "tenant_id": str(tenant_id) if tenant_id else None
+        }
+        
+    except Exception as e:
+        logger.error(f"Erreur génération numéro facture: {e}")
+        db.rollback()
+        
+        # Fallback: générer un numéro basé sur timestamp
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+        invoice_number = f"INV-{timestamp}"
+        
+        return {
+            "invoice_number": invoice_number,
+            "sequence_number": 1,
+            "date": date_str,
+            "pharmacy_id": str(pharmacy_id),
+            "tenant_id": str(tenant_id) if tenant_id else None,
+            "fallback": True
+        }
+    
 @router.post("/sync-invoice-counter")
 async def sync_invoice_counter(
     sync_data: dict,

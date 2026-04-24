@@ -1,18 +1,23 @@
-# app/models/invoice_counter.py
-
-from sqlalchemy import Column, Integer, Date, DateTime
+from sqlalchemy import Column, Integer, Date, String, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
-from app.db.base import Base
+from sqlalchemy.sql import func
 import uuid
-from datetime import date, datetime
+from app.db.base import Base
+from sqlalchemy.schema import UniqueConstraint
 
 class InvoiceCounter(Base):
-    __tablename__ = "invoice_counters"
+    __tablename__ = "invoice_counter"
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    tenant_id = Column(UUID(as_uuid=True), nullable=False)
-    pharmacy_id = Column(UUID(as_uuid=True), nullable=False)
-    date = Column(Date, nullable=False, default=date.today)
-    current_number = Column(Integer, default=1)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    pharmacy_id = Column(UUID(as_uuid=True), ForeignKey("pharmacies.id", ondelete="CASCADE"), nullable=False)
+    date = Column(Date, nullable=False)
+    current_number = Column(Integer, default=1, nullable=False)
+    last_invoice_date = Column(Date, nullable=True)
+    created_at = Column(Date, server_default=func.now())
+    updated_at = Column(Date, onupdate=func.now())
+    
+    # Pour la compatibilité avec les requêtes
+    __table_args__ = (
+        UniqueConstraint('tenant_id', 'pharmacy_id', 'date', name='unique_tenant_pharmacy_date'),
+    )
