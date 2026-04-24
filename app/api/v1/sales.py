@@ -673,12 +673,10 @@ async def get_next_invoice_number(
     current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
 ):
     """
-    Récupère le prochain numéro de facture disponible depuis le serveur.
-    ✓ Vérifie l'unicité réelle
-    ✓ Incrémente automatiquement jusqu'à trouver un numéro libre
+    Récupère le prochain numéro de facture disponible.
+    GARANTIT l'unicité en vérifiant l'existence réelle dans la base.
     """
     from sqlalchemy import text
-    from app.models.invoice_counter import InvoiceCounter
     
     tenant_id = current_tenant.id if current_tenant else None
     pharmacy_id = current_pharmacy.id if current_pharmacy else None
@@ -692,20 +690,24 @@ async def get_next_invoice_number(
     today = datetime.now().date()
     date_str = today.strftime("%Y%m%d")
     
-    # Nombre maximum de tentatives pour trouver un numéro unique
-    max_attempts = 10
+    max_attempts = 20
+    attempt = 0
     
-    for attempt in range(max_attempts):
+    while attempt < max_attempts:
+        attempt += 1
+        
+        # Utiliser une transaction pour éviter les conditions de course
         try:
-            # Utiliser SQL raw pour éviter les problèmes de comparaison TEXT/UUID
-            check_query = text("""
+            # Verrouiller la ligne du compteur (SELECT FOR UPDATE)
+            lock_query = text("""
                 SELECT current_number FROM invoice_counter 
                 WHERE tenant_id::text = :tenant_id 
                 AND pharmacy_id::text = :pharmacy_id 
                 AND date = :date
+                FOR UPDATE
             """)
             
-            result = db.execute(check_query, {
+            result = db.execute(lock_query, {
                 "tenant_id": str(tenant_id) if tenant_id else None,
                 "pharmacy_id": str(pharmacy_id),
                 "date": today
@@ -715,117 +717,93 @@ async def get_next_invoice_number(
                 current_number = result[0]
             else:
                 current_number = 1
+                
+                # Créer le compteur
+                insert_counter = text("""
+                    INSERT INTO invoice_counter (tenant_id, pharmacy_id, date, current_number)
+                    VALUES (:tenant_id, :pharmacy_id, :date, 1)
+                """)
+                db.execute(insert_counter, {
+                    "tenant_id": tenant_id,
+                    "pharmacy_id": pharmacy_id,
+                    "date": today
+                })
             
-            # Générer le numéro de facture
-            invoice_number = f"INV-{date_str}-{current_number:04d}"
+            # Générer le numéro potentiel
+            test_number = f"INV-{date_str}-{current_number:04d}"
             
-            # ✅ VÉRIFICATION CRITIQUE: S'assurer que le numéro n'existe pas déjà
-            existing_query = text("""
+            # Vérifier si ce numéro existe DÉJÀ
+            check_exists = text("""
                 SELECT id FROM sales 
                 WHERE invoice_number = :invoice_number
                 AND tenant_id::text = :tenant_id
                 LIMIT 1
             """)
             
-            existing = db.execute(existing_query, {
-                "invoice_number": invoice_number,
+            existing = db.execute(check_exists, {
+                "invoice_number": test_number,
                 "tenant_id": str(tenant_id) if tenant_id else None
             }).first()
             
             if not existing:
-                # Numéro libre trouvé !
+                # ✅ Numéro libre ! Le réserver immédiatement
                 # Incrémenter le compteur pour la prochaine fois
-                if result:
-                    update_query = text("""
-                        UPDATE invoice_counter 
-                        SET current_number = current_number + 1
-                        WHERE tenant_id::text = :tenant_id 
-                        AND pharmacy_id::text = :pharmacy_id 
-                        AND date = :date
-                    """)
-                    db.execute(update_query, {
-                        "tenant_id": str(tenant_id) if tenant_id else None,
-                        "pharmacy_id": str(pharmacy_id),
-                        "date": today
-                    })
-                else:
-                    # Premier compteur de la journée - insérer avec current_number=2
-                    insert_query = text("""
-                        INSERT INTO invoice_counter (tenant_id, pharmacy_id, date, current_number)
-                        VALUES (:tenant_id, :pharmacy_id, :date, 2)
-                    """)
-                    db.execute(insert_query, {
-                        "tenant_id": tenant_id,
-                        "pharmacy_id": pharmacy_id,
-                        "date": today
-                    })
+                update_counter = text("""
+                    UPDATE invoice_counter 
+                    SET current_number = current_number + 1
+                    WHERE tenant_id::text = :tenant_id 
+                    AND pharmacy_id::text = :pharmacy_id 
+                    AND date = :date
+                """)
+                db.execute(update_counter, {
+                    "tenant_id": str(tenant_id) if tenant_id else None,
+                    "pharmacy_id": str(pharmacy_id),
+                    "date": today
+                })
                 
                 db.commit()
                 
                 return {
-                    "invoice_number": invoice_number,
+                    "invoice_number": test_number,
                     "sequence_number": current_number,
                     "date": date_str,
                     "pharmacy_id": str(pharmacy_id),
                     "tenant_id": str(tenant_id) if tenant_id else None,
-                    "unique": True
+                    "unique": True,
+                    "attempt": attempt
                 }
             else:
-                # Le numéro existe déjà - incrémenter le compteur et réessayer
-                logger.warning(f"⚠️ Conflit: {invoice_number} existe déjà, tentative {attempt + 2}/{max_attempts}")
+                # Ce numéro existe déjà - mettre à jour le compteur et réessayer
+                logger.warning(f"⚠️ Conflit: {test_number} existe déjà (tentative {attempt}/{max_attempts})")
                 
                 # Mettre à jour le compteur pour passer au suivant
-                if result:
-                    update_query = text("""
-                        UPDATE invoice_counter 
-                        SET current_number = current_number + 1
-                        WHERE tenant_id::text = :tenant_id 
-                        AND pharmacy_id::text = :pharmacy_id 
-                        AND date = :date
-                    """)
-                    db.execute(update_query, {
-                        "tenant_id": str(tenant_id) if tenant_id else None,
-                        "pharmacy_id": str(pharmacy_id),
-                        "date": today
-                    })
-                else:
-                    insert_query = text("""
-                        INSERT INTO invoice_counter (tenant_id, pharmacy_id, date, current_number)
-                        VALUES (:tenant_id, :pharmacy_id, :date, 2)
-                        ON CONFLICT (tenant_id, pharmacy_id, date) 
-                        DO UPDATE SET current_number = invoice_counter.current_number + 1
-                    """)
-                    db.execute(insert_query, {
-                        "tenant_id": tenant_id,
-                        "pharmacy_id": pharmacy_id,
-                        "date": today
-                    })
+                update_counter = text("""
+                    UPDATE invoice_counter 
+                    SET current_number = current_number + 1
+                    WHERE tenant_id::text = :tenant_id 
+                    AND pharmacy_id::text = :pharmacy_id 
+                    AND date = :date
+                """)
+                db.execute(update_counter, {
+                    "tenant_id": str(tenant_id) if tenant_id else None,
+                    "pharmacy_id": str(pharmacy_id),
+                    "date": today
+                })
                 
                 db.commit()
                 continue  # Réessayer avec le nouveau numéro
                 
         except Exception as e:
-            logger.error(f"Erreur génération numéro facture (tentative {attempt + 1}): {e}")
+            logger.error(f"Erreur tentative {attempt}: {e}")
             db.rollback()
             
-            if attempt == max_attempts - 1:
-                # Fallback: générer un numéro basé sur timestamp + UUID
-                timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
-                fallback_number = f"INV-{timestamp}"
-                
-                return {
-                    "invoice_number": fallback_number,
-                    "sequence_number": 0,
-                    "date": date_str,
-                    "pharmacy_id": str(pharmacy_id),
-                    "tenant_id": str(tenant_id) if tenant_id else None,
-                    "fallback": True,
-                    "conflict_resolved": False
-                }
+            if attempt >= max_attempts:
+                break
+            continue
     
-    # Si on arrive ici, tous les essais ont échoué
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
-    fallback_number = f"INV-{timestamp}"
+    # Fallback ultime : timestamp + UUID
+    import uuid
+    fallback_number = f"INV-{datetime.now().strftime('%Y%m%d%H%M%S')}-{str(uuid.uuid4())[:8]}"
     
     return {
         "invoice_number": fallback_number,
@@ -834,8 +812,7 @@ async def get_next_invoice_number(
         "pharmacy_id": str(pharmacy_id),
         "tenant_id": str(tenant_id) if tenant_id else None,
         "fallback": True,
-        "conflict_resolved": False,
-        "max_attempts_reached": True
+        "warning": f"Génération fallback après {max_attempts} tentatives"
     }
     
 @router.post("/sync-invoice-counter")
