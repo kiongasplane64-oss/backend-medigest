@@ -25,7 +25,7 @@ router = APIRouter(prefix="/admin/sync", tags=["Admin Synchronization"])
 # ==================== SCHEMAS ====================
 
 class ExportRequest(BaseModel):
-    tenant_id: int
+    tenant_id: Any
     branch_ids: Optional[List[int]] = None
     entity_types: Optional[List[str]] = None
     since: Optional[datetime] = None

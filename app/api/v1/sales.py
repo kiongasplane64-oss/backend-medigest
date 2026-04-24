@@ -948,6 +948,55 @@ async def confirm_invoice_number(
         "pharmacy_id": str(pharmacy_id),
         "date": today.isoformat()
     }
+
+@router.get("/last-invoice-number")
+async def get_last_invoice_number(
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
+):
+    """
+    Récupère le dernier numéro de facture utilisé (séquence)
+    """
+    from sqlalchemy import text
+    
+    tenant_id = current_tenant.id if current_tenant else None
+    pharmacy_id = current_pharmacy.id if current_pharmacy else None
+    
+    if not pharmacy_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Aucune pharmacie sélectionnée"
+        )
+    
+    today = datetime.now().date()
+    date_str = today.strftime("%Y%m%d")
+    
+    # Récupérer la dernière séquence utilisée
+    query = text("""
+        SELECT MAX(CAST(SUBSTRING(invoice_number FROM 'INV-[0-9]+-([0-9]+)$') AS INTEGER)) as last_sequence
+        FROM sales 
+        WHERE invoice_number LIKE :pattern
+        AND tenant_id::text = :tenant_id
+        AND pharmacy_id::text = :pharmacy_id
+    """)
+    
+    result = db.execute(query, {
+        "pattern": f"INV-{date_str}-%",
+        "tenant_id": str(tenant_id) if tenant_id else None,
+        "pharmacy_id": str(pharmacy_id)
+    }).first()
+    
+    last_sequence = result[0] if result and result[0] else 0
+    
+    return {
+        "last_sequence": last_sequence,
+        "date": date_str,
+        "pharmacy_id": str(pharmacy_id),
+        "next_sequence": last_sequence + 1,
+        "next_invoice": f"INV-{date_str}-{last_sequence + 1:04d}"
+    }
 # =======================
 # Endpoint: Impact des ventes sur le stock
 # =======================
