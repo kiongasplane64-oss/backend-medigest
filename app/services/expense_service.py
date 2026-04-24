@@ -1,4 +1,4 @@
-# app/services/expense_service.py (version complète)
+# app/services/expense_service.py (version complète corrigée)
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import date, datetime
 from decimal import Decimal
@@ -15,14 +15,26 @@ class ExpenseService:
     """Service complet pour la gestion des dépenses"""
     
     @staticmethod
+    def _safe_decimal(value, default=Decimal('0')) -> Decimal:
+        """Convertit une valeur en Decimal de manière sécurisée"""
+        if value is None:
+            return default
+        try:
+            if isinstance(value, Decimal):
+                return value
+            return Decimal(str(value))
+        except (ValueError, TypeError):
+            return default
+    
+    @staticmethod
     def create_expense(
         db: Session,
         tenant_id: UUID,
         user_id: UUID,
         expense_data: ExpenseCreate
     ) -> Expense:
-        """Crée une nouvelle dépense"""
-        # Vérifier que la branche existe si fournie
+        """Crée une nouvelle dépense avec gestion des valeurs None"""
+        # ✅ Vérifier que la branche existe si fournie
         if expense_data.branch_id:
             branch = db.query(Branch).filter(
                 Branch.id == expense_data.branch_id,
@@ -32,16 +44,43 @@ class ExpenseService:
             if not branch:
                 raise ValueError("Branche non trouvée ou inactive")
         
-        # Créer la dépense
+        # ✅ Convertir les données en dictionnaire
+        data_dict = expense_data.model_dump(exclude_unset=True)
+        
+        # ✅ S'assurer que amount et tax_amount sont des Decimal valides
+        amount = ExpenseService._safe_decimal(data_dict.get('amount'), Decimal('0'))
+        tax_amount = ExpenseService._safe_decimal(data_dict.get('tax_amount'), Decimal('0'))
+        
+        # ✅ Calculer total_amount
+        total_amount = amount + tax_amount
+        
+        # ✅ Créer l'expense avec les valeurs sécurisées
         expense = Expense(
             tenant_id=tenant_id,
             user_id=user_id,
-            **expense_data.model_dump(exclude_unset=True)
+            amount=amount,
+            tax_amount=tax_amount,
+            total_amount=total_amount,
+            expense_type=data_dict.get('expense_type', 'other'),
+            description=data_dict.get('description', ''),
+            expense_date=data_dict.get('expense_date', datetime.now().date()),
+            branch_id=data_dict.get('branch_id'),
+            payment_method=data_dict.get('payment_method', 'cash'),
+            status=data_dict.get('status', 'pending'),
+            approval_status='pending',
+            supplier=data_dict.get('supplier'),
+            notes=data_dict.get('notes'),
+            invoice_number=data_dict.get('invoice_number'),
+            reference=data_dict.get('reference'),
+            payee=data_dict.get('payee'),
+            payment_reference=data_dict.get('payment_reference'),
+            invoice_date=data_dict.get('invoice_date'),
+            is_recurring=data_dict.get('is_recurring', False),
+            recurrence_interval=data_dict.get('recurrence_interval'),
+            next_due_date=data_dict.get('next_due_date'),
+            cost_center=data_dict.get('cost_center'),
+            project_code=data_dict.get('project_code')
         )
-        
-        # Calculer le total si nécessaire
-        if expense.total_amount is None:
-            expense.total_amount = expense.amount + expense.tax_amount
         
         db.add(expense)
         db.commit()
@@ -144,12 +183,14 @@ class ExpenseService:
         
         # Mettre à jour les champs
         update_data = expense_data.model_dump(exclude_unset=True)
+        
         for field, value in update_data.items():
             setattr(expense, field, value)
         
-        # Recalculer le total si nécessaire
-        if 'amount' in update_data or 'tax_amount' in update_data:
-            expense.total_amount = expense.amount + expense.tax_amount
+        # ✅ Recalculer le total avec gestion des None
+        amount = ExpenseService._safe_decimal(getattr(expense, 'amount', Decimal('0')))
+        tax_amount = ExpenseService._safe_decimal(getattr(expense, 'tax_amount', Decimal('0')))
+        expense.total_amount = amount + tax_amount
         
         db.commit()
         db.refresh(expense)
@@ -220,9 +261,9 @@ class ExpenseService:
         results = db.query(
             Branch.id.label('branch_id'),
             Branch.name.label('branch_name'),
-            func.sum(Expense.total_amount).label('total_expenses'),
-            func.count(Expense.id).label('expense_count'),
-            func.avg(Expense.amount).label('average_expense')
+            func.coalesce(func.sum(Expense.total_amount), 0).label('total_expenses'),
+            func.coalesce(func.count(Expense.id), 0).label('expense_count'),
+            func.coalesce(func.avg(Expense.amount), 0).label('average_expense')
         ).outerjoin(
             Expense, and_(
                 Expense.branch_id == Branch.id,
@@ -236,7 +277,7 @@ class ExpenseService:
             Branch.id, Branch.name
         ).all()
         
-        # Calculer le total général pour les pourcentages
+        # ✅ Calculer le total général avec gestion des None
         total_all = sum(float(r.total_expenses or 0) for r in results)
         
         return [
@@ -263,9 +304,9 @@ class ExpenseService:
             User.id.label('user_id'),
             User.nom_complet.label('username'),
             User.email,
-            func.sum(Expense.total_amount).label('total_expenses'),
-            func.count(Expense.id).label('expense_count'),
-            func.avg(Expense.amount).label('average_expense')
+            func.coalesce(func.sum(Expense.total_amount), 0).label('total_expenses'),
+            func.coalesce(func.count(Expense.id), 0).label('expense_count'),
+            func.coalesce(func.avg(Expense.amount), 0).label('average_expense')
         ).outerjoin(
             Expense, and_(
                 Expense.user_id == User.id,
@@ -279,7 +320,7 @@ class ExpenseService:
             User.id, User.nom_complet, User.email
         ).all()
         
-        # Calculer le total général
+        # ✅ Calculer le total général
         total_all = sum(float(r.total_expenses or 0) for r in results)
         
         return [
@@ -303,11 +344,11 @@ class ExpenseService:
         end_date: date
     ) -> Dict[str, Any]:
         """Récupère un résumé des dépenses"""
-        # Statistiques générales
+        # ✅ Statistiques générales avec coalesce pour éviter None
         stats = db.query(
-            func.sum(Expense.total_amount).label('total'),
-            func.count(Expense.id).label('count'),
-            func.avg(Expense.total_amount).label('avg')
+            func.coalesce(func.sum(Expense.total_amount), 0).label('total'),
+            func.coalesce(func.count(Expense.id), 0).label('count'),
+            func.coalesce(func.avg(Expense.total_amount), 0).label('avg')
         ).filter(
             Expense.tenant_id == tenant_id,
             Expense.expense_date.between(start_date, end_date)
@@ -316,8 +357,8 @@ class ExpenseService:
         # Par catégorie
         by_category = db.query(
             Expense.expense_type,
-            func.sum(Expense.total_amount).label('total'),
-            func.count(Expense.id).label('count')
+            func.coalesce(func.sum(Expense.total_amount), 0).label('total'),
+            func.coalesce(func.count(Expense.id), 0).label('count')
         ).filter(
             Expense.tenant_id == tenant_id,
             Expense.expense_date.between(start_date, end_date)
@@ -326,8 +367,8 @@ class ExpenseService:
         # Par statut d'approbation
         by_status = db.query(
             Expense.approval_status,
-            func.sum(Expense.total_amount).label('total'),
-            func.count(Expense.id).label('count')
+            func.coalesce(func.sum(Expense.total_amount), 0).label('total'),
+            func.coalesce(func.count(Expense.id), 0).label('count')
         ).filter(
             Expense.tenant_id == tenant_id,
             Expense.expense_date.between(start_date, end_date)
@@ -349,8 +390,8 @@ class ExpenseService:
                     "count": row.count
                 } for row in by_status
             },
-            "period_start": start_date,
-            "period_end": end_date
+            "period_start": start_date.isoformat(),
+            "period_end": end_date.isoformat()
         }
     
     @staticmethod
