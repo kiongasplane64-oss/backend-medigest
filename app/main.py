@@ -35,6 +35,8 @@ from app.api.v1.capital import router as capital_router
 from app.api.v1.endpoints.expenses import router as expenses_router
 from app.api.v1.endpoints.branches import router as branches_router
 from app.api.v1.endpoints.profit import router as profit_router
+from app.api.v1.endpoints.returns import router as returns_router
+from app.api.v1.endpoints import invoices
 
 from app.core.startup import init_storage
 
@@ -228,6 +230,9 @@ include_router_auto(app, capital_router)
 app.add_middleware(SubscriptionCheckMiddleware)
 app.add_middleware(SubscriptionMiddleware)
 include_router_auto(app, admin_sync_router)
+include_router_auto(app, returns_router)
+include_router_auto(app, invoices.router, tags=["Factures"])
+
 
 
 # ============================================================================
