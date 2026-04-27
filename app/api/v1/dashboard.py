@@ -432,7 +432,6 @@ async def get_dashboard_stats(
             detail=f"Erreur récupération statistiques: {str(e)}"
         )
 
-
 @router.get("/alerts", response_model=DashboardAlertListResponse)
 async def get_dashboard_alerts(
     db: Session = Depends(get_db),

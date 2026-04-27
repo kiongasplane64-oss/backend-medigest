@@ -29,6 +29,7 @@ from app.models.purchase import Purchase, PurchaseItem
 from app.models.debt import Debt
 from app.models.return_product import Return, ReturnItem, ReturnStatus, ReturnType
 from app.models.transfert import ProductTransfer, TransferStatus
+from app.models.branch import Branch
 from app.api.deps import (
     get_current_tenant,
     get_current_user,
@@ -430,7 +431,6 @@ async def get_dashboard_stats(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur récupération statistiques: {str(e)}"
         )
-
 
 @router.get("/alerts", response_model=DashboardAlertListResponse)
 async def get_dashboard_alerts(
@@ -1016,15 +1016,30 @@ def _get_expense_stats(
 ) -> Dict[str, Any]:
     """Récupère les statistiques des dépenses"""
     
+    # Récupérer les IDs des branches qui appartiennent aux pharmacies sélectionnées
+    valid_branch_ids_query = db.query(Branch.id).filter(
+        Branch.tenant_id == tenant_id,
+        Branch.pharmacy_id.in_(pharmacy_ids),
+        Branch.is_active == True
+    )
+    if branch_id:
+        valid_branch_ids_query = valid_branch_ids_query.filter(Branch.id == branch_id)
+    
+    valid_branch_ids = [b.id for b in valid_branch_ids_query.all()]
+    
+    if not valid_branch_ids:
+        return {
+            "monthly_expenses": 0,
+            "daily_expenses": 0
+        }
+    
     query = db.query(Expense).filter(
         Expense.tenant_id == tenant_id,
-        Expense.pharmacy_id.in_(pharmacy_ids),
+        Expense.branch_id.in_(valid_branch_ids),
         Expense.approval_status == "approved",
         Expense.expense_date >= start_dt.date(),
         Expense.expense_date <= end_dt.date()
     )
-    if branch_id:
-        query = query.filter(Expense.branch_id == branch_id)
     
     expenses = query.all()
     
@@ -1036,13 +1051,11 @@ def _get_expense_stats(
     
     daily_query = db.query(Expense).filter(
         Expense.tenant_id == tenant_id,
-        Expense.pharmacy_id.in_(pharmacy_ids),
+        Expense.branch_id.in_(valid_branch_ids),
         Expense.approval_status == "approved",
         Expense.created_at >= today_start,
         Expense.created_at <= today_end
     )
-    if branch_id:
-        daily_query = daily_query.filter(Expense.branch_id == branch_id)
     
     daily_expenses = sum(safe_decimal_to_float(e.amount) for e in daily_query.all())
     
@@ -1050,7 +1063,6 @@ def _get_expense_stats(
         "monthly_expenses": round(monthly_expenses, 2),
         "daily_expenses": round(daily_expenses, 2)
     }
-
 
 def _get_debt_stats(
     db: Session,
@@ -1060,13 +1072,30 @@ def _get_debt_stats(
 ) -> Dict[str, Any]:
     """Récupère les statistiques des dettes"""
     
-    query = db.query(Debt).filter(
-        Debt.tenant_id == tenant_id,
-        Debt.pharmacy_id.in_(pharmacy_ids),
-        Debt.is_active == True
+    # Récupérer les IDs des branches
+    valid_branch_ids_query = db.query(Branch.id).filter(
+        Branch.tenant_id == tenant_id,
+        Branch.pharmacy_id.in_(pharmacy_ids),
+        Branch.is_active == True
     )
     if branch_id:
-        query = query.filter(Debt.branch_id == branch_id)
+        valid_branch_ids_query = valid_branch_ids_query.filter(Branch.id == branch_id)
+    
+    valid_branch_ids = [b.id for b in valid_branch_ids_query.all()]
+    
+    if not valid_branch_ids:
+        return {
+            "total_debts": 0,
+            "unpaid_debts": 0,
+            "recovery_rate": 0,
+            "monthly_debts": 0
+        }
+    
+    query = db.query(Debt).filter(
+        Debt.tenant_id == tenant_id,
+        Debt.branch_id.in_(valid_branch_ids),
+        Debt.is_active == True
+    )
     
     debts = query.all()
     
@@ -1092,7 +1121,6 @@ def _get_debt_stats(
         "recovery_rate": recovery_rate,
         "monthly_debts": round(monthly_debts, 2)
     }
-
 
 def _get_purchase_stats(
     db: Session,
@@ -1347,13 +1375,25 @@ def _get_recent_debts(
 ) -> List[Dict[str, Any]]:
     """Récupère les dettes récentes"""
     
-    query = db.query(Debt).filter(
-        Debt.tenant_id == tenant_id,
-        Debt.pharmacy_id.in_(pharmacy_ids),
-        Debt.is_active == True
+    # Récupérer les IDs des branches
+    valid_branch_ids_query = db.query(Branch.id).filter(
+        Branch.tenant_id == tenant_id,
+        Branch.pharmacy_id.in_(pharmacy_ids),
+        Branch.is_active == True
     )
     if branch_id:
-        query = query.filter(Debt.branch_id == branch_id)
+        valid_branch_ids_query = valid_branch_ids_query.filter(Branch.id == branch_id)
+    
+    valid_branch_ids = [b.id for b in valid_branch_ids_query.all()]
+    
+    if not valid_branch_ids:
+        return []
+    
+    query = db.query(Debt).filter(
+        Debt.tenant_id == tenant_id,
+        Debt.branch_id.in_(valid_branch_ids),
+        Debt.is_active == True
+    )
     
     debts = query.order_by(desc(Debt.created_at)).limit(limit).all()
     
@@ -1365,7 +1405,6 @@ def _get_recent_debts(
         }
         for d in debts
     ]
-
 
 def _get_recent_purchases(
     db: Session,
@@ -1407,18 +1446,30 @@ def _get_expense_categories(
 ) -> List[Dict[str, Any]]:
     """Récupère les dépenses par catégorie"""
     
+    # Récupérer les IDs des branches qui appartiennent aux pharmacies sélectionnées
+    valid_branch_ids_query = db.query(Branch.id).filter(
+        Branch.tenant_id == tenant_id,
+        Branch.pharmacy_id.in_(pharmacy_ids),
+        Branch.is_active == True
+    )
+    if branch_id:
+        valid_branch_ids_query = valid_branch_ids_query.filter(Branch.id == branch_id)
+    
+    valid_branch_ids = [b.id for b in valid_branch_ids_query.all()]
+    
+    if not valid_branch_ids:
+        return []
+    
     query = db.query(
         Expense.expense_type,
         func.coalesce(func.sum(Expense.amount), 0).label("total")
     ).filter(
         Expense.tenant_id == tenant_id,
-        Expense.pharmacy_id.in_(pharmacy_ids),
+        Expense.branch_id.in_(valid_branch_ids),
         Expense.approval_status == "approved",
         Expense.expense_date >= start_dt.date(),
         Expense.expense_date <= end_dt.date()
     )
-    if branch_id:
-        query = query.filter(Expense.branch_id == branch_id)
     
     results = query.group_by(Expense.expense_type).order_by(desc("total")).limit(limit).all()
     
@@ -1429,7 +1480,6 @@ def _get_expense_categories(
         }
         for r in results
     ]
-
 
 def _get_active_users_count(
     db: Session,

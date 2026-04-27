@@ -230,7 +230,6 @@ include_router_auto(app, capital_router)
 app.add_middleware(SubscriptionCheckMiddleware)
 app.add_middleware(SubscriptionMiddleware)
 include_router_auto(app, admin_sync_router)
-include_router_auto(app, returns_router)
 include_router_auto(app, invoices.router, tags=["Factures"])
 
 
