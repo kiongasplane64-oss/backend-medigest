@@ -1071,21 +1071,19 @@ async def get_return_stats(
     current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_user: User = Depends(get_current_active_user),
     current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
-    period: Optional[str] = Query("this_month", description="Période: today, this_week, this_month, this_year")
+    period: Optional[str] = Query("this_month", description="Period: today, this_week, this_month, this_year")
 ):
-    """
-    Statistiques globales des retours.
-    """
+    """Statistiques globales des retours - Version robuste"""
     try:
         tenant_id = current_tenant.id if current_tenant else None
         
         if not current_pharmacy:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Aucune pharmacie active sélectionnée"
+                detail="Aucune pharmacie active selectionnee"
             )
         
-        # Déterminer la période
+        # Determiner la periode
         today = date.today()
         if period == "today":
             start_date = today
@@ -1103,52 +1101,65 @@ async def get_return_stats(
             start_date = today.replace(day=1)
             end_date = today
         
-        # Requête de base
+        # Requete de base
         base_query = db.query(Return).filter(
             Return.tenant_id == tenant_id,
             Return.pharmacy_id == current_pharmacy.id,
             Return.is_active == True,
-            func.date(Return.created_at).between(start_date, end_date)
+            Return.created_at >= start_date,
+            Return.created_at <= end_date + timedelta(days=1)
         )
         
-        # Statistiques par statut
-        total_returns = base_query.count()
-        pending_count = base_query.filter(Return.status == ReturnStatus.PENDING).count()
-        approved_count = base_query.filter(Return.status == ReturnStatus.APPROVED).count()
-        rejected_count = base_query.filter(Return.status == ReturnStatus.REJECTED).count()
-        processed_count = base_query.filter(Return.status == ReturnStatus.PROCESSED).count()
+        # Compter par statut (en utilisant des strings pour eviter les erreurs d'enum)
+        all_returns = base_query.all()
         
-        # Statistiques financières
-        total_refund_amount = base_query.filter(
-            Return.status == ReturnStatus.PROCESSED
-        ).with_entities(func.coalesce(func.sum(Return.refund_amount), 0)).scalar() or 0
+        total_returns = len(all_returns)
+        pending_count = sum(1 for r in all_returns if getattr(r, 'status', None) == 'pending')
+        approved_count = sum(1 for r in all_returns if getattr(r, 'status', None) == 'approved')
+        rejected_count = sum(1 for r in all_returns if getattr(r, 'status', None) == 'rejected')
+        processed_count = sum(1 for r in all_returns if getattr(r, 'status', None) == 'processed')
         
-        total_restocking_fees = base_query.with_entities(
-            func.coalesce(func.sum(Return.restocking_fee), 0)
-        ).scalar() or 0
+        # Compter par type
+        customer_returns = sum(1 for r in all_returns if getattr(r, 'return_type', None) == 'customer')
+        supplier_returns = sum(1 for r in all_returns if getattr(r, 'return_type', None) == 'supplier')
+        internal_returns = sum(1 for r in all_returns if getattr(r, 'return_type', None) == 'internal')
         
-        # Statistiques par type
-        customer_returns = base_query.filter(Return.return_type == ReturnType.CUSTOMER).count()
-        supplier_returns = base_query.filter(Return.return_type == ReturnType.SUPPLIER).count()
-        internal_returns = base_query.filter(Return.return_type == ReturnType.INTERNAL).count()
+        # Calculer les montants
+        total_refund_amount = sum(float(getattr(r, 'refund_amount', 0) or 0) for r in all_returns if getattr(r, 'status', None) == 'processed')
+        total_restocking_fees = sum(float(getattr(r, 'restocking_fee', 0) or 0) for r in all_returns)
         
-        # Top produits retournés
-        top_products = db.query(
-            ReturnItem.product_name,
-            func.sum(ReturnItem.quantity).label("total_quantity"),
-            func.sum(ReturnItem.total).label("total_value")
-        ).join(
-            Return, Return.id == ReturnItem.return_id
-        ).filter(
-            Return.tenant_id == tenant_id,
-            Return.pharmacy_id == current_pharmacy.id,
-            func.date(Return.created_at).between(start_date, end_date),
-            Return.is_active == True
-        ).group_by(
-            ReturnItem.product_name
-        ).order_by(
-            desc("total_quantity")
-        ).limit(5).all()
+        # Top produits retournes
+        try:
+            top_products_query = db.query(
+                ReturnItem.product_name,
+                func.sum(ReturnItem.quantity).label("total_quantity"),
+                func.sum(ReturnItem.total).label("total_value")
+            ).join(
+                Return, Return.id == ReturnItem.return_id
+            ).filter(
+                Return.tenant_id == tenant_id,
+                Return.pharmacy_id == current_pharmacy.id,
+                Return.created_at >= start_date,
+                Return.created_at <= end_date + timedelta(days=1),
+                Return.is_active == True,
+                ReturnItem.product_name.isnot(None)
+            ).group_by(
+                ReturnItem.product_name
+            ).order_by(
+                desc("total_quantity")
+            ).limit(5).all()
+            
+            top_products = [
+                {
+                    "product_name": p.product_name,
+                    "quantity": int(p.total_quantity),
+                    "value": float(p.total_value) if p.total_value else 0.0
+                }
+                for p in top_products_query
+            ]
+        except Exception as e:
+            logger.warning(f"Erreur top produits: {str(e)}")
+            top_products = []
         
         return ReturnStatsResponse(
             period=period,
@@ -1159,19 +1170,12 @@ async def get_return_stats(
             approved_count=approved_count,
             rejected_count=rejected_count,
             processed_count=processed_count,
-            total_refund_amount=float(total_refund_amount),
-            total_restocking_fees=float(total_restocking_fees),
+            total_refund_amount=total_refund_amount,
+            total_restocking_fees=total_restocking_fees,
             customer_returns=customer_returns,
             supplier_returns=supplier_returns,
             internal_returns=internal_returns,
-            top_returned_products=[
-                {
-                    "product_name": p.product_name,
-                    "quantity": int(p.total_quantity),
-                    "value": float(p.total_value)
-                }
-                for p in top_products
-            ]
+            top_returned_products=top_products
         )
         
     except Exception as e:
@@ -1180,7 +1184,6 @@ async def get_return_stats(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur statistiques: {str(e)}"
         )
-
 
 @router.delete("/{return_id}", status_code=status.HTTP_200_OK)
 async def cancel_return(
