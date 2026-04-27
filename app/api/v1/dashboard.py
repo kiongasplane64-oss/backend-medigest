@@ -1,7 +1,8 @@
-# app/api/v1/endpoints/dashboard_stats.py
+# app/api/v1/dashboard.py
 """
 API de statistiques pour le tableau de bord principal (Dashboard.tsx)
 Fournit toutes les données nécessaires à l'affichage des KPI, graphiques et alertes
+Basé sur la BRANCHE de l'utilisateur connecté
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
@@ -20,7 +21,7 @@ from app.models.user import User
 from app.models.pharmacy import Pharmacy
 from app.models.branch import Branch
 from app.models.tenant import Tenant
-from app.models.user_pharmacy import UserPharmacy
+from app.models.user_branch import UserBranch
 from app.models.stock_movement import StockMovement
 from app.models.finance import Expense
 from app.models.customer import Customer
@@ -29,7 +30,6 @@ from app.models.purchase import Purchase, PurchaseItem
 from app.models.debt import Debt
 from app.models.return_product import Return, ReturnItem, ReturnStatus, ReturnType
 from app.models.transfert import ProductTransfer, TransferStatus
-from app.models.branch import Branch
 from app.api.deps import (
     get_current_tenant,
     get_current_user,
@@ -52,15 +52,30 @@ from typing import Optional
 
 
 class DashboardFilters(BaseModel):
-    """Filtres pour le dashboard"""
-    pharmacy_id: Optional[str] = None
+    """Filtres pour le dashboard (uniquement branch_id)"""
     branch_id: Optional[str] = None
     start_date: Optional[date] = None
     end_date: Optional[date] = None
 
 
+class DashboardBranchInfo(BaseModel):
+    """Informations sur la branche active"""
+    id: str
+    name: str
+    address: str
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    city: str
+    parent_pharmacy_id: str
+    parent_pharmacy_name: str
+    manager_name: Optional[str] = None
+
+
 class DashboardStatsResponse(BaseModel):
     """Structure complète des statistiques du dashboard"""
+    # Informations branche
+    branch_info: Optional[DashboardBranchInfo] = None
+    
     # Ventes
     daily_sales: float
     monthly_sales: float
@@ -158,37 +173,74 @@ class DashboardAlertListResponse(BaseModel):
 # HELPERS
 # =======================
 
-def get_user_accessible_pharmacies(
+def get_user_current_branch(
     db: Session, 
     user_id: UUID, 
     tenant_id: Optional[UUID] = None,
-    pharmacy_id: Optional[UUID] = None
-) -> List[UUID]:
-    """Récupère la liste des pharmacies accessibles par l'utilisateur"""
-    if not user_id:
-        return []
-    
-    # Super admin ou admin voit tout
+    branch_id: Optional[UUID] = None
+) -> Optional[Branch]:
+    """
+    Récupère la branche actuelle de l'utilisateur connecté.
+    Priorité:
+    1. Si branch_id est fourni et que l'utilisateur y a accès
+    2. La branche active stockée dans user.active_branch_id
+    3. La branche principale de l'utilisateur
+    """
     user = db.query(User).filter(User.id == user_id).first()
-    if user and user.role in ["super_admin", "superadmin", "admin"]:
-        query = db.query(Pharmacy.id).filter(Pharmacy.is_active == True)
-        if tenant_id:
-            query = query.filter(Pharmacy.tenant_id == tenant_id)
-        if pharmacy_id:
-            query = query.filter(Pharmacy.id == pharmacy_id)
-        return [p.id for p in query.all()]
+    if not user:
+        return None
     
-    # Autres utilisateurs voient seulement leurs pharmacies
-    query = db.query(UserPharmacy.pharmacy_id).filter(UserPharmacy.user_id == user_id)
-    if tenant_id:
-        query = query.join(Pharmacy).filter(Pharmacy.tenant_id == tenant_id)
+    # Super admin ou admin peut accéder à n'importe quelle branche
+    is_admin = user.role in ["super_admin", "superadmin", "admin"]
     
-    pharmacy_ids = [p.pharmacy_id for p in query.all()]
+    # Si un branch_id est fourni, vérifier l'accès
+    if branch_id:
+        if is_admin:
+            branch = db.query(Branch).filter(
+                Branch.id == branch_id,
+                Branch.tenant_id == tenant_id,
+                Branch.is_active == True
+            ).first()
+            if branch:
+                return branch
+        else:
+            # Vérifier que l'utilisateur est assigné à cette branche
+            user_branch = db.query(UserBranch).filter(
+                UserBranch.user_id == user_id,
+                UserBranch.branch_id == branch_id,
+                UserBranch.is_active == True
+            ).first()
+            if user_branch:
+                return user_branch.branch
     
-    if pharmacy_id and pharmacy_id in pharmacy_ids:
-        return [pharmacy_id]
+    # Sinon, utiliser la branche active stockée
+    if user.active_branch_id:
+        branch = db.query(Branch).filter(
+            Branch.id == user.active_branch_id,
+            Branch.is_active == True
+        ).first()
+        if branch and (is_admin or _user_has_branch_access(db, user_id, branch.id)):
+            return branch
     
-    return pharmacy_ids
+    # Sinon, récupérer la première branche assignée
+    user_branch = db.query(UserBranch).filter(
+        UserBranch.user_id == user_id,
+        UserBranch.is_active == True
+    ).first()
+    
+    if user_branch:
+        return user_branch.branch
+    
+    return None
+
+
+def _user_has_branch_access(db: Session, user_id: UUID, branch_id: UUID) -> bool:
+    """Vérifie si l'utilisateur a accès à la branche"""
+    return db.query(UserBranch).filter(
+        UserBranch.user_id == user_id,
+        UserBranch.branch_id == branch_id,
+        UserBranch.is_active == True
+    ).first() is not None
 
 
 def safe_decimal_to_float(value: Any, default: float = 0.0) -> float:
@@ -250,7 +302,6 @@ async def get_dashboard_stats(
     db: Session = Depends(get_db),
     current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_user: User = Depends(get_current_active_user),
-    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
     branch_id: Optional[UUID] = Query(None, description="Filtrer par succursale"),
     period: str = Query("month", description="Période: day, week, month"),
     start_date: Optional[date] = Query(None, description="Date de début personnalisée"),
@@ -258,16 +309,32 @@ async def get_dashboard_stats(
 ):
     """
     Récupère toutes les statistiques pour le tableau de bord principal.
-    Inclut: ventes, stock, bénéfices, dépenses, dettes, achats, retours, transferts.
+    Les données sont filtrées UNIQUEMENT par la branche de l'utilisateur connecté.
     """
     try:
         tenant_id = current_tenant.id if current_tenant else None
         
-        # Déterminer les pharmacies accessibles
-        pharmacy_ids = get_user_accessible_pharmacies(db, current_user.id, tenant_id, pharmacy_id)
+        # Déterminer la branche de l'utilisateur
+        branch = get_user_current_branch(db, current_user.id, tenant_id, branch_id)
         
-        if not pharmacy_ids:
+        if not branch:
             return _get_empty_stats_response()
+        
+        # Récupérer la pharmacie parente pour les informations
+        parent_pharmacy = branch.parent_pharmacy
+        
+        # Construire les informations de la branche
+        branch_info = DashboardBranchInfo(
+            id=str(branch.id),
+            name=branch.name,
+            address=branch.address,
+            phone=branch.phone,
+            email=branch.email,
+            city=branch.city,
+            parent_pharmacy_id=str(parent_pharmacy.id) if parent_pharmacy else "",
+            parent_pharmacy_name=parent_pharmacy.name if parent_pharmacy else "",
+            manager_name=branch.manager_name
+        )
         
         # Déterminer les plages de dates
         if start_date and end_date:
@@ -276,22 +343,23 @@ async def get_dashboard_stats(
         else:
             current_start, current_end = get_date_range(period)
         
-        # Date d'hier pour la comparaison
-        yesterday_start = current_start - timedelta(days=(current_end - current_start).days + 1)
-        yesterday_end = current_start - timedelta(days=1)
+        # Date précédente pour la comparaison
+        days_diff = (current_end - current_start).days + 1
+        previous_start = current_start - timedelta(days=days_diff)
+        previous_end = current_start - timedelta(days=1)
         
         # Convertir en datetime
         current_start_dt = datetime.combine(current_start, datetime.min.time())
         current_end_dt = datetime.combine(current_end, datetime.max.time())
-        yesterday_start_dt = datetime.combine(yesterday_start, datetime.min.time())
-        yesterday_end_dt = datetime.combine(yesterday_end, datetime.max.time())
+        previous_start_dt = datetime.combine(previous_start, datetime.min.time())
+        previous_end_dt = datetime.combine(previous_end, datetime.max.time())
         
         # 1. STATISTIQUES DES VENTES
-        sales_stats_current = _get_sales_stats(
-            db, tenant_id, pharmacy_ids, branch_id, current_start_dt, current_end_dt
+        sales_stats_current = _get_sales_stats_by_branch(
+            db, tenant_id, branch.id, current_start_dt, current_end_dt
         )
-        sales_stats_previous = _get_sales_stats(
-            db, tenant_id, pharmacy_ids, branch_id, yesterday_start_dt, yesterday_end_dt
+        sales_stats_previous = _get_sales_stats_by_branch(
+            db, tenant_id, branch.id, previous_start_dt, previous_end_dt
         )
         
         daily_sales = sales_stats_current["daily_sales"]
@@ -303,58 +371,72 @@ async def get_dashboard_stats(
         net_profit = sales_stats_current["net_profit"]
         
         # 2. STATISTIQUES DU STOCK
-        stock_stats = _get_stock_stats(db, tenant_id, pharmacy_ids, branch_id)
+        stock_stats = _get_stock_stats_by_branch(db, tenant_id, branch.id)
         
         # 3. STATISTIQUES DES DÉPENSES
-        expense_stats = _get_expense_stats(
-            db, tenant_id, pharmacy_ids, branch_id, current_start_dt, current_end_dt
+        expense_stats = _get_expense_stats_by_branch(
+            db, tenant_id, branch.id, current_start_dt, current_end_dt
         )
         
         # 4. STATISTIQUES DES DETTES
-        debt_stats = _get_debt_stats(db, tenant_id, pharmacy_ids, branch_id)
+        debt_stats = _get_debt_stats_by_branch(db, tenant_id, branch.id)
         
         # 5. STATISTIQUES DES ACHATS
-        purchase_stats = _get_purchase_stats(
-            db, tenant_id, pharmacy_ids, branch_id, current_start_dt, current_end_dt
+        purchase_stats = _get_purchase_stats_by_branch(
+            db, tenant_id, branch.id, current_start_dt, current_end_dt
         )
         
         # 6. STATISTIQUES DES RETOURS
-        return_stats = _get_return_stats(
-            db, tenant_id, pharmacy_ids, branch_id, current_start_dt, current_end_dt
+        return_stats = _get_return_stats_by_branch(
+            db, tenant_id, branch.id, current_start_dt, current_end_dt
         )
         
         # 7. STATISTIQUES DES TRANSFERTS
-        transfer_stats = _get_transfer_stats(db, tenant_id, pharmacy_ids, branch_id)
+        transfer_stats = _get_transfer_stats_by_branch(db, tenant_id, branch.id)
         
         # 8. TRANSACTIONS RÉCENTES
-        recent_transactions = _get_recent_transactions(
-            db, tenant_id, pharmacy_ids, branch_id, limit=10
+        recent_transactions = _get_recent_transactions_by_branch(
+            db, tenant_id, branch.id, limit=10
         )
         
         # 9. PRODUITS EN STOCK BAS
-        low_stock_products = _get_low_stock_products(db, tenant_id, pharmacy_ids, branch_id, limit=10)
+        low_stock_products = _get_low_stock_products_by_branch(
+            db, tenant_id, branch.id, limit=10
+        )
         
         # 10. PRODUITS EXPIRANT BIENTÔT
-        expiring_products = _get_expiring_products(db, tenant_id, pharmacy_ids, branch_id, limit=10)
+        expiring_products = _get_expiring_products_by_branch(
+            db, tenant_id, branch.id, limit=10
+        )
         
         # 11. DETTES RÉCENTES
-        debt_list = _get_recent_debts(db, tenant_id, pharmacy_ids, branch_id, limit=10)
+        debt_list = _get_recent_debts_by_branch(
+            db, tenant_id, branch.id, limit=10
+        )
         
         # 12. ACHATS RÉCENTS
-        recent_purchases = _get_recent_purchases(db, tenant_id, pharmacy_ids, branch_id, limit=10)
+        recent_purchases = _get_recent_purchases_by_branch(
+            db, tenant_id, branch.id, limit=10
+        )
         
         # 13. CATÉGORIES DE DÉPENSES
-        expense_categories = _get_expense_categories(
-            db, tenant_id, pharmacy_ids, branch_id, current_start_dt, current_end_dt, limit=5
+        expense_categories = _get_expense_categories_by_branch(
+            db, tenant_id, branch.id, current_start_dt, current_end_dt, limit=5
         )
         
         # 14. UTILISATEURS ACTIFS
-        active_users = _get_active_users_count(db, tenant_id, pharmacy_ids, branch_id)
+        active_users = _get_active_users_count_by_branch(
+            db, tenant_id, branch.id
+        )
         
         # 15. CLIENTS TOTAUX
-        total_customers = _get_customers_count(db, tenant_id, pharmacy_ids, branch_id)
+        total_customers = _get_customers_count_by_branch(
+            db, tenant_id, branch.id
+        )
         
         return DashboardStatsResponse(
+            branch_info=branch_info,
+            
             # Ventes
             daily_sales=daily_sales,
             monthly_sales=monthly_sales,
@@ -432,12 +514,12 @@ async def get_dashboard_stats(
             detail=f"Erreur récupération statistiques: {str(e)}"
         )
 
+
 @router.get("/alerts", response_model=DashboardAlertListResponse)
 async def get_dashboard_alerts(
     db: Session = Depends(get_db),
     current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_user: User = Depends(get_current_active_user),
-    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
     branch_id: Optional[UUID] = Query(None, description="Filtrer par succursale"),
     severity: Optional[str] = Query(None, description="high, medium, low"),
     include_resolved: bool = Query(False, description="Inclure les alertes résolues"),
@@ -447,12 +529,15 @@ async def get_dashboard_alerts(
     Récupère toutes les alertes pour le tableau de bord:
     - Stock critique (rupture, stock bas)
     - Péremption (expiré, expirant bientôt)
+    (Basé sur la branche de l'utilisateur)
     """
     try:
         tenant_id = current_tenant.id if current_tenant else None
-        pharmacy_ids = get_user_accessible_pharmacies(db, current_user.id, tenant_id, pharmacy_id)
         
-        if not pharmacy_ids:
+        # Déterminer la branche de l'utilisateur
+        branch = get_user_current_branch(db, current_user.id, tenant_id, branch_id)
+        
+        if not branch:
             return DashboardAlertListResponse(alerts=[], total=0, critical_count=0, warning_count=0)
         
         alerts = []
@@ -462,14 +547,12 @@ async def get_dashboard_alerts(
         # 1. ALERTES DE STOCK CRITIQUE (rupture)
         out_of_stock_products = db.query(Product).filter(
             Product.tenant_id == tenant_id,
-            Product.pharmacy_id.in_(pharmacy_ids),
+            Product.branch_id == branch.id,
             Product.is_active == True,
             Product.quantity == 0
-        )
-        if branch_id:
-            out_of_stock_products = out_of_stock_products.filter(Product.branch_id == branch_id)
+        ).all()
         
-        for product in out_of_stock_products.all():
+        for product in out_of_stock_products:
             alerts.append(DashboardAlertResponse(
                 id=str(product.id),
                 type="out_of_stock",
@@ -479,24 +562,24 @@ async def get_dashboard_alerts(
                 product_id=str(product.id),
                 product_name=product.name,
                 current_stock=0,
-                threshold=product.alert_threshold
+                threshold=product.alert_threshold,
+                expiry_date=None,
+                days_remaining=None
             ))
             critical_count += 1
         
         # 2. ALERTES DE STOCK BAS
         low_stock_products = db.query(Product).filter(
             Product.tenant_id == tenant_id,
-            Product.pharmacy_id.in_(pharmacy_ids),
+            Product.branch_id == branch.id,
             Product.is_active == True,
             Product.quantity > 0,
             Product.quantity <= Product.alert_threshold
-        )
-        if branch_id:
-            low_stock_products = low_stock_products.filter(Product.branch_id == branch_id)
+        ).all()
         
-        for product in low_stock_products.all():
+        for product in low_stock_products:
             if product.quantity == 0:
-                continue  # Déjà traité
+                continue
             severity = "high" if product.quantity <= product.alert_threshold / 2 else "medium"
             alerts.append(DashboardAlertResponse(
                 id=str(product.id),
@@ -507,7 +590,9 @@ async def get_dashboard_alerts(
                 product_id=str(product.id),
                 product_name=product.name,
                 current_stock=product.quantity,
-                threshold=product.alert_threshold
+                threshold=product.alert_threshold,
+                expiry_date=None,
+                days_remaining=None
             ))
             if severity == "high":
                 critical_count += 1
@@ -520,16 +605,14 @@ async def get_dashboard_alerts(
         
         expiring_products = db.query(Product).filter(
             Product.tenant_id == tenant_id,
-            Product.pharmacy_id.in_(pharmacy_ids),
+            Product.branch_id == branch.id,
             Product.is_active == True,
             Product.expiry_date.isnot(None),
             Product.expiry_date <= expiry_threshold,
             Product.quantity > 0
-        )
-        if branch_id:
-            expiring_products = expiring_products.filter(Product.branch_id == branch_id)
+        ).all()
         
-        for product in expiring_products.all():
+        for product in expiring_products:
             days_remaining = (product.expiry_date - today).days
             if days_remaining < 0:
                 severity = "high"
@@ -553,6 +636,7 @@ async def get_dashboard_alerts(
                 product_id=str(product.id),
                 product_name=product.name,
                 current_stock=product.quantity,
+                threshold=product.alert_threshold,
                 expiry_date=product.expiry_date.isoformat(),
                 days_remaining=days_remaining
             ))
@@ -588,18 +672,20 @@ async def get_stock_value_history(
     db: Session = Depends(get_db),
     current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_user: User = Depends(get_current_active_user),
-    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
     branch_id: Optional[UUID] = Query(None, description="Filtrer par succursale"),
     days: int = Query(30, ge=7, le=365)
 ):
     """
     Récupère l'historique de la valeur du stock sur une période.
+    (Basé sur la branche de l'utilisateur)
     """
     try:
         tenant_id = current_tenant.id if current_tenant else None
-        pharmacy_ids = get_user_accessible_pharmacies(db, current_user.id, tenant_id, pharmacy_id)
         
-        if not pharmacy_ids:
+        # Déterminer la branche de l'utilisateur
+        branch = get_user_current_branch(db, current_user.id, tenant_id, branch_id)
+        
+        if not branch:
             return {"history": [], "total_stock_value": 0}
         
         history = []
@@ -609,18 +695,15 @@ async def get_stock_value_history(
         # Pour chaque jour, calculer la valeur du stock
         current_date = start_date
         while current_date <= end_date:
-            # Compter les produits actifs à cette date
             products = db.query(Product).filter(
                 Product.tenant_id == tenant_id,
-                Product.pharmacy_id.in_(pharmacy_ids),
+                Product.branch_id == branch.id,
                 Product.is_active == True,
                 Product.created_at <= datetime.combine(current_date, datetime.max.time())
-            )
-            if branch_id:
-                products = products.filter(Product.branch_id == branch_id)
+            ).all()
             
             total_value = 0
-            for product in products.all():
+            for product in products:
                 total_value += safe_decimal_to_float(product.selling_price) * (product.quantity or 0)
             
             history.append({
@@ -650,18 +733,20 @@ async def get_sales_history(
     db: Session = Depends(get_db),
     current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_user: User = Depends(get_current_active_user),
-    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
     branch_id: Optional[UUID] = Query(None, description="Filtrer par succursale"),
     days: int = Query(30, ge=7, le=365)
 ):
     """
     Récupère l'historique des ventes sur une période.
+    (Basé sur la branche de l'utilisateur)
     """
     try:
         tenant_id = current_tenant.id if current_tenant else None
-        pharmacy_ids = get_user_accessible_pharmacies(db, current_user.id, tenant_id, pharmacy_id)
         
-        if not pharmacy_ids:
+        # Déterminer la branche de l'utilisateur
+        branch = get_user_current_branch(db, current_user.id, tenant_id, branch_id)
+        
+        if not branch:
             return {"history": [], "total_revenue": 0, "total_sales": 0}
         
         end_date = date.today()
@@ -675,15 +760,11 @@ async def get_sales_history(
             func.coalesce(func.avg(Sale.total_amount), 0).label("average_basket")
         ).filter(
             Sale.tenant_id == tenant_id,
-            Sale.pharmacy_id.in_(pharmacy_ids),
+            Sale.branch_id == branch.id,
             Sale.status == "completed",
             func.date(Sale.created_at) >= start_date,
             func.date(Sale.created_at) <= end_date
-        )
-        if branch_id:
-            results = results.filter(Sale.branch_id == branch_id)
-        
-        results = results.group_by(func.date(Sale.created_at)).order_by(func.date(Sale.created_at)).all()
+        ).group_by(func.date(Sale.created_at)).order_by(func.date(Sale.created_at)).all()
         
         history = []
         total_revenue = 0
@@ -721,18 +802,20 @@ async def get_profit_history(
     db: Session = Depends(get_db),
     current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_user: User = Depends(get_current_active_user),
-    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
     branch_id: Optional[UUID] = Query(None, description="Filtrer par succursale"),
     days: int = Query(30, ge=7, le=365)
 ):
     """
     Récupère l'historique des bénéfices sur une période.
+    (Basé sur la branche de l'utilisateur)
     """
     try:
         tenant_id = current_tenant.id if current_tenant else None
-        pharmacy_ids = get_user_accessible_pharmacies(db, current_user.id, tenant_id, pharmacy_id)
         
-        if not pharmacy_ids:
+        # Déterminer la branche de l'utilisateur
+        branch = get_user_current_branch(db, current_user.id, tenant_id, branch_id)
+        
+        if not branch:
             return {"history": [], "total_profit": 0, "average_profit": 0}
         
         end_date = date.today()
@@ -749,15 +832,13 @@ async def get_profit_history(
             # Récupérer les ventes du jour
             sales = db.query(Sale).filter(
                 Sale.tenant_id == tenant_id,
-                Sale.pharmacy_id.in_(pharmacy_ids),
+                Sale.branch_id == branch.id,
                 Sale.status == "completed",
                 Sale.created_at >= start_dt,
                 Sale.created_at <= end_dt
-            )
-            if branch_id:
-                sales = sales.filter(Sale.branch_id == branch_id)
+            ).all()
             
-            sale_ids = [s.id for s in sales.all()]
+            sale_ids = [s.id for s in sales]
             
             if sale_ids:
                 # Calculer le coût des ventes
@@ -808,7 +889,7 @@ async def get_profit_history(
 
 
 # =======================
-# FONCTIONS INTERNES
+# FONCTIONS INTERNES - BASÉES SUR BRANCH
 # =======================
 
 def _get_empty_stats_response() -> DashboardStatsResponse:
@@ -858,29 +939,25 @@ def _get_empty_stats_response() -> DashboardStatsResponse:
     )
 
 
-def _get_sales_stats(
+def _get_sales_stats_by_branch(
     db: Session,
     tenant_id: Optional[UUID],
-    pharmacy_ids: List[UUID],
-    branch_id: Optional[UUID],
+    branch_id: UUID,
     start_dt: datetime,
     end_dt: datetime
 ) -> Dict[str, Any]:
-    """Récupère les statistiques des ventes"""
+    """Récupère les statistiques des ventes pour une branche spécifique"""
     
     query = db.query(
         func.coalesce(func.sum(Sale.total_amount), 0).label("total_sales"),
         func.count(Sale.id).label("sales_count")
     ).filter(
         Sale.tenant_id == tenant_id,
-        Sale.pharmacy_id.in_(pharmacy_ids),
+        Sale.branch_id == branch_id,
         Sale.status == "completed",
         Sale.created_at >= start_dt,
         Sale.created_at <= end_dt
     )
-    
-    if branch_id:
-        query = query.filter(Sale.branch_id == branch_id)
     
     result = query.first()
     
@@ -888,22 +965,20 @@ def _get_sales_stats(
     sales_count = safe_int(result.sales_count if result else 0)
     
     # Calcul du bénéfice net
-    sale_ids_query = db.query(Sale.id).filter(
+    sale_ids = db.query(Sale.id).filter(
         Sale.tenant_id == tenant_id,
-        Sale.pharmacy_id.in_(pharmacy_ids),
+        Sale.branch_id == branch_id,
         Sale.status == "completed",
         Sale.created_at >= start_dt,
         Sale.created_at <= end_dt
-    )
-    if branch_id:
-        sale_ids_query = sale_ids_query.filter(Sale.branch_id == branch_id)
+    ).all()
     
-    sale_ids = [s.id for s in sale_ids_query.all()]
+    sale_ids_list = [s.id for s in sale_ids]
     
     net_profit = 0
-    if sale_ids:
+    if sale_ids_list:
         sale_items = db.query(SaleItem).filter(
-            SaleItem.sale_id.in_(sale_ids),
+            SaleItem.sale_id.in_(sale_ids_list),
             SaleItem.tenant_id == tenant_id
         ).all()
         
@@ -930,23 +1005,18 @@ def _get_sales_stats(
     }
 
 
-def _get_stock_stats(
+def _get_stock_stats_by_branch(
     db: Session,
     tenant_id: Optional[UUID],
-    pharmacy_ids: List[UUID],
-    branch_id: Optional[UUID]
+    branch_id: UUID
 ) -> Dict[str, Any]:
-    """Récupère les statistiques du stock"""
+    """Récupère les statistiques du stock pour une branche spécifique"""
     
-    query = db.query(Product).filter(
+    products = db.query(Product).filter(
         Product.tenant_id == tenant_id,
-        Product.pharmacy_id.in_(pharmacy_ids),
+        Product.branch_id == branch_id,
         Product.is_active == True
-    )
-    if branch_id:
-        query = query.filter(Product.branch_id == branch_id)
-    
-    products = query.all()
+    ).all()
     
     total_purchase_value = 0
     total_selling_value = 0
@@ -960,7 +1030,7 @@ def _get_stock_stats(
     expiry_threshold = today + timedelta(days=30)
     
     for product in products:
-        qty = product.quantity or 0 
+        qty = product.quantity or 0
         total_quantity += qty
         total_purchase_value += safe_decimal_to_float(product.purchase_price) * qty
         total_selling_value += safe_decimal_to_float(product.selling_price) * qty
@@ -986,7 +1056,7 @@ def _get_stock_stats(
             Sale, Sale.id == SaleItem.sale_id
         ).filter(
             SaleItem.tenant_id == tenant_id,
-            SaleItem.product_id.in_([p.id for p in products]),
+            SaleItem.branch_id == branch_id,
             Sale.status == "completed",
             Sale.created_at >= thirty_days_ago
         ).scalar() or 0
@@ -1006,42 +1076,23 @@ def _get_stock_stats(
     }
 
 
-def _get_expense_stats(
+def _get_expense_stats_by_branch(
     db: Session,
     tenant_id: Optional[UUID],
-    pharmacy_ids: List[UUID],
-    branch_id: Optional[UUID],
+    branch_id: UUID,
     start_dt: datetime,
     end_dt: datetime
 ) -> Dict[str, Any]:
-    """Récupère les statistiques des dépenses"""
+    """Récupère les statistiques des dépenses pour une branche spécifique"""
     
-    # Récupérer les IDs des branches qui appartiennent aux pharmacies sélectionnées
-    valid_branch_ids_query = db.query(Branch.id).filter(
-        Branch.tenant_id == tenant_id,
-        Branch.pharmacy_id.in_(pharmacy_ids),
-        Branch.is_active == True
-    )
-    if branch_id:
-        valid_branch_ids_query = valid_branch_ids_query.filter(Branch.id == branch_id)
-    
-    valid_branch_ids = [b.id for b in valid_branch_ids_query.all()]
-    
-    if not valid_branch_ids:
-        return {
-            "monthly_expenses": 0,
-            "daily_expenses": 0
-        }
-    
-    query = db.query(Expense).filter(
+    # Dépenses du mois
+    expenses = db.query(Expense).filter(
         Expense.tenant_id == tenant_id,
-        Expense.branch_id.in_(valid_branch_ids),
+        Expense.branch_id == branch_id,
         Expense.approval_status == "approved",
         Expense.expense_date >= start_dt.date(),
         Expense.expense_date <= end_dt.date()
-    )
-    
-    expenses = query.all()
+    ).all()
     
     monthly_expenses = sum(safe_decimal_to_float(e.amount) for e in expenses)
     
@@ -1049,55 +1100,34 @@ def _get_expense_stats(
     today_start = datetime.combine(date.today(), datetime.min.time())
     today_end = datetime.combine(date.today(), datetime.max.time())
     
-    daily_query = db.query(Expense).filter(
+    daily_expenses = db.query(Expense).filter(
         Expense.tenant_id == tenant_id,
-        Expense.branch_id.in_(valid_branch_ids),
+        Expense.branch_id == branch_id,
         Expense.approval_status == "approved",
         Expense.created_at >= today_start,
         Expense.created_at <= today_end
-    )
+    ).all()
     
-    daily_expenses = sum(safe_decimal_to_float(e.amount) for e in daily_query.all())
+    daily_expenses_sum = sum(safe_decimal_to_float(e.amount) for e in daily_expenses)
     
     return {
         "monthly_expenses": round(monthly_expenses, 2),
-        "daily_expenses": round(daily_expenses, 2)
+        "daily_expenses": round(daily_expenses_sum, 2)
     }
 
-def _get_debt_stats(
+
+def _get_debt_stats_by_branch(
     db: Session,
     tenant_id: Optional[UUID],
-    pharmacy_ids: List[UUID],
-    branch_id: Optional[UUID]
+    branch_id: UUID
 ) -> Dict[str, Any]:
-    """Récupère les statistiques des dettes"""
+    """Récupère les statistiques des dettes pour une branche spécifique"""
     
-    # Récupérer les IDs des branches
-    valid_branch_ids_query = db.query(Branch.id).filter(
-        Branch.tenant_id == tenant_id,
-        Branch.pharmacy_id.in_(pharmacy_ids),
-        Branch.is_active == True
-    )
-    if branch_id:
-        valid_branch_ids_query = valid_branch_ids_query.filter(Branch.id == branch_id)
-    
-    valid_branch_ids = [b.id for b in valid_branch_ids_query.all()]
-    
-    if not valid_branch_ids:
-        return {
-            "total_debts": 0,
-            "unpaid_debts": 0,
-            "recovery_rate": 0,
-            "monthly_debts": 0
-        }
-    
-    query = db.query(Debt).filter(
+    debts = db.query(Debt).filter(
         Debt.tenant_id == tenant_id,
-        Debt.branch_id.in_(valid_branch_ids),
+        Debt.branch_id == branch_id,
         Debt.is_active == True
-    )
-    
-    debts = query.all()
+    ).all()
     
     total_debts = sum(safe_decimal_to_float(d.remaining_amount) for d in debts)
     unpaid_debts = sum(safe_decimal_to_float(d.remaining_amount) for d in debts if d.status == "unpaid")
@@ -1110,8 +1140,8 @@ def _get_debt_stats(
     # Dettes du mois
     first_day_of_month = date.today().replace(day=1)
     monthly_debts = sum(
-        safe_decimal_to_float(d.initial_amount) 
-        for d in debts 
+        safe_decimal_to_float(d.initial_amount)
+        for d in debts
         if d.created_at and d.created_at.date() >= first_day_of_month
     )
     
@@ -1122,27 +1152,23 @@ def _get_debt_stats(
         "monthly_debts": round(monthly_debts, 2)
     }
 
-def _get_purchase_stats(
+
+def _get_purchase_stats_by_branch(
     db: Session,
     tenant_id: Optional[UUID],
-    pharmacy_ids: List[UUID],
-    branch_id: Optional[UUID],
+    branch_id: UUID,
     start_dt: datetime,
     end_dt: datetime
 ) -> Dict[str, Any]:
-    """Récupère les statistiques des achats"""
+    """Récupère les statistiques des achats pour une branche spécifique"""
     
-    query = db.query(Purchase).filter(
+    purchases = db.query(Purchase).filter(
         Purchase.tenant_id == tenant_id,
-        Purchase.pharmacy_id.in_(pharmacy_ids),
+        Purchase.branch_id == branch_id,
         Purchase.status == "completed",
         Purchase.created_at >= start_dt,
         Purchase.created_at <= end_dt
-    )
-    if branch_id:
-        query = query.filter(Purchase.branch_id == branch_id)
-    
-    purchases = query.all()
+    ).all()
     
     monthly_purchases = sum(safe_decimal_to_float(p.total_amount) for p in purchases)
     
@@ -1150,119 +1176,108 @@ def _get_purchase_stats(
     today_start = datetime.combine(date.today(), datetime.min.time())
     today_end = datetime.combine(date.today(), datetime.max.time())
     
-    daily_query = db.query(Purchase).filter(
+    daily_purchases = db.query(Purchase).filter(
         Purchase.tenant_id == tenant_id,
-        Purchase.pharmacy_id.in_(pharmacy_ids),
+        Purchase.branch_id == branch_id,
         Purchase.status == "completed",
         Purchase.created_at >= today_start,
         Purchase.created_at <= today_end
-    )
-    if branch_id:
-        daily_query = daily_query.filter(Purchase.branch_id == branch_id)
+    ).all()
     
-    daily_purchases = sum(safe_decimal_to_float(p.total_amount) for p in daily_query.all())
+    daily_purchases_sum = sum(safe_decimal_to_float(p.total_amount) for p in daily_purchases)
     
     # Nombre de fournisseurs
     suppliers_count = db.query(func.count(func.distinct(Purchase.supplier_id))).filter(
         Purchase.tenant_id == tenant_id,
-        Purchase.pharmacy_id.in_(pharmacy_ids),
+        Purchase.branch_id == branch_id,
         Purchase.status == "completed"
     ).scalar() or 0
     
     # Commandes en attente
     pending_orders = db.query(Purchase).filter(
         Purchase.tenant_id == tenant_id,
-        Purchase.pharmacy_id.in_(pharmacy_ids),
+        Purchase.branch_id == branch_id,
         Purchase.status.in_(["pending", "ordered"])
     ).count()
     
     return {
         "monthly_purchases": round(monthly_purchases, 2),
-        "daily_purchases": round(daily_purchases, 2),
+        "daily_purchases": round(daily_purchases_sum, 2),
         "suppliers_count": suppliers_count,
         "pending_orders": pending_orders
     }
 
 
-def _get_return_stats(
+def _get_return_stats_by_branch(
     db: Session,
     tenant_id: Optional[UUID],
-    pharmacy_ids: List[UUID],
-    branch_id: Optional[UUID],
+    branch_id: UUID,
     start_dt: datetime,
     end_dt: datetime
 ) -> Dict[str, Any]:
-    """Récupère les statistiques des retours"""
+    """Récupère les statistiques des retours pour une branche spécifique"""
     
     # Retours du mois
-    query = db.query(Return).filter(
+    monthly_returns_obj = db.query(Return).filter(
         Return.tenant_id == tenant_id,
-        Return.pharmacy_id.in_(pharmacy_ids),
+        Return.branch_id == branch_id,
         Return.created_at >= start_dt,
         Return.created_at <= end_dt,
         Return.is_active == True
-    )
-    if branch_id:
-        query = query.filter(Return.branch_id == branch_id)
+    ).all()
     
-    monthly_returns_obj = query.all()
     monthly_returns = sum(safe_decimal_to_float(r.total_amount) for r in monthly_returns_obj)
     
     # Retours en attente
-    pending_query = db.query(Return).filter(
+    pending_returns = db.query(Return).filter(
         Return.tenant_id == tenant_id,
-        Return.pharmacy_id.in_(pharmacy_ids),
+        Return.branch_id == branch_id,
         Return.status == ReturnStatus.PENDING,
         Return.is_active == True
-    )
-    if branch_id:
-        pending_query = pending_query.filter(Return.branch_id == branch_id)
+    ).count()
     
-    pending_returns = pending_query.count()
-    
-    # Valeur totale des retours (tous statuts)
-    total_query = db.query(Return).filter(
+    # Valeur totale des retours
+    total_returns_value = db.query(Return).filter(
         Return.tenant_id == tenant_id,
-        Return.pharmacy_id.in_(pharmacy_ids),
+        Return.branch_id == branch_id,
         Return.is_active == True
-    )
-    if branch_id:
-        total_query = total_query.filter(Return.branch_id == branch_id)
+    ).all()
     
-    total_returns_value = sum(safe_decimal_to_float(r.total_amount) for r in total_query.all())
+    total_returns_sum = sum(safe_decimal_to_float(r.total_amount) for r in total_returns_value)
     
     return {
         "monthly_returns": round(monthly_returns, 2),
         "pending_returns": pending_returns,
-        "total_returns_value": round(total_returns_value, 2)
+        "total_returns_value": round(total_returns_sum, 2)
     }
 
 
-def _get_transfer_stats(
+def _get_transfer_stats_by_branch(
     db: Session,
     tenant_id: Optional[UUID],
-    pharmacy_ids: List[UUID],
-    branch_id: Optional[UUID]
+    branch_id: UUID
 ) -> Dict[str, Any]:
-    """Récupère les statistiques des transferts"""
+    """Récupère les statistiques des transferts pour une branche spécifique"""
     
-    # Transferts en attente
-    pending_query = db.query(ProductTransfer).filter(
+    # Transferts en attente (source ou destination)
+    pending_transfers = db.query(ProductTransfer).filter(
         ProductTransfer.tenant_id == tenant_id,
-        ProductTransfer.source_pharmacy_id.in_(pharmacy_ids),
+        or_(
+            ProductTransfer.source_branch_id == branch_id,
+            ProductTransfer.destination_branch_id == branch_id
+        ),
         ProductTransfer.status == TransferStatus.PENDING
-    )
-    
-    pending_transfers = pending_query.count()
+    ).count()
     
     # Transferts en transit
-    transit_query = db.query(ProductTransfer).filter(
+    in_transit_transfers = db.query(ProductTransfer).filter(
         ProductTransfer.tenant_id == tenant_id,
-        ProductTransfer.source_pharmacy_id.in_(pharmacy_ids),
+        or_(
+            ProductTransfer.source_branch_id == branch_id,
+            ProductTransfer.destination_branch_id == branch_id
+        ),
         ProductTransfer.status == TransferStatus.IN_TRANSIT
-    )
-    
-    in_transit_transfers = transit_query.count()
+    ).count()
     
     return {
         "pending_transfers": pending_transfers,
@@ -1270,24 +1285,19 @@ def _get_transfer_stats(
     }
 
 
-def _get_recent_transactions(
+def _get_recent_transactions_by_branch(
     db: Session,
     tenant_id: Optional[UUID],
-    pharmacy_ids: List[UUID],
-    branch_id: Optional[UUID],
+    branch_id: UUID,
     limit: int = 10
 ) -> List[Dict[str, Any]]:
-    """Récupère les transactions récentes"""
+    """Récupère les transactions récentes pour une branche"""
     
-    query = db.query(Sale).filter(
+    sales = db.query(Sale).filter(
         Sale.tenant_id == tenant_id,
-        Sale.pharmacy_id.in_(pharmacy_ids),
+        Sale.branch_id == branch_id,
         Sale.status == "completed"
-    )
-    if branch_id:
-        query = query.filter(Sale.branch_id == branch_id)
-    
-    sales = query.order_by(desc(Sale.created_at)).limit(limit).all()
+    ).order_by(desc(Sale.created_at)).limit(limit).all()
     
     return [
         {
@@ -1300,26 +1310,21 @@ def _get_recent_transactions(
     ]
 
 
-def _get_low_stock_products(
+def _get_low_stock_products_by_branch(
     db: Session,
     tenant_id: Optional[UUID],
-    pharmacy_ids: List[UUID],
-    branch_id: Optional[UUID],
+    branch_id: UUID,
     limit: int = 10
 ) -> List[Dict[str, Any]]:
-    """Récupère les produits en stock bas"""
+    """Récupère les produits en stock bas pour une branche"""
     
-    query = db.query(Product).filter(
+    products = db.query(Product).filter(
         Product.tenant_id == tenant_id,
-        Product.pharmacy_id.in_(pharmacy_ids),
+        Product.branch_id == branch_id,
         Product.is_active == True,
         Product.quantity > 0,
         Product.quantity <= Product.alert_threshold
-    )
-    if branch_id:
-        query = query.filter(Product.branch_id == branch_id)
-    
-    products = query.order_by(Product.quantity.asc()).limit(limit).all()
+    ).order_by(Product.quantity.asc()).limit(limit).all()
     
     return [
         {
@@ -1331,30 +1336,25 @@ def _get_low_stock_products(
     ]
 
 
-def _get_expiring_products(
+def _get_expiring_products_by_branch(
     db: Session,
     tenant_id: Optional[UUID],
-    pharmacy_ids: List[UUID],
-    branch_id: Optional[UUID],
+    branch_id: UUID,
     limit: int = 10
 ) -> List[Dict[str, Any]]:
-    """Récupère les produits expirant bientôt"""
+    """Récupère les produits expirant bientôt pour une branche"""
     
     today = date.today()
     threshold = today + timedelta(days=30)
     
-    query = db.query(Product).filter(
+    products = db.query(Product).filter(
         Product.tenant_id == tenant_id,
-        Product.pharmacy_id.in_(pharmacy_ids),
+        Product.branch_id == branch_id,
         Product.is_active == True,
         Product.expiry_date.isnot(None),
         Product.expiry_date <= threshold,
         Product.quantity > 0
-    )
-    if branch_id:
-        query = query.filter(Product.branch_id == branch_id)
-    
-    products = query.order_by(Product.expiry_date.asc()).limit(limit).all()
+    ).order_by(Product.expiry_date.asc()).limit(limit).all()
     
     return [
         {
@@ -1366,36 +1366,19 @@ def _get_expiring_products(
     ]
 
 
-def _get_recent_debts(
+def _get_recent_debts_by_branch(
     db: Session,
     tenant_id: Optional[UUID],
-    pharmacy_ids: List[UUID],
-    branch_id: Optional[UUID],
+    branch_id: UUID,
     limit: int = 10
 ) -> List[Dict[str, Any]]:
-    """Récupère les dettes récentes"""
+    """Récupère les dettes récentes pour une branche"""
     
-    # Récupérer les IDs des branches
-    valid_branch_ids_query = db.query(Branch.id).filter(
-        Branch.tenant_id == tenant_id,
-        Branch.pharmacy_id.in_(pharmacy_ids),
-        Branch.is_active == True
-    )
-    if branch_id:
-        valid_branch_ids_query = valid_branch_ids_query.filter(Branch.id == branch_id)
-    
-    valid_branch_ids = [b.id for b in valid_branch_ids_query.all()]
-    
-    if not valid_branch_ids:
-        return []
-    
-    query = db.query(Debt).filter(
+    debts = db.query(Debt).filter(
         Debt.tenant_id == tenant_id,
-        Debt.branch_id.in_(valid_branch_ids),
+        Debt.branch_id == branch_id,
         Debt.is_active == True
-    )
-    
-    debts = query.order_by(desc(Debt.created_at)).limit(limit).all()
+    ).order_by(desc(Debt.created_at)).limit(limit).all()
     
     return [
         {
@@ -1406,24 +1389,20 @@ def _get_recent_debts(
         for d in debts
     ]
 
-def _get_recent_purchases(
+
+def _get_recent_purchases_by_branch(
     db: Session,
     tenant_id: Optional[UUID],
-    pharmacy_ids: List[UUID],
-    branch_id: Optional[UUID],
+    branch_id: UUID,
     limit: int = 10
 ) -> List[Dict[str, Any]]:
-    """Récupère les achats récents"""
+    """Récupère les achats récents pour une branche"""
     
-    query = db.query(Purchase).filter(
+    purchases = db.query(Purchase).filter(
         Purchase.tenant_id == tenant_id,
-        Purchase.pharmacy_id.in_(pharmacy_ids),
+        Purchase.branch_id == branch_id,
         Purchase.status == "completed"
-    )
-    if branch_id:
-        query = query.filter(Purchase.branch_id == branch_id)
-    
-    purchases = query.order_by(desc(Purchase.created_at)).limit(limit).all()
+    ).order_by(desc(Purchase.created_at)).limit(limit).all()
     
     return [
         {
@@ -1435,43 +1414,26 @@ def _get_recent_purchases(
     ]
 
 
-def _get_expense_categories(
+def _get_expense_categories_by_branch(
     db: Session,
     tenant_id: Optional[UUID],
-    pharmacy_ids: List[UUID],
-    branch_id: Optional[UUID],
+    branch_id: UUID,
     start_dt: datetime,
     end_dt: datetime,
     limit: int = 5
 ) -> List[Dict[str, Any]]:
-    """Récupère les dépenses par catégorie"""
+    """Récupère les dépenses par catégorie pour une branche"""
     
-    # Récupérer les IDs des branches qui appartiennent aux pharmacies sélectionnées
-    valid_branch_ids_query = db.query(Branch.id).filter(
-        Branch.tenant_id == tenant_id,
-        Branch.pharmacy_id.in_(pharmacy_ids),
-        Branch.is_active == True
-    )
-    if branch_id:
-        valid_branch_ids_query = valid_branch_ids_query.filter(Branch.id == branch_id)
-    
-    valid_branch_ids = [b.id for b in valid_branch_ids_query.all()]
-    
-    if not valid_branch_ids:
-        return []
-    
-    query = db.query(
+    results = db.query(
         Expense.expense_type,
         func.coalesce(func.sum(Expense.amount), 0).label("total")
     ).filter(
         Expense.tenant_id == tenant_id,
-        Expense.branch_id.in_(valid_branch_ids),
+        Expense.branch_id == branch_id,
         Expense.approval_status == "approved",
         Expense.expense_date >= start_dt.date(),
         Expense.expense_date <= end_dt.date()
-    )
-    
-    results = query.group_by(Expense.expense_type).order_by(desc("total")).limit(limit).all()
+    ).group_by(Expense.expense_type).order_by(desc("total")).limit(limit).all()
     
     return [
         {
@@ -1481,46 +1443,38 @@ def _get_expense_categories(
         for r in results
     ]
 
-def _get_active_users_count(
+
+def _get_active_users_count_by_branch(
     db: Session,
     tenant_id: Optional[UUID],
-    pharmacy_ids: List[UUID],
-    branch_id: Optional[UUID]
+    branch_id: UUID
 ) -> int:
-    """Récupère le nombre d'utilisateurs actifs"""
+    """Récupère le nombre d'utilisateurs actifs pour une branche"""
     
-    # Compter les utilisateurs qui ont fait des ventes dans les 30 derniers jours
     thirty_days_ago = datetime.utcnow() - timedelta(days=30)
     
-    query = db.query(func.count(func.distinct(Sale.created_by))).filter(
+    count = db.query(func.count(func.distinct(Sale.created_by))).filter(
         Sale.tenant_id == tenant_id,
-        Sale.pharmacy_id.in_(pharmacy_ids),
+        Sale.branch_id == branch_id,
         Sale.status == "completed",
         Sale.created_at >= thirty_days_ago
-    )
-    if branch_id:
-        query = query.filter(Sale.branch_id == branch_id)
+    ).scalar() or 0
     
-    return query.scalar() or 0
+    return count
 
 
-def _get_customers_count(
+def _get_customers_count_by_branch(
     db: Session,
     tenant_id: Optional[UUID],
-    pharmacy_ids: List[UUID],
-    branch_id: Optional[UUID]
+    branch_id: UUID
 ) -> int:
-    """Récupère le nombre total de clients"""
+    """Récupère le nombre total de clients pour une branche"""
     
-    query = db.query(Customer).filter(
+    return db.query(Customer).filter(
         Customer.tenant_id == tenant_id,
-        Customer.pharmacy_id.in_(pharmacy_ids),
+        Customer.branch_id == branch_id,
         Customer.is_active == True
-    )
-    if branch_id:
-        query = query.filter(Customer.branch_id == branch_id)
-    
-    return query.count()
+    ).count()
 
 
 # Endpoint de test
@@ -1531,19 +1485,19 @@ async def test_dashboard(
     """Endpoint de test pour le module dashboard"""
     return {
         "message": "Module Dashboard opérationnel",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "user": {
             "id": str(current_user.id),
             "email": current_user.email,
             "role": current_user.role
         },
         "features": [
-            "Statistiques globales",
+            "Statistiques basées sur la branche",
             "Alertes stock et péremption",
             "Historique valeur stock",
             "Historique ventes",
             "Historique bénéfices",
-            "Filtres par pharmacie/succursale",
+            "Filtres par succursale",
             "Périodes personnalisées"
         ]
     }

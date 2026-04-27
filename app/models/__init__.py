@@ -53,6 +53,7 @@ from app.models.user_history import UserHistory
 from app.models.trash_bin import TrashBin
 from app.models.user_expense import UserExpense 
 from app.models.return_product import Return, ReturnItem
+from app.models.user_branch import UserBranch
 
 __all__ = [
     # Core
@@ -115,5 +116,6 @@ __all__ = [
     "BranchSubscription",
     "UserExpense",
     "Return",
-    "ReturnItem"
+    "ReturnItem",
+    "UserBranch"
 ]

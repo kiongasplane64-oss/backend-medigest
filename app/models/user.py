@@ -119,6 +119,12 @@ class User(Base):
     expenses = relationship("Expense", foreign_keys="Expense.user_id", back_populates="user")
     expenses_approved = relationship("Expense", foreign_keys="Expense.approved_by")
     user_expenses = relationship("UserExpense", back_populates="user", foreign_keys="UserExpense.user_id")
+    branch_associations = relationship(
+        "UserBranch", 
+        back_populates="user", 
+        cascade="all, delete-orphan",
+        foreign_keys="UserBranch.user_id"
+    )
     
     # =========================
     # Méthodes utilitaires
@@ -435,3 +441,17 @@ class User(Base):
         return db_session.query(BranchSubscription).filter(
             BranchSubscription.branch_id == self.active_branch_id
         ).first()
+    
+    @property
+    def assigned_branches(self):
+        """Retourne la liste des branches assignées à cet utilisateur"""
+        return [assoc.branch for assoc in self.branch_associations if assoc.is_active]
+    
+    def get_primary_branch(self):
+        """Récupère la branche principale de l'utilisateur"""
+        for assoc in self.branch_associations:
+            if assoc.is_primary and assoc.is_active:
+                return assoc.branch
+        if self.branch_associations:
+            return self.branch_associations[0].branch
+        return None

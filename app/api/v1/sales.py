@@ -2063,3 +2063,116 @@ async def get_service_status(
             "statistics"
         ]
     }
+
+@router.get("/health")
+async def sales_health_check(
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+):
+    """
+    Endpoint de health check pour le service de ventes.
+    Utilisé par le frontend pour vérifier la disponibilité du service.
+    """
+    return {
+        "status": "healthy",
+        "service": "sales",
+        "timestamp": datetime.utcnow().isoformat(),
+        "endpoints_available": [
+            "/api/v1/sales",
+            "/api/v1/sales/stats/daily",
+            "/api/v1/sales/stats/overview",
+            "/api/v1/sales/next-invoice-number"
+        ]
+    }
+
+
+@router.get("/ping")
+async def sales_ping():
+    """
+    Endpoint simple pour vérifier que le service est accessible.
+    """
+    return {
+        "status": "ok",
+        "service": "sales",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+@router.get("/sellers")
+async def get_sellers(
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
+    role: Optional[str] = Query(None, description="Filtrer par rôle (vendeur, caissier, gerant)")
+):
+    """
+    Récupère la liste des vendeurs/caissiers ayant accès aux pharmacies.
+    """
+    try:
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        # Base query - récupérer les utilisateurs qui ont des rôles de vente
+        allowed_roles = ["vendeur", "caissier", "gerant", "admin", "superadmin", "super_admin"]
+        
+        # Si un rôle spécifique est demandé
+        if role and role.lower() in allowed_roles:
+            allowed_roles = [role.lower()]
+        
+        # Récupérer les utilisateurs actifs avec les rôles appropriés
+        query = db.query(User).filter(
+            User.is_active == True,
+            User.role.in_(allowed_roles)
+        )
+        
+        if tenant_id:
+            query = query.filter(User.tenant_id == tenant_id)
+        
+        # Si une pharmacie est spécifiée, filtrer par accès
+        if pharmacy_id:
+            # Récupérer les utilisateurs qui ont accès à cette pharmacie
+            user_pharmacy_query = db.query(UserPharmacy.user_id).filter(
+                UserPharmacy.pharmacy_id == pharmacy_id
+            )
+            query = query.filter(User.id.in_(user_pharmacy_query))
+        
+        users = query.order_by(User.nom_complet, User.email).all()
+        
+        return {
+            "success": True,
+            "sellers": [
+                {
+                    "id": str(user.id),
+                    "email": user.email,
+                    "nom_complet": getattr(user, 'nom_complet', user.email),
+                    "role": user.role,
+                    "is_active": user.is_active
+                }
+                for user in users
+            ],
+            "total": len(users)
+        }
+        
+    except Exception as e:
+        logger.error(f"Erreur récupération vendeurs: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur récupération vendeurs: {str(e)}"
+        )
+
+
+@router.get("/sellers/{pharmacy_id}")
+async def get_sellers_by_pharmacy(
+    pharmacy_id: UUID,
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+):
+    """
+    Récupère la liste des vendeurs pour une pharmacie spécifique.
+    """
+    return await get_sellers(
+        db=db,
+        current_tenant=current_tenant,
+        current_user=current_user,
+        pharmacy_id=pharmacy_id
+    )

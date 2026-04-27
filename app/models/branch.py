@@ -127,6 +127,12 @@ class Branch(Base):
     branch_subscription = relationship("BranchSubscription", back_populates="branch", foreign_keys=[subscription_id], uselist=False)
     
     returns = relationship("Return", back_populates="branch", cascade="all, delete-orphan")
+    user_associations = relationship(
+        "UserBranch", 
+        back_populates="branch", 
+        cascade="all, delete-orphan",
+        foreign_keys="UserBranch.branch_id"
+    )
     
     # =========================
     # Méthodes
@@ -283,3 +289,16 @@ class Branch(Base):
     
     def __repr__(self):
         return f"<Branch {self.name} - {self.city}>"
+    
+    # Pour accéder directement aux utilisateurs
+    @property
+    def assigned_users(self):
+        """Retourne la liste des utilisateurs assignés à cette branche"""
+        return [assoc.user for assoc in self.user_associations if assoc.is_active]
+    
+    def get_users_with_role(self, role: str):
+        """Récupère les utilisateurs ayant un rôle spécifique dans la branche"""
+        return [
+            assoc.user for assoc in self.user_associations 
+            if assoc.is_active and assoc.role_in_branch == role
+        ]
