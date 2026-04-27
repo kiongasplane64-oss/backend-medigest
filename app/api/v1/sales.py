@@ -2041,3 +2041,25 @@ async def test_sales(
         ],
         "timestamp": datetime.utcnow().isoformat()
     }
+
+@router.get("/service-status")
+async def get_service_status(
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+):
+    """
+    Vérifie le statut du service de vente
+    """
+    return {
+        "status": "operational",
+        "service": "sales",
+        "version": "3.1.0",
+        "timestamp": datetime.utcnow().isoformat(),
+        "features": [
+            "sales_management",
+            "credit_sales",
+            "receipt_generation",
+            "statistics"
+        ]
+    }

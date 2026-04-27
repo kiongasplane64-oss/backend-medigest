@@ -4,9 +4,13 @@ import datetime
 import logging
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.routing import APIRouter
+from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy import text
 
 from app.db.session import engine
@@ -39,6 +43,7 @@ from app.api.v1.endpoints.returns import router as returns_router
 from app.api.v1.endpoints import invoices
 
 from app.core.startup import init_storage
+from app.core.exceptions import setup_exception_handlers
 
 # Routers admin / legacy
 from app.api.routes.pharmacies import router as pharmacies_router
@@ -75,6 +80,7 @@ app = FastAPI(
     openapi_url="/api/v1/openapi.json",
     docs_url="/api/docs",
     redoc_url="/api/redoc",
+    default_response_class=JSONResponse,
 )
 
 
@@ -90,6 +96,59 @@ async def startup_event():
         logger.warning("⚠️ Problème d'initialisation du stockage")
     
     logger.info("✅ Application prête")
+
+
+# Configuration des gestionnaires d'exceptions
+setup_exception_handlers(app)
+
+
+# ============================================================================
+# MIDDLEWARE FORCE JSON
+# ============================================================================
+
+class ForceJSONMiddleware(BaseHTTPMiddleware):
+    """Middleware qui force les réponses à être en JSON"""
+    
+    async def dispatch(self, request: Request, call_next):
+        # Ajouter l'en-tête Accept: application/json par défaut
+        # Note: request._headers est readonly, on utilise request.headers dict à la place
+        modified_request = request
+        if "Accept" not in request.headers:
+            # Créer un nouveau dictionnaire d'en-têtes
+            headers = dict(request.headers)
+            headers["Accept"] = "application/json"
+            # Reconstruire la requête avec les nouveaux headers
+            from starlette.datastructures import Headers
+            modified_request = Request(request.scope, receive=request.receive)
+            modified_request._headers = Headers(headers)
+        
+        response = await call_next(modified_request)
+        
+        # Si la réponse est du HTML et que c'est une erreur, la convertir
+        content_type = response.headers.get("content-type", "")
+        if response.status_code >= 400 and "text/html" in content_type:
+            try:
+                body = b""
+                async for chunk in response.body_iterator:
+                    body += chunk
+                
+                return JSONResponse(
+                    status_code=response.status_code,
+                    content={
+                        "detail": f"Erreur {response.status_code}",
+                        "path": str(request.url.path),
+                        "method": request.method,
+                        "fallback": True
+                    }
+                )
+            except:
+                pass
+        
+        return response
+
+
+# Ajouter le middleware après les gestionnaires d'exceptions
+app.add_middleware(ForceJSONMiddleware)
 
 
 # ============================================================================
@@ -231,7 +290,7 @@ app.add_middleware(SubscriptionCheckMiddleware)
 app.add_middleware(SubscriptionMiddleware)
 include_router_auto(app, admin_sync_router)
 include_router_auto(app, invoices.router, tags=["Factures"])
-
+include_router_auto(app, returns_router)
 
 
 # ============================================================================
