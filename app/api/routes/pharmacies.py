@@ -710,6 +710,235 @@ def reactivate_pharmacy(
 
 
 # ==================== PHARMACY CONFIGURATION ====================
+@router.get("/{pharmacy_id}/service-status")
+def check_pharmacy_service_status(
+    pharmacy_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant)
+):
+    """
+    Vérifie si la pharmacie est en service selon les heures configurées.
+    """
+    try:
+        UUID(pharmacy_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID de pharmacie invalide"
+        )
+    
+    # Vérifier l'accès à la pharmacie
+    query = db.query(Pharmacy).filter(Pharmacy.id == pharmacy_id)
+    
+    if current_user.role not in ["super_admin", "superadmin"]:
+        if not current_tenant:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Accès non autorisé"
+            )
+        query = query.filter(Pharmacy.tenant_id == current_tenant.id)
+    
+    pharmacy = query.first()
+    
+    if not pharmacy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pharmacie non trouvée"
+        )
+    
+    # Récupérer la configuration
+    config = pharmacy.config or {}
+    working_hours = config.get("workingHours", {})
+    
+    if not working_hours.get("enabled", True):
+        return {
+            "pharmacy_id": str(pharmacy.id),
+            "pharmacy_name": pharmacy.name,
+            "in_service": True,
+            "restrictions_enabled": False,
+            "message": "Service toujours disponible (pas de restriction horaire)",
+            "current_time_utc": datetime.now(pytz.UTC).isoformat(),
+        }
+    
+    timezone_str = working_hours.get("timezone", "Africa/Kinshasa")
+    
+    try:
+        tz = pytz.timezone(timezone_str)
+        now_local = datetime.now(tz)
+        now_utc = datetime.now(pytz.UTC)
+    except Exception:
+        tz = pytz.UTC
+        now_local = datetime.now(pytz.UTC)
+        now_utc = now_local
+        timezone_str = "UTC"
+    
+    current_minutes = now_local.hour * 60 + now_local.minute
+    current_day = now_local.strftime("%A").lower()
+    
+    days_off = working_hours.get("daysOff", {})
+    
+    if not days_off:
+        days_off = {
+            "monday": True,
+            "tuesday": True,
+            "wednesday": True,
+            "thursday": True,
+            "friday": True,
+            "saturday": True,
+            "sunday": False
+        }
+    
+    is_working_day = days_off.get(current_day, False)
+    
+    start_time_str = working_hours.get("startTime", "08:00")
+    end_time_str = working_hours.get("endTime", "20:00")
+    
+    try:
+        start_parts = start_time_str.split(":")
+        end_parts = end_time_str.split(":")
+        start_minutes = int(start_parts[0]) * 60 + int(start_parts[1])
+        end_minutes = int(end_parts[0]) * 60 + int(end_parts[1])
+    except (ValueError, IndexError):
+        start_minutes = 8 * 60
+        end_minutes = 20 * 60
+        start_time_str = "08:00"
+        end_time_str = "20:00"
+    
+    if end_minutes < start_minutes:
+        is_within_hours = current_minutes >= start_minutes or current_minutes <= end_minutes
+    else:
+        is_within_hours = start_minutes <= current_minutes <= end_minutes
+    
+    in_service = is_working_day and is_within_hours
+    
+    # Calculer le prochain service
+    next_service_info = calculate_next_service_time(
+        current_day=current_day,
+        current_minutes=current_minutes,
+        working_hours=working_hours,
+        is_working_day=is_working_day,
+        start_minutes=start_minutes,
+        end_minutes=end_minutes,
+        days_off=days_off
+    )
+    
+    return {
+        "pharmacy_id": str(pharmacy.id),
+        "pharmacy_name": pharmacy.name,
+        "in_service": in_service,
+        "restrictions_enabled": True,
+        "current_time_utc": now_utc.isoformat(),
+        "current_time_local": now_local.isoformat(),
+        "timezone": timezone_str,
+        "current_day": current_day,
+        "is_working_day": is_working_day,
+        "is_within_hours": is_within_hours,
+        "working_hours": {
+            "start": start_time_str,
+            "end": end_time_str,
+            "overtime": working_hours.get("overtimeEndTime")
+        },
+        "message": "Service disponible" if in_service else "Service indisponible - hors horaires",
+        "next_service_time": next_service_info
+    }
+
+
+def calculate_next_service_time(
+    current_day: str,
+    current_minutes: int,
+    working_hours: dict,
+    is_working_day: bool,
+    start_minutes: int,
+    end_minutes: int,
+    days_off: dict
+) -> str | None:
+    """Calcule le prochain moment où la pharmacie sera en service."""
+    start_time_str = working_hours.get("startTime", "08:00")
+    
+    if is_working_day and current_minutes < start_minutes:
+        return f"{start_time_str} (aujourd'hui)"
+    
+    if is_working_day and current_minutes > end_minutes:
+        return find_next_open_day(current_day, start_time_str, days_off)
+    
+    if not is_working_day:
+        return find_next_open_day(current_day, start_time_str, days_off)
+    
+    return None
+
+
+def find_next_open_day(current_day: str, start_time: str, days_off: dict) -> str:
+    """Trouve le prochain jour OUVERT dans la semaine."""
+    days_order = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    
+    day_names_fr = {
+        "monday": "lundi", 
+        "tuesday": "mardi", 
+        "wednesday": "mercredi",
+        "thursday": "jeudi", 
+        "friday": "vendredi", 
+        "saturday": "samedi",
+        "sunday": "dimanche"
+    }
+    
+    try:
+        current_index = days_order.index(current_day)
+    except ValueError:
+        current_index = 0
+    
+    for i in range(1, 8):
+        next_index = (current_index + i) % 7
+        next_day = days_order[next_index]
+        
+        is_open = days_off.get(next_day, False)
+        
+        if is_open:
+            day_name_fr = day_names_fr.get(next_day, next_day)
+            if i == 1:
+                return f"{start_time} demain"
+            else:
+                return f"{start_time} {day_name_fr}"
+    
+    return "aucun jour d'ouverture configuré"
+
+@router.get("/{pharmacy_id}/branches/{branch_id}/service-status")
+def check_branch_service_status(
+    pharmacy_id: str,
+    branch_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant)
+):
+    """Version simplifiée pour les branches"""
+    try:
+        UUID(pharmacy_id)
+        UUID(branch_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID invalide"
+        )
+    
+    branch = db.query(Branch).filter(
+        Branch.id == branch_id,
+        Branch.parent_pharmacy_id == pharmacy_id
+    ).first()
+    
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Branche non trouvée"
+        )
+    
+    return {
+        "branch_id": str(branch.id),
+        "branch_name": branch.name,
+        "in_service": True,
+        "restrictions_enabled": False,
+        "message": "Service disponible",
+        "current_time_utc": datetime.utcnow().isoformat()
+    }
 
 @router.get("/{pharmacy_id}/config", response_model=PharmacyConfigResponse)
 def get_pharmacy_config(
