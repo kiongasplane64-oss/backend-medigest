@@ -18,7 +18,9 @@ from app.models.sale import Sale, SaleItem
 from app.models.product import Product, ProductStock
 from app.models.customer import Customer
 from app.models.user import User
+from app.models.user_branch import UserBranch
 from app.models.pharmacy import Pharmacy
+from app.models.branch import Branch
 from app.models.user_pharmacy import UserPharmacy
 from app.models.tenant import Tenant
 from app.models.stock_movement import StockMovement
@@ -183,7 +185,8 @@ async def create_sale(
     current_user: User = Depends(get_current_active_user),
     current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
     background_tasks: BackgroundTasks = BackgroundTasks(),
-    force_invoice_number: Optional[str] = Query(None, description="Force un numéro de facture spécifique (réservé admin)")
+    force_invoice_number: Optional[str] = Query(None, description="Force un numéro de facture spécifique (réservé admin)"),
+    branch_id: Optional[UUID] = Query(None, description="ID de la branche (optionnel)")
 ):
     """
     Crée une nouvelle vente avec gestion complète par pharmacie
@@ -224,6 +227,57 @@ async def create_sale(
             )
         
         tenant_id = current_tenant.id if current_tenant else None
+
+        # ========================
+        # DÉTERMINER LA BRANCHE
+        # ========================
+        final_branch_id = None
+        
+        # Priorité 1: branch_id passé en paramètre
+        if branch_id:
+            branch = db.query(Branch).filter(
+                Branch.id == branch_id,
+                Branch.is_active == True
+            ).first()
+            if branch:
+                final_branch_id = branch.id
+                logger.info(f"📍 Branche sélectionnée: {branch.name} ({branch.id})")
+            else:
+                logger.warning(f"⚠️ Branche {branch_id} non trouvée")
+        
+        # Priorité 2: branche active de l'utilisateur
+        if not final_branch_id and current_user.active_branch_id:
+            branch = db.query(Branch).filter(
+                Branch.id == current_user.active_branch_id,
+                Branch.is_active == True
+            ).first()
+            if branch:
+                final_branch_id = branch.id
+                logger.info(f"📍 Branche active utilisateur: {branch.name} ({branch.id})")
+        
+        # Priorité 3: première branche de l'utilisateur
+        if not final_branch_id:
+            user_branch = db.query(UserBranch).filter(
+                UserBranch.user_id == current_user.id,
+                UserBranch.is_active == True
+            ).first()
+            if user_branch and user_branch.branch:
+                final_branch_id = user_branch.branch.id
+                logger.info(f"📍 Première branche de l'utilisateur: {user_branch.branch.name} ({final_branch_id})")
+        
+        # Priorité 4: branche par défaut de la pharmacie
+        if not final_branch_id:
+            first_branch = db.query(Branch).filter(
+                Branch.parent_pharmacy_id == pharmacy.id,
+                Branch.is_active == True
+            ).first()
+            if first_branch:
+                final_branch_id = first_branch.id
+                logger.info(f"📍 Branche par défaut de la pharmacie: {first_branch.name} ({final_branch_id})")
+        
+        # Si toujours pas de branche, on peut laisser NULL
+        if not final_branch_id:
+            logger.warning(f"⚠️ Aucune branche trouvée pour la pharmacie {pharmacy.id}, vente sans branche assignée")
 
         # Validation des données
         if not sale_data.items or len(sale_data.items) == 0:
@@ -408,10 +462,11 @@ async def create_sale(
             total_discount += global_discount_amount
             total_amount -= global_discount_amount
 
-        # Créer la vente avec le numéro de facture final
+        # Créer la vente avec le numéro de facture final ET la branche
         sale = Sale(
             tenant_id=tenant_id,
             pharmacy_id=pharmacy.id,
+            branch_id=final_branch_id,  # ← AJOUT DE LA BRANCHE !
             reference=reference,
             customer_id=sale_data.customer_id,
             customer_name=client.nom_complet if client else sale_data.customer_name,
@@ -433,7 +488,7 @@ async def create_sale(
             total_tva=total_tva,
             total_amount=total_amount,
             status="pending" if sale_data.is_credit else "completed",
-            invoice_number=final_invoice_number,  # ← Numéro de facture unique
+            invoice_number=final_invoice_number,
             cancelled_at=None,
             cancelled_by=None,
             cancel_reason=None
@@ -490,7 +545,7 @@ async def create_sale(
             # Créer un mouvement de stock avec traçabilité du prix utilisé
             movement = StockMovement(
                 tenant_id=tenant_id,
-                branch_id=getattr(pharmacy, 'branch_id', None),
+                branch_id=final_branch_id,  # ← Utiliser la même branche
                 product_id=product.id,
                 pharmacy_id=pharmacy.id,
                 quantity_before=old_quantity,
@@ -536,6 +591,7 @@ async def create_sale(
 
         logger.info(
             f"Vente créée: {sale.reference} - Facture: {final_invoice_number} - "
+            f"Branche: {final_branch_id} - "
             f"{len(sale_items)} articles - Pharmacie: {pharmacy.name} par {current_user.email}"
         )
 
@@ -550,7 +606,7 @@ async def create_sale(
             },
             receipt_available=True,
             receipt_url=f"/api/v1/sales/{sale.id}/receipt",
-            generated_invoice_number=final_invoice_number  # Ajouter ce champ à SaleResponse
+            generated_invoice_number=final_invoice_number
         )
 
     except HTTPException:
@@ -563,7 +619,6 @@ async def create_sale(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             detail=f"Erreur création vente: {str(e)}"
         )
-
 
 # ========================
 # FONCTIONS UTILITAIRES POUR LES NUMÉROS DE FACTURE
@@ -1603,6 +1658,7 @@ async def get_sales(
     start_date: Optional[datetime] = Query(None, description="Date de début"),
     end_date: Optional[datetime] = Query(None, description="Date de fin"),
     pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
+    branch_id: Optional[UUID] = Query(None, description="Filtrer par branche"),  # ← AJOUTER CETTE LIGNE
     user_id: Optional[UUID] = Query(None, description="Filtrer par utilisateur (caissier)"),
     payment_method: Optional[str] = Query(None, description="Filtrer par méthode de paiement"),
     status: Optional[str] = Query(None, description="Filtrer par statut (completed, pending, cancelled)"),
@@ -1619,17 +1675,25 @@ async def get_sales(
     try:
         tenant_id = current_tenant.id if current_tenant else None
         
+        # Convertir branch_id en pharmacy_id si nécessaire
+        actual_pharmacy_id = pharmacy_id
+        if branch_id and not pharmacy_id:
+            # Récupérer la pharmacie parente de la branche
+            branch = db.query(Branch).filter(Branch.id == branch_id).first()
+            if branch:
+                actual_pharmacy_id = branch.parent_pharmacy_id
+        
         # Déterminer les pharmacies accessibles
         if current_user.role in ["super_admin", "superadmin", "admin", "gerant"]:
-            if pharmacy_id:
+            if actual_pharmacy_id:
                 # Vérifier que la pharmacie existe
-                pharmacy_check = db.query(Pharmacy).filter(Pharmacy.id == pharmacy_id).first()
+                pharmacy_check = db.query(Pharmacy).filter(Pharmacy.id == actual_pharmacy_id).first()
                 if not pharmacy_check:
                     raise HTTPException(
                         status_code=status.HTTP_404_NOT_FOUND,
                         detail="Pharmacie non trouvée"
                     )
-                pharmacy_ids = [pharmacy_id]
+                pharmacy_ids = [actual_pharmacy_id]
             else:
                 pharmacies_query = db.query(Pharmacy.id).filter(Pharmacy.is_active == True)
                 if tenant_id:
@@ -1638,22 +1702,24 @@ async def get_sales(
         else:
             # Vendeur, caissier - uniquement ses pharmacies
             accessible_pharmacies = get_user_accessible_pharmacies(db, current_user.id, tenant_id)
-            if pharmacy_id:
-                if pharmacy_id not in accessible_pharmacies:
+            if actual_pharmacy_id:
+                if actual_pharmacy_id not in accessible_pharmacies:
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail="Accès non autorisé à cette pharmacie"
                     )
-                pharmacy_ids = [pharmacy_id]
+                pharmacy_ids = [actual_pharmacy_id]
             else:
                 pharmacy_ids = accessible_pharmacies
         
         if not pharmacy_ids:
             return SaleListResponse(
+                items=[],
                 total=0,
                 page=skip // limit + 1 if limit > 0 else 1,
-                page_size=limit,
-                data=[]
+                size=0,
+                has_more=False,
+                page_size=limit
             )
         
         # Construction de la requête de base
@@ -1794,7 +1860,6 @@ async def get_sales(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur récupération des ventes: {str(e)}"
         )
-
 
 @router.get("/{sale_id}", response_model=SaleDetailResponse)
 async def get_sale_by_id(

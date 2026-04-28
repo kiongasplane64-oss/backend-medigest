@@ -89,6 +89,9 @@ class Purchase(Base):
     
     items = relationship("PurchaseItem", back_populates="purchase", cascade="all, delete-orphan")
     payments = relationship("PurchasePayment", back_populates="purchase", cascade="all, delete-orphan")
+    credit = relationship("PurchaseCredit", back_populates="purchase", uselist=False)
+    is_credit_purchase = Column(Boolean, default=False, comment="Achat effectué à crédit")
+    credit_config_id = Column(UUID(as_uuid=True), ForeignKey("supplier_credit_configs.id"), nullable=True)
 
     __table_args__ = (
         Index("ix_purchases_tenant_status", "tenant_id", "status"),

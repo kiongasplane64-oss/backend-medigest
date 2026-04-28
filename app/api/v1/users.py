@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional, Dict, Any
 import logging
 import traceback
+from sqlalchemy import or_
 import sys
 from datetime import datetime, timedelta
 from uuid import UUID
@@ -13,12 +14,23 @@ from app.models.user import User
 from app.models.user_pharmacy import UserPharmacy
 from app.models.pharmacy import Pharmacy
 from app.models.branch import Branch
+from app.models.user_branch import UserBranch
 from app.schemas.user import UserCreate, UserUpdate, UserResponse, UserListSchema
 from app.core.security import hash_password, verify_password
 from app.api.v1.auth import get_current_user
 from app.services.audit_service import log_action
 from app.models.tenant import Tenant
 from sqlalchemy import func
+from app.api.deps import (
+    get_current_tenant,  
+    get_current_user,
+    get_current_active_user,
+    require_role,
+    require_permission,
+    get_current_pharmacy_entity,
+    get_current_branch_entity,
+    can_user_access_pharmacy
+)
 
 # Logging setup
 logging.basicConfig(
@@ -1204,3 +1216,82 @@ def get_my_profile_with_slash(
 ):
     """Alias pour GET /users/me/profile avec slash"""
     return get_my_profile(db, current_user)
+
+# Dans app/api/v1/users.py, ajoutez ou corrigez l'endpoint:
+
+@router.get("/sellers")
+async def get_sellers(
+    branch_id: Optional[str] = Query(None, description="Filtrer par branche (UUID)"),
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+):
+    """
+    Récupère la liste des vendeurs/caissiers.
+    """
+    try:
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        # Convertir branch_id en UUID si fourni
+        branch_uuid = None
+        if branch_id:
+            try:
+                branch_uuid = UUID(branch_id)
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Format d'ID de branche invalide: {branch_id}"
+                )
+        
+        # Rôles autorisés pour la vente
+        allowed_roles = ["vendeur", "caissier", "gerant", "admin", "super_admin", "superadmin"]
+        
+        # Requête de base
+        query = db.query(User).filter(
+            User.actif == True,
+            User.role.in_(allowed_roles)
+        )
+        
+        if tenant_id:
+            query = query.filter(User.tenant_id == tenant_id)
+        
+        # Filtrer par branche si spécifiée
+        if branch_uuid:
+            from app.models.user_branch import UserBranch
+            query = query.filter(
+                or_(
+                    User.branch_id == branch_uuid,
+                    User.id.in_(
+                        db.query(UserBranch.user_id).filter(
+                            UserBranch.branch_id == branch_uuid,
+                            UserBranch.is_active == True
+                        )
+                    )
+                )
+            )
+        
+        users = query.order_by(User.nom_complet).all()
+        
+        return {
+            "success": True,
+            "users": [
+                {
+                    "id": str(u.id),
+                    "email": u.email,
+                    "name": u.nom_complet,
+                    "role": u.role,
+                    "is_active": u.actif
+                }
+                for u in users
+            ],
+            "total": len(users)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur récupération vendeurs: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur récupération vendeurs: {str(e)}"
+        )

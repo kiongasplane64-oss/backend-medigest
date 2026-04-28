@@ -21,6 +21,7 @@ from app.api.v1.endpoints.profit import router as profit_router
 from app.api.v1.endpoints.admin_sync import router as admin_sync
 from app.api.v1.endpoints.returns import router as returns_router
 from app.api.v1.endpoints import invoices
+from app.api.v1.endpoints.sellers import router as sellers_router
 
 
 
@@ -58,3 +59,4 @@ api_router.include_router(admin_sync)
 
 # Ajouter le router
 api_router.include_router(invoices.router, prefix="/invoices", tags=["Factures"])
+api_router.include_router(sellers_router, prefix="/users", tags=["Users"])

@@ -20,6 +20,7 @@ class Sale(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
     pharmacy_id = Column(UUID(as_uuid=True), ForeignKey("pharmacies.id"), nullable=False, index=True)
+    
 
     reference = Column(String(50), unique=True, nullable=False, index=True)
 
@@ -111,6 +112,7 @@ class Sale(Base):
         uselist=False,
     )
     returns = relationship("Return", back_populates="sale", cascade="all, delete-orphan")
+    credit_allocations = relationship("SaleCreditAllocation", back_populates="sale")
 
     # CORRECTION: Index mis à jour pour utiliser customer_id 
     __table_args__ = (
@@ -236,6 +238,7 @@ class SaleItem(Base):
     sale = relationship("Sale", back_populates="items", foreign_keys=[sale_id])
     tenant = relationship("Tenant")
     product = relationship("Product", foreign_keys=[product_id])
+    credit_allocations = relationship("SaleCreditAllocation", back_populates="sale_item")
 
     __table_args__ = (
         Index("ix_sale_items_product", "tenant_id", "product_id"),

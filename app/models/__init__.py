@@ -54,6 +54,18 @@ from app.models.trash_bin import TrashBin
 from app.models.user_expense import UserExpense 
 from app.models.return_product import Return, ReturnItem
 from app.models.user_branch import UserBranch
+from .supplier_credit import (
+    SupplierCreditConfig,
+    SupplierDebt,
+    PurchaseCredit,
+    ProductCreditItem,
+    SaleCreditAllocation,
+    SupplierCreditTransaction,
+    AdjustedCapital,
+    CreditStatus,
+    PaymentFrequency,
+    ProductOwnershipStatus
+)
 
 __all__ = [
     # Core
@@ -117,5 +129,15 @@ __all__ = [
     "UserExpense",
     "Return",
     "ReturnItem",
-    "UserBranch"
+    "UserBranch",
+    "SupplierCreditConfig",
+    "SupplierDebt",
+    "PurchaseCredit",
+    "ProductCreditItem",
+    "SaleCreditAllocation",
+    "SupplierCreditTransaction",
+    "AdjustedCapital",
+    "CreditStatus",
+    "PaymentFrequency",
+    "ProductOwnershipStatus"
 ]

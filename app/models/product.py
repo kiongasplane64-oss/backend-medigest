@@ -152,6 +152,10 @@ class Product(Base):
     main_supplier = Column(String(200), nullable=True)
     supplier_code = Column(String(100), nullable=True)
     supplier_price = Column(Numeric(12, 2), nullable=True)
+    credit_items = relationship("ProductCreditItem", back_populates="product")
+    ownership_status = Column(String(30), default="fully_owned", 
+                         comment="Statut de propriété: fully_owned, credit, partial_credit, consignment")
+    has_credit_portion = Column(Boolean, default=False, comment="Le produit a-t-il une partie à crédit?")
 
     # =====================================
     # MÉTADONNÉES ET MÉDIAS

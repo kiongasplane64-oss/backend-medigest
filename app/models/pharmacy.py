@@ -55,6 +55,7 @@ class Pharmacy(Base):
         foreign_keys=[subscription_id]
     )
     returns = relationship("Return", back_populates="pharmacy", cascade="all, delete-orphan")
+    adjusted_capitals = relationship("AdjustedCapital", back_populates="pharmacy")
     # =========================
     # CONFIGURATION COMPLÈTE (harmonisée avec les schémas)
     # =========================

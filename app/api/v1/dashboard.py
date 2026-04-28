@@ -1,4 +1,4 @@
-# app/api/v1/dashboard.py
+# app/api/v1/endpoints/dashboard.py
 """
 API de statistiques pour le tableau de bord principal (Dashboard.tsx)
 Fournit toutes les données nécessaires à l'affichage des KPI, graphiques et alertes
@@ -28,7 +28,6 @@ from app.models.customer import Customer
 from app.models.cost import Supplier
 from app.models.purchase import Purchase, PurchaseItem
 from app.models.debt import Debt
-from app.models.return_product import Return, ReturnItem, ReturnStatus, ReturnType
 from app.models.transfert import ProductTransfer, TransferStatus
 from app.api.deps import (
     get_current_tenant,
@@ -120,17 +119,12 @@ class DashboardStatsResponse(BaseModel):
     pending_orders: int
     recent_purchases: List[Dict[str, Any]]
     
-    # Retours
-    monthly_returns: float
-    pending_returns: int
-    total_returns_value: float
-    
     # Transferts
-    pending_transfers: int
-    in_transit_transfers: int
+   #pending_transfers: int
+   #in_transit_transfers: int
     
     # Transactions récentes
-    recent_transactions: List[Dict[str, Any]]
+   #recent_transactions: List[Dict[str, Any]]
     
     # Alertes stock
     low_stock_products: List[Dict[str, Any]]
@@ -386,13 +380,8 @@ async def get_dashboard_stats(
             db, tenant_id, branch.id, current_start_dt, current_end_dt
         )
         
-        # 6. STATISTIQUES DES RETOURS
-        return_stats = _get_return_stats_by_branch(
-            db, tenant_id, branch.id, current_start_dt, current_end_dt
-        )
-        
         # 7. STATISTIQUES DES TRANSFERTS
-        transfer_stats = _get_transfer_stats_by_branch(db, tenant_id, branch.id)
+       #transfer_stats = _get_transfer_stats_by_branch(db, tenant_id, branch.id)
         
         # 8. TRANSACTIONS RÉCENTES
         recent_transactions = _get_recent_transactions_by_branch(
@@ -483,17 +472,12 @@ async def get_dashboard_stats(
             pending_orders=purchase_stats["pending_orders"],
             recent_purchases=recent_purchases,
             
-            # Retours
-            monthly_returns=return_stats["monthly_returns"],
-            pending_returns=return_stats["pending_returns"],
-            total_returns_value=return_stats["total_returns_value"],
-            
             # Transferts
-            pending_transfers=transfer_stats["pending_transfers"],
-            in_transit_transfers=transfer_stats["in_transit_transfers"],
+            #ending_transfers=transfer_stats["pending_transfers"],
+            #n_transit_transfers=transfer_stats["in_transit_transfers"],
             
             # Transactions récentes
-            recent_transactions=recent_transactions,
+           #recent_transactions=recent_transactions,
             
             # Alertes stock
             low_stock_products=low_stock_products,
@@ -924,11 +908,8 @@ def _get_empty_stats_response() -> DashboardStatsResponse:
         suppliers_count=0,
         pending_orders=0,
         recent_purchases=[],
-        monthly_returns=0,
-        pending_returns=0,
-        total_returns_value=0,
-        pending_transfers=0,
-        in_transit_transfers=0,
+       #pending_transfers=0,
+       #in_transit_transfers=0,
         recent_transactions=[],
         low_stock_products=[],
         expiring_products=[],
@@ -1048,7 +1029,7 @@ def _get_stock_stats_by_branch(
     
     potential_profit = total_selling_value - total_purchase_value
     
-    # Taux de rotation
+    # Taux de rotation - CORRECTION : Utiliser Sale pour filtrer par branch_id
     stock_turnover = 0
     if total_quantity > 0:
         thirty_days_ago = datetime.utcnow() - timedelta(days=30)
@@ -1056,7 +1037,7 @@ def _get_stock_stats_by_branch(
             Sale, Sale.id == SaleItem.sale_id
         ).filter(
             SaleItem.tenant_id == tenant_id,
-            SaleItem.branch_id == branch_id,
+            Sale.branch_id == branch_id,  # Correction : filtrer sur Sale.branch_id
             Sale.status == "completed",
             Sale.created_at >= thirty_days_ago
         ).scalar() or 0
@@ -1074,7 +1055,6 @@ def _get_stock_stats_by_branch(
         "expiring_soon_count": expiring_soon_count,
         "stock_turnover": stock_turnover
     }
-
 
 def _get_expense_stats_by_branch(
     db: Session,
@@ -1123,10 +1103,14 @@ def _get_debt_stats_by_branch(
 ) -> Dict[str, Any]:
     """Récupère les statistiques des dettes pour une branche spécifique"""
     
-    debts = db.query(Debt).filter(
+    # Debt est lié à Sale, qui a branch_id
+    debts = db.query(Debt).join(
+        Sale, Debt.sale_id == Sale.id
+    ).filter(
         Debt.tenant_id == tenant_id,
-        Debt.branch_id == branch_id,
-        Debt.is_active == True
+        Sale.branch_id == branch_id,
+        Debt.is_active == True,
+        Sale.status == "completed"
     ).all()
     
     total_debts = sum(safe_decimal_to_float(d.remaining_amount) for d in debts)
@@ -1152,7 +1136,6 @@ def _get_debt_stats_by_branch(
         "monthly_debts": round(monthly_debts, 2)
     }
 
-
 def _get_purchase_stats_by_branch(
     db: Session,
     tenant_id: Optional[UUID],
@@ -1162,9 +1145,15 @@ def _get_purchase_stats_by_branch(
 ) -> Dict[str, Any]:
     """Récupère les statistiques des achats pour une branche spécifique"""
     
+    # Purchase a pharmacy_id, pas branch_id
+    # Récupérer la pharmacy parente de la branche
+    branch = db.query(Branch).filter(Branch.id == branch_id).first()
+    if not branch:
+        return {"monthly_purchases": 0, "daily_purchases": 0, "suppliers_count": 0, "pending_orders": 0}
+    
     purchases = db.query(Purchase).filter(
         Purchase.tenant_id == tenant_id,
-        Purchase.branch_id == branch_id,
+        Purchase.pharmacy_id == branch.parent_pharmacy_id,
         Purchase.status == "completed",
         Purchase.created_at >= start_dt,
         Purchase.created_at <= end_dt
@@ -1178,7 +1167,7 @@ def _get_purchase_stats_by_branch(
     
     daily_purchases = db.query(Purchase).filter(
         Purchase.tenant_id == tenant_id,
-        Purchase.branch_id == branch_id,
+        Purchase.pharmacy_id == branch.parent_pharmacy_id,
         Purchase.status == "completed",
         Purchase.created_at >= today_start,
         Purchase.created_at <= today_end
@@ -1189,15 +1178,15 @@ def _get_purchase_stats_by_branch(
     # Nombre de fournisseurs
     suppliers_count = db.query(func.count(func.distinct(Purchase.supplier_id))).filter(
         Purchase.tenant_id == tenant_id,
-        Purchase.branch_id == branch_id,
+        Purchase.pharmacy_id == branch.parent_pharmacy_id,
         Purchase.status == "completed"
     ).scalar() or 0
     
     # Commandes en attente
     pending_orders = db.query(Purchase).filter(
         Purchase.tenant_id == tenant_id,
-        Purchase.branch_id == branch_id,
-        Purchase.status.in_(["pending", "ordered"])
+        Purchase.pharmacy_id == branch.parent_pharmacy_id,
+        Purchase.status.in_(["pending", "ordered", "draft"])
     ).count()
     
     return {
@@ -1206,51 +1195,6 @@ def _get_purchase_stats_by_branch(
         "suppliers_count": suppliers_count,
         "pending_orders": pending_orders
     }
-
-
-def _get_return_stats_by_branch(
-    db: Session,
-    tenant_id: Optional[UUID],
-    branch_id: UUID,
-    start_dt: datetime,
-    end_dt: datetime
-) -> Dict[str, Any]:
-    """Récupère les statistiques des retours pour une branche spécifique"""
-    
-    # Retours du mois
-    monthly_returns_obj = db.query(Return).filter(
-        Return.tenant_id == tenant_id,
-        Return.branch_id == branch_id,
-        Return.created_at >= start_dt,
-        Return.created_at <= end_dt,
-        Return.is_active == True
-    ).all()
-    
-    monthly_returns = sum(safe_decimal_to_float(r.total_amount) for r in monthly_returns_obj)
-    
-    # Retours en attente
-    pending_returns = db.query(Return).filter(
-        Return.tenant_id == tenant_id,
-        Return.branch_id == branch_id,
-        Return.status == ReturnStatus.PENDING,
-        Return.is_active == True
-    ).count()
-    
-    # Valeur totale des retours
-    total_returns_value = db.query(Return).filter(
-        Return.tenant_id == tenant_id,
-        Return.branch_id == branch_id,
-        Return.is_active == True
-    ).all()
-    
-    total_returns_sum = sum(safe_decimal_to_float(r.total_amount) for r in total_returns_value)
-    
-    return {
-        "monthly_returns": round(monthly_returns, 2),
-        "pending_returns": pending_returns,
-        "total_returns_value": round(total_returns_sum, 2)
-    }
-
 
 def _get_transfer_stats_by_branch(
     db: Session,
@@ -1374,9 +1318,11 @@ def _get_recent_debts_by_branch(
 ) -> List[Dict[str, Any]]:
     """Récupère les dettes récentes pour une branche"""
     
-    debts = db.query(Debt).filter(
+    debts = db.query(Debt).join(
+        Sale, Debt.sale_id == Sale.id
+    ).filter(
         Debt.tenant_id == tenant_id,
-        Debt.branch_id == branch_id,
+        Sale.branch_id == branch_id,
         Debt.is_active == True
     ).order_by(desc(Debt.created_at)).limit(limit).all()
     
@@ -1389,7 +1335,6 @@ def _get_recent_debts_by_branch(
         for d in debts
     ]
 
-
 def _get_recent_purchases_by_branch(
     db: Session,
     tenant_id: Optional[UUID],
@@ -1398,9 +1343,13 @@ def _get_recent_purchases_by_branch(
 ) -> List[Dict[str, Any]]:
     """Récupère les achats récents pour une branche"""
     
+    branch = db.query(Branch).filter(Branch.id == branch_id).first()
+    if not branch:
+        return []
+    
     purchases = db.query(Purchase).filter(
         Purchase.tenant_id == tenant_id,
-        Purchase.branch_id == branch_id,
+        Purchase.pharmacy_id == branch.parent_pharmacy_id,
         Purchase.status == "completed"
     ).order_by(desc(Purchase.created_at)).limit(limit).all()
     
@@ -1413,7 +1362,6 @@ def _get_recent_purchases_by_branch(
         for p in purchases
     ]
 
-
 def _get_expense_categories_by_branch(
     db: Session,
     tenant_id: Optional[UUID],
@@ -1423,6 +1371,10 @@ def _get_expense_categories_by_branch(
     limit: int = 5
 ) -> List[Dict[str, Any]]:
     """Récupère les dépenses par catégorie pour une branche"""
+    
+    branch = db.query(Branch).filter(Branch.id == branch_id).first()
+    if not branch:
+        return []
     
     results = db.query(
         Expense.expense_type,
@@ -1442,7 +1394,6 @@ def _get_expense_categories_by_branch(
         }
         for r in results
     ]
-
 
 def _get_active_users_count_by_branch(
     db: Session,

@@ -569,6 +569,7 @@ class Supplier(Base):
     notes = Column(Text, nullable=True)
     supplier_metadata = Column(JSON, default=dict)
     
+    
     # =====================================
     # TIMESTAMPS
     # =====================================
@@ -582,6 +583,11 @@ class Supplier(Base):
     tenant = relationship("Tenant", back_populates="suppliers")
     costs = relationship("Cost", back_populates="supplier")
     purchases = relationship("Purchase", back_populates="supplier", overlaps="supplier_purchases") 
+    credit_configs = relationship("SupplierCreditConfig", back_populates="supplier", 
+                              cascade="all, delete-orphan")
+    debt = relationship("SupplierDebt", back_populates="supplier", uselist=False)
+    purchase_credits = relationship("PurchaseCredit", back_populates="supplier")
+    credit_transactions = relationship("SupplierCreditTransaction", back_populates="supplier")
     
     # =====================================
     # INDEXES
