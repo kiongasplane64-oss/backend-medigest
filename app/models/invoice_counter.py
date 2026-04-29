@@ -11,6 +11,7 @@ class InvoiceCounter(Base):
     id = Column(Integer, primary_key=True, index=True)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
     pharmacy_id = Column(UUID(as_uuid=True), ForeignKey("pharmacies.id", ondelete="CASCADE"), nullable=False)
+    branch_id = Column(UUID(as_uuid=True), nullable=False)
     date = Column(Date, nullable=False)
     current_number = Column(Integer, default=1, nullable=False)
     last_invoice_date = Column(Date, nullable=True)

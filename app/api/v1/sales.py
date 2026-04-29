@@ -394,7 +394,7 @@ async def create_sale(
                 # Conflit détecté - générer un nouveau numéro
                 logger.warning(f"⚠️ Conflit numéro facture {sale_data.invoice_number} - Génération automatique")
                 final_invoice_number = await generate_unique_invoice_number(
-                    db, tenant_id, pharmacy.id
+                    db, tenant_id, pharmacy.id, final_branch_id 
                 )
             else:
                 # Numéro valide et unique
@@ -403,7 +403,7 @@ async def create_sale(
         else:
             # Aucun numéro fourni - génération automatique
             final_invoice_number = await generate_unique_invoice_number(
-                db, tenant_id, pharmacy.id
+                db, tenant_id, pharmacy.id, final_branch_id 
             )
             logger.info(f"📋 Numéro facture généré automatiquement: {final_invoice_number}")
 
@@ -628,22 +628,28 @@ async def generate_unique_invoice_number(
     db: Session,
     tenant_id: UUID,
     pharmacy_id: UUID,
+    branch_id: UUID,  # ← Ajouter branch_id
     max_attempts: int = 5
 ) -> str:
     """
-    Génère un numéro de facture unique pour une pharmacie.
-    Format: INV-YYYYMMDD-XXXX (ex: INV-20260423-0042)
+    Génère un numéro de facture unique pour une branche spécifique.
+    Format: INV-{branch_code}-{YYYYMMDD}-{XXXX}
     """
     from app.models.invoice_counter import InvoiceCounter
     
     today = datetime.now().date()
     date_str = today.strftime("%Y%m%d")
     
+    # Récupérer le code de la branche (3-4 lettres)
+    branch = db.query(Branch).filter(Branch.id == branch_id).first()
+    branch_code = branch.code if branch and branch.code else branch.name[:4].upper() if branch.name else "BR"
+    
     for attempt in range(max_attempts):
-        # Récupérer ou créer le compteur
+        # Récupérer ou créer le compteur pour cette branche
         counter = db.query(InvoiceCounter).filter(
             InvoiceCounter.tenant_id == tenant_id,
             InvoiceCounter.pharmacy_id == pharmacy_id,
+            InvoiceCounter.branch_id == branch_id,  # ← Filtrer par branche
             InvoiceCounter.date == today
         ).first()
         
@@ -651,24 +657,25 @@ async def generate_unique_invoice_number(
             counter = InvoiceCounter(
                 tenant_id=tenant_id,
                 pharmacy_id=pharmacy_id,
+                branch_id=branch_id,  # ← Ajouter branch_id
                 date=today,
                 current_number=1
             )
             db.add(counter)
             db.flush()
         
-        # Générer le numéro
+        # Générer le numéro avec code branche
         sequence = counter.current_number
-        invoice_number = f"INV-{date_str}-{sequence:04d}"
+        invoice_number = f"INV-{branch_code}-{date_str}-{sequence:04d}"
         
-        # Vérifier l'unicité
+        # Vérifier l'unicité (maintenant unique par branche)
         existing = db.query(Sale).filter(
             Sale.invoice_number == invoice_number,
-            Sale.tenant_id == tenant_id
+            Sale.tenant_id == tenant_id,
+            Sale.branch_id == branch_id  # ← Vérifier aussi par branche
         ).first()
         
         if not existing:
-            # Incrémenter le compteur pour la prochaine fois
             counter.current_number += 1
             db.flush()
             return invoice_number
@@ -677,10 +684,9 @@ async def generate_unique_invoice_number(
         counter.current_number += 1
         logger.warning(f"⚠️ Conflit sur {invoice_number}, tentative {attempt + 2}/{max_attempts}")
     
-    # Fallback avec timestamp
+    # Fallback
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
-    return f"INV-{timestamp}"
-
+    return f"INV-{branch_code}-{timestamp}"
 
 async def increment_invoice_counter(
     db: Session,
