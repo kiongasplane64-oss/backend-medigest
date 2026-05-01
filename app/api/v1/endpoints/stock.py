@@ -39,7 +39,8 @@ from app.api.deps import (
     get_current_pharmacy_entity,
     get_current_branch_entity,
     require_permission,
-    can_user_access_pharmacy
+    can_user_access_pharmacy,
+    verify_branch_access
 )
 
 # Import des services
@@ -122,6 +123,8 @@ except ImportError:
             }
         
         def get_stock_alerts(self, pharmacy_id=None):
+            branch: Branch = Depends(verify_branch_access),
+            db: Session = Depends(get_db),
             alerts = {"critical_alerts": [], "warning_alerts": []}
             
             # Rupture de stock

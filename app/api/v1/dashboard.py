@@ -265,7 +265,15 @@ def calculate_trend(current: float, previous: float) -> float:
 
 
 def get_date_range(period: str = "month"):
-    """Retourne les dates de début et fin selon la période"""
+    """
+    Retourne les dates de début et fin selon la période
+    
+    Args:
+        period: "day", "week", "month", ou autre (30 jours par défaut)
+    
+    Returns:
+        tuple: (start_date, end_date) en tant que date (pas datetime)
+    """
     today = date.today()
     
     if period == "day":
@@ -276,16 +284,17 @@ def get_date_range(period: str = "month"):
         end_date = start_date + timedelta(days=6)
     elif period == "month":
         start_date = today.replace(day=1)
+        # Calculer le dernier jour du mois
         if start_date.month == 12:
             end_date = start_date.replace(year=start_date.year + 1, month=1, day=1) - timedelta(days=1)
         else:
             end_date = start_date.replace(month=start_date.month + 1, day=1) - timedelta(days=1)
     else:
+        # Période par défaut: 30 jours
         start_date = today - timedelta(days=30)
         end_date = today
     
     return start_date, end_date
-
 
 # =======================
 # ROUTES PRINCIPALES
@@ -927,9 +936,13 @@ def _get_sales_stats_by_branch(
     start_dt: datetime,
     end_dt: datetime
 ) -> Dict[str, Any]:
-    """Récupère les statistiques des ventes pour une branche spécifique"""
+    """
+    Récupère les statistiques des ventes pour une branche spécifique
+    Retourne les stats pour la période demandée ET pour le jour actuel
+    """
     
-    query = db.query(
+    # 1. STATS POUR LA PÉRIODE DEMANDÉE (mois/semaine/personnalisée)
+    period_query = db.query(
         func.coalesce(func.sum(Sale.total_amount), 0).label("total_sales"),
         func.count(Sale.id).label("sales_count")
     ).filter(
@@ -940,12 +953,59 @@ def _get_sales_stats_by_branch(
         Sale.created_at <= end_dt
     )
     
-    result = query.first()
+    period_result = period_query.first()
+    period_total_sales = safe_decimal_to_float(period_result.total_sales if period_result else 0)
+    period_sales_count = safe_int(period_result.sales_count if period_result else 0)
     
-    total_sales = safe_decimal_to_float(result.total_sales if result else 0)
-    sales_count = safe_int(result.sales_count if result else 0)
+    # 2. STATS POUR LE JOUR ACTUEL
+    today_start = datetime.combine(date.today(), datetime.min.time())
+    today_end = datetime.combine(date.today(), datetime.max.time())
     
-    # Calcul du bénéfice net
+    daily_query = db.query(
+        func.coalesce(func.sum(Sale.total_amount), 0).label("daily_total"),
+        func.count(Sale.id).label("daily_count")
+    ).filter(
+        Sale.tenant_id == tenant_id,
+        Sale.branch_id == branch_id,
+        Sale.status == "completed",
+        Sale.created_at >= today_start,
+        Sale.created_at <= today_end
+    )
+    
+    daily_result = daily_query.first()
+    daily_total_sales = safe_decimal_to_float(daily_result.daily_total if daily_result else 0)
+    daily_sales_count = safe_int(daily_result.daily_count if daily_result else 0)
+    
+    # 3. CALCUL DES BÉNÉFICES
+    # Bénéfice pour la période
+    period_profit = _calculate_profit_for_period(db, tenant_id, branch_id, start_dt, end_dt)
+    
+    # Bénéfice pour le jour
+    daily_profit = _calculate_profit_for_period(db, tenant_id, branch_id, today_start, today_end)
+    
+    return {
+        # Stats de la période (mois)
+        "monthly_sales": period_total_sales,
+        "monthly_transactions": period_sales_count,
+        "net_profit": period_profit,
+        
+        # Stats du jour
+        "daily_sales": daily_total_sales,
+        "daily_transactions": daily_sales_count,
+        "daily_profit": daily_profit
+    }
+
+
+def _calculate_profit_for_period(
+    db: Session,
+    tenant_id: Optional[UUID],
+    branch_id: UUID,
+    start_dt: datetime,
+    end_dt: datetime
+) -> float:
+    """Calcule le bénéfice net pour une période donnée"""
+    
+    # Récupérer les IDs des ventes de la période
     sale_ids = db.query(Sale.id).filter(
         Sale.tenant_id == tenant_id,
         Sale.branch_id == branch_id,
@@ -956,35 +1016,34 @@ def _get_sales_stats_by_branch(
     
     sale_ids_list = [s.id for s in sale_ids]
     
-    net_profit = 0
-    if sale_ids_list:
-        sale_items = db.query(SaleItem).filter(
-            SaleItem.sale_id.in_(sale_ids_list),
-            SaleItem.tenant_id == tenant_id
-        ).all()
-        
-        total_cost = Decimal('0')
-        for item in sale_items:
-            product = db.query(Product).filter(
-                Product.id == item.product_id,
-                Product.tenant_id == tenant_id
-            ).first()
-            if product:
-                total_cost += Decimal(str(product.purchase_price)) * Decimal(str(item.quantity))
-        
-        net_profit = safe_decimal_to_float(Decimal(str(total_sales)) - total_cost)
+    if not sale_ids_list:
+        return 0.0
     
-    days_diff = max(1, (end_dt - start_dt).days)
+    # Récupérer le total des ventes
+    total_sales_result = db.query(func.coalesce(func.sum(Sale.total_amount), 0)).filter(
+        Sale.id.in_(sale_ids_list)
+    ).scalar() or 0
     
-    return {
-        "daily_sales": total_sales,
-        "monthly_sales": total_sales,
-        "daily_transactions": sales_count,
-        "monthly_transactions": sales_count,
-        "daily_profit": net_profit / days_diff,
-        "net_profit": net_profit
-    }
-
+    total_sales = safe_decimal_to_float(total_sales_result)
+    
+    # Calculer le coût des produits vendus
+    sale_items = db.query(SaleItem).filter(
+        SaleItem.sale_id.in_(sale_ids_list),
+        SaleItem.tenant_id == tenant_id
+    ).all()
+    
+    total_cost = Decimal('0')
+    for item in sale_items:
+        product = db.query(Product).filter(
+            Product.id == item.product_id,
+            Product.tenant_id == tenant_id
+        ).first()
+        if product:
+            total_cost += Decimal(str(product.purchase_price)) * Decimal(str(item.quantity))
+    
+    net_profit = safe_decimal_to_float(Decimal(str(total_sales)) - total_cost)
+    
+    return net_profit
 
 def _get_stock_stats_by_branch(
     db: Session,

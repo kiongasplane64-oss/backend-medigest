@@ -1,4 +1,5 @@
-# app/api/v1/subscriptions.py
+# app/api/v1/subscriptions.py - VERSION CORRIGEE
+
 """
 Endpoints de gestion des abonnements (VERSION BRANCHE).
 - Abonnement lié à la BRANCHE (pas à la pharmacie)
@@ -41,13 +42,13 @@ PLAN_CONFIG = {
         "name": "Essai",
         "price_monthly": 0,
         "price_yearly": 0,
-        "max_products": 2000,
-        "max_users": 5,
-        "max_storage_mb": 100,
+        "max_products": 3000,
+        "max_users": 10,
+        "max_storage_mb": 2048,
         "trial_days": 14,
         "features": [
-            "5 Utilisateurs",
-            "2000 Produits",
+            "10 Utilisateurs",
+            "3000 Produits",
             "14 jours d'essai",
             "Support prioritaire"
         ]
@@ -61,7 +62,7 @@ PLAN_CONFIG = {
         "max_storage_mb": 500,
         "features": [
             "5 Utilisateurs",
-            "1500 Produits",
+            "3000 Produits",
             "Support email"
         ]
     },
@@ -74,7 +75,7 @@ PLAN_CONFIG = {
         "max_storage_mb": 2000,
         "features": [
             "20 Utilisateurs",
-            "3000 Produits",
+            "4000 Produits",
             "Transferts inter-stocks",
             "Support prioritaire"
         ]
@@ -88,7 +89,7 @@ PLAN_CONFIG = {
         "max_storage_mb": 5000,
         "features": [
             "20 Utilisateurs",
-            "10000 Produits",
+            "15000 Produits",
             "API d'inventaire",
             "Support 24/7"
         ]
@@ -97,8 +98,8 @@ PLAN_CONFIG = {
         "name": "Infinite",
         "price_monthly": 30,
         "price_yearly": 288,
-        "max_products": 0,  # 0 = illimité
-        "max_users": 0,    # 0 = illimité
+        "max_products": 0,
+        "max_users": 0,
         "max_storage_mb": 10000,
         "features": [
             "Utilisateurs illimités",
@@ -149,11 +150,19 @@ def get_branch_subscription_by_id(db: Session, branch_id: UUID) -> Optional[Bran
     ).first()
 
 
+# =============================================================================
+# FONCTION CORRIGEE - get_branch_limits
+# =============================================================================
+
 def get_branch_limits(db: Session, user: User) -> Dict[str, Any]:
-    """Récupère les limites de la branche active."""
+    """
+    Récupère les limites de la branche active.
+    VERSION CORRIGEE - sans la mauvaise relation Branch.users
+    """
     
-    # Vérifier que user a une branche active
+    # Verifier que l'utilisateur a une branche active
     if not user or not user.active_branch_id:
+        logger.warning(f"Utilisateur {user.email if user else 'unknown'} sans branche active")
         return {
             "has_subscription": False,
             "is_active": False,
@@ -169,10 +178,14 @@ def get_branch_limits(db: Session, user: User) -> Dict[str, Any]:
         }
     
     try:
-        # Récupérer la branche
-        branch = db.query(Branch).filter(Branch.id == user.active_branch_id).first()
+        # Recuperer la branche
+        branch = db.query(Branch).filter(
+            Branch.id == user.active_branch_id,
+            Branch.is_active == True
+        ).first()
         
         if not branch:
+            logger.warning(f"Branche {user.active_branch_id} non trouvee pour {user.email}")
             return {
                 "has_subscription": False,
                 "is_active": False,
@@ -187,10 +200,11 @@ def get_branch_limits(db: Session, user: User) -> Dict[str, Any]:
                 "access_mode": "read_only"
             }
         
-        # REQUÊTE DIRECTE sur BranchSubscription
+        # Recuperer l'abonnement de la branche
         subscription = get_branch_subscription_by_id(db, branch.id)
         
         if not subscription:
+            logger.info(f"Pas d'abonnement pour branche {branch.id}")
             return {
                 "has_subscription": False,
                 "is_active": False,
@@ -205,12 +219,14 @@ def get_branch_limits(db: Session, user: User) -> Dict[str, Any]:
                 "access_mode": "read_only"
             }
         
-        # Vérifier si l'abonnement est actif
+        # Verifier si l'abonnement est actif
         is_active = subscription.is_active()
         
-        # Récupérer le nom du plan
+        # Recuperer le nom du plan
         plan_value = subscription.plan.value if hasattr(subscription.plan, 'value') else str(subscription.plan)
         plan_config = get_plan_config(plan_value)
+        
+        logger.info(f"Abonnement trouve pour branche {branch.id}: plan={plan_value}, is_active={is_active}, end_date={subscription.end_date}")
         
         return {
             "has_subscription": True,
@@ -260,8 +276,11 @@ def get_current_usage(db: Session, user: User) -> Dict[str, Any]:
         Product.branch_id == user.active_branch_id
     ).count()
     
-    users_count = db.query(UserModel).filter(
-        UserModel.branch_id == user.active_branch_id
+    # Compter les utilisateurs associes a cette branche via user_branches
+    from app.models.user_branch import UserBranch
+    users_count = db.query(UserBranch).filter(
+        UserBranch.branch_id == user.active_branch_id,
+        UserBranch.is_active == True
     ).count()
     
     return {
@@ -292,11 +311,12 @@ async def get_subscription_status(
     logger.info("Demande du statut abonnement pour %s", current_user.email)
     
     if not current_user.active_branch_id:
+        logger.warning(f"Utilisateur {current_user.email} sans branche active")
         return {
             "success": True,
             "has_subscription": False,
             "is_active": False,
-            "message": "Aucune branche active sélectionnée",
+            "message": "Aucune branche active selectionnee",
             "access_mode": "read_only",
             "user": {
                 "id": str(current_user.id),
@@ -320,12 +340,14 @@ async def get_subscription_status(
     has_subscription = limits.get("has_subscription", False)
     access_mode = "full" if is_active else "read_only"
     
+    logger.info(f"Statut pour {current_user.email}: has_subscription={has_subscription}, is_active={is_active}")
+    
     return {
         "success": True,
         "has_subscription": has_subscription,
         "is_active": is_active,
         "access_mode": access_mode,
-        "message": "Abonnement actif" if is_active else "Abonnement inactif ou expiré",
+        "message": "Abonnement actif" if is_active else "Abonnement inactif ou expire",
         "user": {
             "id": str(current_user.id),
             "email": current_user.email,
@@ -360,7 +382,6 @@ async def get_subscription_status(
             "requires_subscription": not has_subscription
         }
     }
-
 
 @router.get("/usage", response_model=Dict[str, Any])
 async def get_subscription_usage(

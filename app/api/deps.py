@@ -25,6 +25,7 @@ from app.models.pharmacy import Pharmacy
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.models.user_pharmacy import UserPharmacy
+from app.services.branch_subscription_utils import get_branch_subscription_by_id, get_branch_limits_from_subscription
 from app.services.subscription_service import (
     can_user_access_feature,
     check_tenant_limits,
@@ -282,7 +283,6 @@ def get_current_user(
             detail="Erreur interne d'authentification",
         )
 
-
 def get_current_active_user(
     current_user: User = Depends(get_current_user),
 ) -> User:
@@ -528,23 +528,23 @@ async def require_active_subscription(
     active_branch_id = getattr(current_user, "active_branch_id", None)
     
     if not active_branch_id:
-        # Si pas de branche active, essayer de trouver la branche principale du tenant
-        if current_user.tenant_id:
-            main_branch = db.query(Branch).filter(
-                Branch.tenant_id == current_user.tenant_id,
-                Branch.is_main_branch == True,
-                Branch.is_active == True
-            ).first()
-            if main_branch:
-                active_branch_id = main_branch.id
-                # Mettre à jour l'utilisateur
-                current_user.active_branch_id = active_branch_id
-                db.commit()
-    
-    if not active_branch_id:
-        logger.warning("⚠️ Pas de branche active pour %s", getattr(current_user, "email", None))
-        # Fallback : autoriser temporairement
-        return current_user
+        # Si pas de branche active, essayer de trouver la première branche accessible
+        from app.models.user_branch import UserBranch
+        
+        first_access = db.query(UserBranch).filter(
+            UserBranch.user_id == current_user.id,
+            UserBranch.is_active == True
+        ).first()
+        
+        if first_access:
+            active_branch_id = first_access.branch_id
+            current_user.active_branch_id = active_branch_id
+            db.commit()
+            logger.info(f"✅ Branche active définie automatiquement: {active_branch_id}")
+        else:
+            logger.warning("⚠️ Pas de branche active pour %s", getattr(current_user, "email", None))
+            # Fallback : autoriser temporairement en lecture seule
+            return current_user
     
     # Vérifier l'abonnement de la branche
     from app.models.branch_subscription import BranchSubscription
@@ -698,20 +698,26 @@ def can_user_access_branch(
     if _is_super_admin(user):
         return True
 
+    # Admin peut accéder à toutes les branches du tenant
     if getattr(user, "role", None) == "admin":
+        # Vérifier que la branche appartient au même tenant
+        if user.tenant_id and branch.tenant_id == user.tenant_id:
+            return True
+        return False
+
+    # Vérifier via la table d'association UserBranch
+    from app.models.user_branch import UserBranch
+    
+    association = db.query(UserBranch).filter(
+        UserBranch.user_id == user.id,
+        UserBranch.branch_id == branch.id,
+        UserBranch.is_active == True
+    ).first()
+    
+    if association:
         return True
-
-    # Vérifier via la pharmacie parente
-    if branch.parent_pharmacy_id:
-        from app.models.user_pharmacy import UserPharmacy
-        association = db.query(UserPharmacy).filter(
-            UserPharmacy.user_id == user.id,
-            UserPharmacy.pharmacy_id == branch.parent_pharmacy_id,
-        ).first()
-        return association is not None
-
+    
     return False
-
 
 def get_current_pharmacy_entity(
     request: Request,
@@ -1194,7 +1200,201 @@ def require_permission(permission: str) -> Callable:
 
     return permission_dependency
 
+async def verify_branch_access(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+) -> Branch:
+    """
+    Vérifie que l'utilisateur a accès à sa branche active.
+    Utilise la table d'association UserBranch.
+    """
+    from app.services.branch_subscription_utils import get_branch_subscription_by_id
+    
+    if not current_user.active_branch_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Aucune branche active sélectionnée"
+        )
+    
+    # Récupérer la branche
+    branch = db.query(Branch).filter(
+        Branch.id == current_user.active_branch_id,
+        Branch.is_active == True
+    ).first()
+    
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Branche non trouvée"
+        )
+    
+    # Vérifier que l'utilisateur est membre de la branche via UserBranch
+    from app.models.user_branch import UserBranch
+    
+    user_branch = db.query(UserBranch).filter(
+        UserBranch.user_id == current_user.id,
+        UserBranch.branch_id == branch.id,
+        UserBranch.is_active == True
+    ).first()
+    
+    if not user_branch and current_user.role != "admin" and not _is_super_admin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Vous n'avez pas accès à cette branche"
+        )
+    
+    # Vérifier l'abonnement de la branche
+    subscription = get_branch_subscription_by_id(db, branch.id)
+    
+    if not subscription or not subscription.is_active():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Abonnement de la branche inactif ou expiré"
+        )
+    
+    return branch
 
+def get_user_branches(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+    only_active: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Récupère toutes les branches auxquelles l'utilisateur a accès.
+    """
+    from app.models.user_branch import UserBranch
+    
+    query = db.query(UserBranch).filter(UserBranch.user_id == current_user.id)
+    
+    if only_active:
+        query = query.filter(UserBranch.is_active == True)
+    
+    associations = query.all()
+    
+    branches = []
+    for assoc in associations:
+        branch = assoc.branch
+        if branch and branch.is_active:
+            branches.append({
+                "id": str(branch.id),
+                "name": branch.name,
+                "code": branch.code,
+                "role_in_branch": assoc.role_in_branch,
+                "permissions": assoc.permissions,
+                "is_primary": assoc.is_primary,
+                "is_active": assoc.is_active,
+                "parent_pharmacy_id": str(branch.parent_pharmacy_id) if branch.parent_pharmacy_id else None,
+            })
+    
+    return branches
+
+def get_user_branch_permissions(
+    user_id: UUID,
+    branch_id: UUID,
+    db: Session,
+) -> Dict[str, Any]:
+    """
+    Récupère les permissions d'un utilisateur dans une branche spécifique.
+    """
+    from app.models.user_branch import UserBranch
+    
+    user_branch = db.query(UserBranch).filter(
+        UserBranch.user_id == user_id,
+        UserBranch.branch_id == branch_id,
+        UserBranch.is_active == True
+    ).first()
+    
+    if not user_branch:
+        # Permissions par défaut pour les admins
+        user = db.query(User).filter(User.id == user_id).first()
+        if user and (user.role == "admin" or _is_super_admin(user)):
+            return {
+                "can_sell": True,
+                "can_manage_stock": True,
+                "can_manage_expenses": True,
+                "can_view_reports": True,
+                "can_manage_users": True,
+                "role_in_branch": user.role,
+            }
+        return {
+            "can_sell": False,
+            "can_manage_stock": False,
+            "can_manage_expenses": False,
+            "can_view_reports": False,
+            "can_manage_users": False,
+            "role_in_branch": None,
+        }
+    
+    return {
+        "can_sell": user_branch.permissions.get("can_sell", False),
+        "can_manage_stock": user_branch.permissions.get("can_manage_stock", False),
+        "can_manage_expenses": user_branch.permissions.get("can_manage_expenses", False),
+        "can_view_reports": user_branch.permissions.get("can_view_reports", False),
+        "can_manage_users": user_branch.permissions.get("can_manage_users", False),
+        "role_in_branch": user_branch.role_in_branch,
+        "is_primary": user_branch.is_primary,
+    }
+
+async def set_active_branch(
+    branch_id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Définit la branche active pour l'utilisateur courant.
+    Vérifie que l'utilisateur a accès à cette branche.
+    """
+    from app.models.user_branch import UserBranch
+    
+    # Vérifier que l'utilisateur a accès à cette branche
+    user_branch = db.query(UserBranch).filter(
+        UserBranch.user_id == current_user.id,
+        UserBranch.branch_id == branch_id,
+        UserBranch.is_active == True
+    ).first()
+    
+    if not user_branch and current_user.role != "admin" and not _is_super_admin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Vous n'avez pas accès à cette branche"
+        )
+    
+    # Vérifier que la branche existe et est active
+    branch = db.query(Branch).filter(
+        Branch.id == branch_id,
+        Branch.is_active == True
+    ).first()
+    
+    if not branch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Branche non trouvée ou inactive"
+        )
+    
+    # Mettre à jour la branche active de l'utilisateur
+    current_user.active_branch_id = branch_id
+    
+    # Si c'est la première fois qu'on définit une branche active,
+    # marquer cette association comme primaire
+    if user_branch and not user_branch.is_primary:
+        # Compter combien de branches primaires l'utilisateur a
+        primary_count = db.query(UserBranch).filter(
+            UserBranch.user_id == current_user.id,
+            UserBranch.is_primary == True
+        ).count()
+        
+        if primary_count == 0:
+            user_branch.is_primary = True
+    
+    db.commit()
+    
+    return {
+        "success": True,
+        "message": f"Branche active définie sur {branch.name}",
+        "branch_id": str(branch_id),
+        "branch_name": branch.name,
+        "role_in_branch": user_branch.role_in_branch if user_branch else None,
+    }
 # =============================================================================
 # 6. CONTEXTE COMBINÉ
 # =============================================================================
@@ -1785,4 +1985,8 @@ __all__ = [
     "get_current_active_branch_dict",
     "get_optional_token_user",
     "_get_token_from_authorization_header",
+    "get_user_branches",
+    "set_active_branch",
+    "verify_branch_access",
+    "can_user_access_branch",
 ]
