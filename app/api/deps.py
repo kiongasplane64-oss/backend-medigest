@@ -334,38 +334,46 @@ def get_current_admin_user(
     Vérifie que l'utilisateur courant a un rôle administrateur (admin ou super_admin).
     À utiliser pour les endpoints d'administration.
     """
+    # Récupérer le rôle (c'est une string dans votre base de données)
     user_role = getattr(current_user, "role", None)
     
-    # Normaliser le rôle (gérer les enums ou strings)
-    if hasattr(user_role, 'value'):
-        user_role = user_role.value
+    # Convertir en string si c'est un objet (par précaution)
+    if user_role is None:
+        role_str = ""
+    elif hasattr(user_role, 'value'):
+        role_str = str(user_role.value).lower()
     elif hasattr(user_role, 'name'):
-        user_role = user_role.name
+        role_str = str(user_role.name).lower()
+    else:
+        role_str = str(user_role).lower()
     
     # Liste des rôles admin autorisés
     admin_roles = {"admin", "super_admin", "superadmin"}
     
-    if not user_role or user_role.lower() not in admin_roles:
+    # Log pour déboguer
+    logger.info(f"🔍 Vérification admin - Utilisateur: {current_user.email}, Rôle brut: {user_role}, Rôle normalisé: {role_str}")
+    
+    if role_str not in admin_roles:
         logger.warning(
-            "⛔ Accès admin refusé pour %s (rôle: %s)",
+            "⛔ Accès admin refusé pour %s (rôle: %s -> normalisé: %s)",
             getattr(current_user, "email", None),
             user_role,
+            role_str,
         )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
                 "error": "admin_access_required",
                 "message": "Accès réservé aux administrateurs",
-                "current_role": user_role,
+                "current_role": role_str,
                 "required_roles": list(admin_roles),
             },
         )
     
     logger.debug("✅ Accès admin autorisé pour %s (rôle: %s)", 
                  getattr(current_user, "email", None), 
-                 user_role)
+                 role_str)
     return current_user
-
 
 def get_super_admin_user(
     current_user: User = Depends(get_current_active_user),
@@ -1978,7 +1986,7 @@ __all__ = [
     "get_pagination_params",
     "get_date_range_params",
     "subscription_required",
-    "get_current_admin_user"
+    "get_current_admin_user",
     "get_current_active_pharmacy",
     "get_current_active_branch",
     "get_current_active_pharmacy_dict",

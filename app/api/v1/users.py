@@ -1,4 +1,5 @@
-# app/api/v1/users.py - Version complète corrigée avec gestion des associations user_pharmacy
+# app/api/v1/users.py - Version complète corrigée
+
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query, Body
 from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional, Dict, Any
@@ -9,22 +10,23 @@ import sys
 from datetime import datetime, timedelta
 from uuid import UUID
 from pydantic import BaseModel, EmailStr, Field, field_validator
+
 from app.db.session import get_db
 from app.models.user import User
 from app.models.user_pharmacy import UserPharmacy
 from app.models.pharmacy import Pharmacy
 from app.models.branch import Branch
 from app.models.user_branch import UserBranch
-from app.schemas.user import UserCreate, UserUpdate, UserResponse, UserListSchema
-from app.core.security import hash_password, verify_password
-from app.api.v1.auth import get_current_user
-from app.services.audit_service import log_action
 from app.models.tenant import Tenant
-from sqlalchemy import func
+from app.core.constants import ROLE_PATTERN, VALID_ROLES
+from app.schemas.user import UserCreate, UserUpdate, UserResponse, UserListSchema, AdminChangePasswordRequest
+from app.core.security import hash_password, verify_password
+from app.services.audit_service import log_action
 from app.api.deps import (
-    get_current_tenant,  
+    get_current_tenant,
     get_current_user,
     get_current_active_user,
+    get_current_admin_user,  # ← Importer la dépendance admin
     require_role,
     require_permission,
     get_current_pharmacy_entity,
@@ -75,8 +77,8 @@ class UserCreateRequest(BaseModel):
     role: str = Field(..., pattern="^(admin|pharmacien|vendeur|caissier|gestionnaire|comptable|preparateur|stockiste)$")
     telephone: Optional[str] = Field(None, max_length=20)
     adresse: Optional[str] = None
-    pharmacy_id: Optional[str] = None  # ID de la pharmacie à associer
-    branch_id: Optional[str] = None     # ID de la branche à associer
+    pharmacy_id: Optional[str] = None
+    branch_id: Optional[str] = None
     is_active: Optional[bool] = True
     permissions: Optional[Dict[str, bool]] = None
     
@@ -87,7 +89,6 @@ class UserCreateRequest(BaseModel):
     @field_validator('full_name')
     @classmethod
     def validate_full_name(cls, v: str) -> str:
-        """Valide et nettoie le nom complet"""
         if not v or len(v.strip()) < 2:
             raise ValueError('Le nom complet doit contenir au moins 2 caractères')
         return v.strip()
@@ -95,7 +96,6 @@ class UserCreateRequest(BaseModel):
     @field_validator('telephone')
     @classmethod
     def validate_telephone(cls, v: Optional[str]) -> Optional[str]:
-        """Valide le format du téléphone"""
         if v:
             cleaned = v.replace(' ', '').replace('-', '')
             if not cleaned.replace('+', '').isdigit():
@@ -108,12 +108,12 @@ class UserUpdateRequest(BaseModel):
     nom_complet: Optional[str] = Field(None, min_length=2, max_length=100)
     email: Optional[EmailStr] = None
     password: Optional[str] = Field(None, min_length=8)
-    role: Optional[str] = Field(None, pattern="^(admin|pharmacien|vendeur|caissier|gestionnaire|comptable|preparateur|stockiste)$")
+    role: Optional[str] = Field(None, pattern=ROLE_PATTERN)
     telephone: Optional[str] = None
     adresse: Optional[str] = None
     actif: Optional[bool] = None
-    active_pharmacy_id: Optional[str] = None  # Pour changer la pharmacie active
-    active_branch_id: Optional[str] = None     # Pour changer la branche active
+    active_pharmacy_id: Optional[str] = None
+    active_branch_id: Optional[str] = None
     
     class Config:
         from_attributes = True
@@ -139,9 +139,7 @@ def is_valid_uuid(uuid_string):
 
 
 def get_default_permissions(role: str) -> dict:
-    """
-    Retourne les permissions par défaut selon le rôle.
-    """
+    """Retourne les permissions par défaut selon le rôle."""
     permissions = {
         "admin": {
             "gestion_utilisateurs": True,
@@ -224,7 +222,6 @@ def get_default_permissions(role: str) -> dict:
             "gestion_fournisseurs": True
         }
     }
-    
     return permissions.get(role, {})
 
 
@@ -232,24 +229,15 @@ def get_default_permissions(role: str) -> dict:
 # ENDPOINTS SPÉCIAUX (DOIVENT ÊTRE AVANT LES ROUTES AVEC PARAMÈTRES)
 # =========================
 
-
 @router.get("/sessions/stats", status_code=status.HTTP_200_OK)
 def get_session_stats(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin_user),  # ← Utiliser admin_user
     date_range: str = Query("month", description="Période: day, week, month, year"),
     pharmacy_id: Optional[str] = Query(None, description="Filtrer par pharmacie"),
     branch_id: Optional[str] = Query(None, description="Filtrer par branche")
 ):
-    """
-    Récupère les statistiques de sessions des utilisateurs
-    """
-    if current_user.role not in ["admin", "super_admin", "gestionnaire"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Accès refusé"
-        )
-    
+    """Récupère les statistiques de sessions des utilisateurs"""
     # Calculer la date de début selon la période
     now = datetime.utcnow()
     if date_range == "day":
@@ -268,13 +256,14 @@ def get_session_stats(
     query = db.query(User).filter(User.tenant_id == current_user.tenant_id)
     
     # Filtrer par pharmacie si spécifiée
-    if pharmacy_id:
-        # Vérifier que l'utilisateur a accès à cette pharmacie via user_pharmacy
-        query = query.filter(User.pharmacy_associations.any(pharmacy_id=pharmacy_id))
+    if pharmacy_id and is_valid_uuid(pharmacy_id):
+        pharmacy_uuid = UUID(pharmacy_id)
+        query = query.filter(User.pharmacy_associations.any(pharmacy_id=pharmacy_uuid))
     
     # Filtrer par branche si spécifiée
-    if branch_id:
-        query = query.filter(User.active_branch_id == branch_id)
+    if branch_id and is_valid_uuid(branch_id):
+        branch_uuid = UUID(branch_id)
+        query = query.filter(User.active_branch_id == branch_uuid)
     
     # Récupérer les utilisateurs
     users = query.filter(User.actif == True).all()
@@ -319,20 +308,13 @@ def get_session_stats(
         "timestamp": now.isoformat()
     }
 
+
 @router.get("/online-users", status_code=status.HTTP_200_OK)
 def get_all_online_users(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_admin_user),  # ← Utiliser admin_user
 ):
-    """
-    Récupère tous les utilisateurs en ligne du tenant
-    """
-    if current_user.role not in ["admin", "super_admin", "gestionnaire"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Accès refusé"
-        )
-    
+    """Récupère tous les utilisateurs en ligne du tenant"""
     # Calculer le seuil d'inactivité (15 minutes)
     threshold = datetime.utcnow() - timedelta(minutes=15)
     
@@ -348,7 +330,6 @@ def get_all_online_users(
             login_duration = datetime.utcnow() - user.last_login
             duration_minutes = int(login_duration.total_seconds() / 60)
             
-            # Déterminer le statut
             if duration_minutes < 5:
                 status = "online"
             elif duration_minutes < 15:
@@ -382,11 +363,9 @@ def get_all_online_users(
 @router.get("/me/profile", status_code=status.HTTP_200_OK)
 def get_my_profile(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_active_user),
 ):
-    """
-    Récupère le profil de l'utilisateur connecté.
-    """
+    """Récupère le profil de l'utilisateur connecté."""
     tenant = db.query(Tenant).filter(Tenant.id == current_user.tenant_id).first()
     
     profile = current_user.to_dict(include_tenant=False, include_pharmacies=True)
@@ -403,45 +382,47 @@ def get_my_profile(
     return profile
 
 
+@router.get("/me/profile/", status_code=status.HTTP_200_OK)
+def get_my_profile_with_slash(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Alias pour GET /users/me/profile avec slash"""
+    return get_my_profile(db, current_user)
+
+
 @router.post("/me/change-password", status_code=status.HTTP_200_OK)
 def change_my_password(
     request_data: ChangePasswordRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_active_user),
 ):
-    """
-    Permet à un utilisateur de changer son propre mot de passe.
-    """
-    old_password = request_data.old_password
-    new_password = request_data.new_password
-    
+    """Permet à un utilisateur de changer son propre mot de passe."""
     # Vérifier l'ancien mot de passe
-    if not verify_password(old_password, current_user.password_hash):
+    if not verify_password(request_data.old_password, current_user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Ancien mot de passe incorrect"
         )
     
     # Vérifier que le nouveau mot de passe est différent
-    if verify_password(new_password, current_user.password_hash):
+    if verify_password(request_data.new_password, current_user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Le nouveau mot de passe doit être différent de l'ancien"
         )
     
     # Vérifier la longueur du mot de passe
-    if len(new_password) < 8:
+    if len(request_data.new_password) < 8:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Le mot de passe doit contenir au moins 8 caractères"
         )
     
     try:
-        # Mettre à jour le mot de passe
-        current_user.password_hash = hash_password(new_password)
+        current_user.password_hash = hash_password(request_data.new_password)
         db.commit()
         
-        # Audit log
         log_action(
             db=db,
             tenant_id=current_user.tenant_id,
@@ -473,7 +454,7 @@ def change_my_password(
 @router.get("/", status_code=status.HTTP_200_OK)
 def list_users(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin_user),  # ← Utiliser admin_user
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=100),
     search: Optional[str] = Query(None),
@@ -483,12 +464,6 @@ def list_users(
     """
     Liste les utilisateurs du tenant avec pagination et filtres.
     """
-    if current_user.role not in ["admin", "super_admin"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Accès refusé. Seuls les administrateurs peuvent voir la liste des utilisateurs."
-        )
-
     # Construire la requête
     query = db.query(User).filter(User.tenant_id == current_user.tenant_id)
     
@@ -510,20 +485,24 @@ def list_users(
     # Pagination
     total = query.count()
     offset = (page - 1) * limit
-    users = query.order_by(User.date_creation.desc()).offset(offset).limit(limit).all()
+    users = query.order_by(User.created_at.desc()).offset(offset).limit(limit).all()  # ← created_at
     
     # Format de réponse
     result = []
     for user in users:
         user_dict = user.to_dict(include_tenant=False, include_pharmacies=True)
-        # Ajouter des informations supplémentaires
         user_dict["can_edit"] = (
             current_user.id != user.id and
             current_user.role in ["admin", "super_admin"]
         )
         result.append(user_dict)
 
-    return result
+    return {
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "users": result
+    }
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
@@ -531,28 +510,17 @@ def create_user(
     user_data: UserCreateRequest,
     request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_admin_user),  # ← Utiliser admin_user
 ):
-    """
-    Crée un utilisateur pour le tenant de l'admin connecté.
-    Accepte 'full_name' du frontend et le convertit en 'nom_complet'.
-    Associe automatiquement l'utilisateur à une pharmacie et une branche.
-    """
-    # Verifier les permissions
-    if current_user.role not in ["admin", "super_admin"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail="Accès refusé. Seuls les administrateurs peuvent créer des utilisateurs."
-        )
-
-    # Verifier que l'admin est actif
+    """Crée un utilisateur pour le tenant de l'admin connecté."""
+    # Vérifier que l'admin est actif
     if not current_user.actif:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Votre compte est désactivé"
         )
 
-    # Verifier si le tenant existe
+    # Vérifier si le tenant existe
     tenant = db.query(Tenant).filter(Tenant.id == current_user.tenant_id).first()
     if not tenant:
         raise HTTPException(
@@ -560,7 +528,7 @@ def create_user(
             detail="Tenant non trouvé"
         )
     
-    # Verifier l'unicite de l'email dans le tenant
+    # Vérifier l'unicité de l'email dans le tenant
     existing_user = db.query(User).filter(
         User.email == user_data.email.lower().strip(),
         User.tenant_id == current_user.tenant_id
@@ -572,15 +540,13 @@ def create_user(
             detail="Cet email est déjà utilisé dans votre pharmacie"
         )
 
-    # Verifier les limites du plan
+    # Vérifier les limites du plan
     user_count = db.query(User).filter(
         User.tenant_id == current_user.tenant_id,
         User.actif == True
     ).count()
     
-    max_users = 10
-    if hasattr(tenant, 'max_users') and tenant.max_users:
-        max_users = tenant.max_users
+    max_users = getattr(tenant, 'max_users', 10)
     
     if user_count >= max_users:
         raise HTTPException(
@@ -588,7 +554,7 @@ def create_user(
             detail=f"Limite d'utilisateurs atteinte ({max_users} maximum). Veuillez mettre à jour votre plan."
         )
 
-    # Verifier les roles autorises
+    # Vérifier les rôles autorisés
     allowed_roles = ["pharmacien", "vendeur", "caissier", "gestionnaire", "comptable", "preparateur", "stockiste"]
     if current_user.role != "super_admin":
         allowed_roles = [role for role in allowed_roles if role != "admin"]
@@ -600,7 +566,7 @@ def create_user(
         )
 
     try:
-        # Creation de l'utilisateur
+        # Création de l'utilisateur
         new_user = User(
             tenant_id=current_user.tenant_id,
             nom_complet=user_data.full_name,
@@ -614,23 +580,18 @@ def create_user(
         )
         
         db.add(new_user)
-        db.flush()  # Pour obtenir l'ID du nouvel utilisateur
+        db.flush()
         
-        # =========================
-        # ASSOCIATION OBLIGATOIRE À LA PHARMACIE
-        # =========================
-        
-        # Determiner la pharmacie a associer
+        # Association à la pharmacie
         pharmacy_id = None
-        if user_data.pharmacy_id:
-            pharmacy_id = user_data.pharmacy_id
+        if user_data.pharmacy_id and is_valid_uuid(user_data.pharmacy_id):
+            pharmacy_id = UUID(user_data.pharmacy_id)
         elif current_user.active_pharmacy_id:
             pharmacy_id = current_user.active_pharmacy_id
         elif current_user.pharmacies:
             pharmacy_id = current_user.pharmacies[0].id
         
         if not pharmacy_id:
-            # Si aucune pharmacie n'est trouvee, prendre la premiere pharmacie du tenant
             first_pharmacy = db.query(Pharmacy).filter(
                 Pharmacy.tenant_id == current_user.tenant_id,
                 Pharmacy.is_active == True
@@ -639,14 +600,12 @@ def create_user(
                 pharmacy_id = first_pharmacy.id
         
         if pharmacy_id:
-            # Recuperer la pharmacie
             pharmacy = db.query(Pharmacy).filter(
                 Pharmacy.id == pharmacy_id,
                 Pharmacy.tenant_id == current_user.tenant_id
             ).first()
             
             if pharmacy:
-                # Creer l'association user_pharmacy
                 user_pharmacy = UserPharmacy(
                     user_id=new_user.id,
                     pharmacy_id=pharmacy.id,
@@ -655,26 +614,18 @@ def create_user(
                     can_manage=(user_data.role in ["admin", "gestionnaire"])
                 )
                 db.add(user_pharmacy)
-                
-                # Definir la pharmacie active
                 new_user.active_pharmacy_id = pharmacy.id
                 
-                # =========================
-                # ASSIGNATION DE LA BRANCHE PAR DEFAUT
-                # =========================
-                
-                # Chercher une branche par defaut pour cette pharmacie
+                # Assignation de la branche par défaut
                 default_branch = None
                 
-                # Priorite 1: Branche fournie par l'utilisateur
-                if user_data.branch_id:
+                if user_data.branch_id and is_valid_uuid(user_data.branch_id):
                     default_branch = db.query(Branch).filter(
-                        Branch.id == user_data.branch_id,
+                        Branch.id == UUID(user_data.branch_id),
                         Branch.parent_pharmacy_id == pharmacy.id,
                         Branch.is_active == True
                     ).first()
                 
-                # Priorite 2: Branche principale de la pharmacie
                 if not default_branch:
                     default_branch = db.query(Branch).filter(
                         Branch.parent_pharmacy_id == pharmacy.id,
@@ -682,7 +633,6 @@ def create_user(
                         Branch.is_main_branch == True
                     ).first()
                 
-                # Priorite 3: Premiere branche active de la pharmacie
                 if not default_branch:
                     default_branch = db.query(Branch).filter(
                         Branch.parent_pharmacy_id == pharmacy.id,
@@ -691,19 +641,15 @@ def create_user(
                 
                 if default_branch:
                     new_user.active_branch_id = default_branch.id
-                    logger.info(f"Branche assignee a {new_user.email}: {default_branch.name} (id: {default_branch.id})")
-                else:
-                    logger.warning(f"Aucune branche trouvee pour la pharmacie {pharmacy.name}, l'utilisateur {new_user.email} n'aura pas de branche active")
+                    logger.info(f"Branche assignée à {new_user.email}: {default_branch.name}")
                 
                 db.add(new_user)
             else:
-                logger.error(f"Pharmacie non trouvee avec l'id {pharmacy_id}")
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Pharmacie non trouvee"
+                    detail="Pharmacie non trouvée"
                 )
         else:
-            logger.error(f"Aucune pharmacie disponible pour le tenant {current_user.tenant_id}")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Aucune pharmacie disponible pour associer l'utilisateur"
@@ -712,29 +658,25 @@ def create_user(
         db.commit()
         db.refresh(new_user)
 
-        # Audit log
         log_action(
             db=db,
             tenant_id=current_user.tenant_id,
             user_id=current_user.id,
             action="CREATE_USER",
             cible="user",
-            description=f"Creation utilisateur: {new_user.email} (role={new_user.role})",
+            description=f"Création utilisateur: {new_user.email} (role={new_user.role})",
             ip=request.client.host if request.client else None
         )
 
-        # Recuperer le nom de la pharmacie
         pharmacie_nom = getattr(tenant, 'nom_pharmacie', 'Votre pharmacie')
-        pharmacie_nom = pharmacie_nom if pharmacie_nom else 'Votre pharmacie'
         
-        # Recuperer le nom de la branche assignee
         branch_name = None
         if new_user.active_branch_id:
             branch = db.query(Branch).filter(Branch.id == new_user.active_branch_id).first()
             branch_name = branch.name if branch else None
 
         return {
-            "message": "Utilisateur cree avec succes",
+            "message": "Utilisateur créé avec succès",
             "user": {
                 "id": str(new_user.id),
                 "email": new_user.email,
@@ -742,25 +684,170 @@ def create_user(
                 "role": new_user.role,
                 "telephone": new_user.telephone,
                 "actif": new_user.actif,
-                "date_creation": new_user.date_creation.isoformat() if new_user.date_creation else None,
+                "created_at": new_user.created_at.isoformat() if new_user.created_at else None,  # ← created_at
                 "active_pharmacy_id": str(new_user.active_pharmacy_id) if new_user.active_pharmacy_id else None,
                 "active_branch_id": str(new_user.active_branch_id) if new_user.active_branch_id else None,
                 "pharmacie": pharmacie_nom,
                 "branche": branch_name
             },
-            "instructions": f"L'utilisateur peut se connecter a votre pharmacie '{pharmacie_nom}' avec son email et mot de passe"
+            "instructions": f"L'utilisateur peut se connecter à votre pharmacie '{pharmacie_nom}' avec son email et mot de passe"
         }
 
     except HTTPException:
         raise
     except Exception as e:
         db.rollback()
-        logger.error(f"Erreur creation utilisateur: {str(e)}", exc_info=True)
+        logger.error(f"Erreur création utilisateur: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erreur lors de la creation de l'utilisateur: {str(e)}"
+            detail=f"Erreur lors de la création de l'utilisateur: {str(e)}"
+        )
+
+@router.post("/{user_id}/change-password", status_code=status.HTTP_200_OK)
+def admin_change_user_password(
+    user_id: str,
+    request_data: AdminChangePasswordRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin_user),  # Seul un admin peut faire ça
+):
+    """
+    Permet à un administrateur de changer le mot de passe d'un utilisateur.
+    """
+    # Vérifier que l'ID est valide
+    if not is_valid_uuid(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID utilisateur invalide"
         )
     
+    user_uuid = UUID(user_id)
+    
+    # Récupérer l'utilisateur
+    user = db.query(User).filter(
+        User.id == user_uuid,
+        User.tenant_id == current_user.tenant_id
+    ).first()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Utilisateur non trouvé dans votre tenant"
+        )
+    
+    # Empêcher un admin de modifier son propre mot de passe via cet endpoint
+    # (il devrait utiliser /me/change-password à la place)
+    if user.id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Utilisez l'endpoint /me/change-password pour modifier votre propre mot de passe"
+        )
+    
+    try:
+        # Changer le mot de passe
+        user.password_hash = hash_password(request_data.new_password)
+        db.commit()
+        
+        # Audit log
+        log_action(
+            db=db,
+            tenant_id=current_user.tenant_id,
+            user_id=current_user.id,
+            action="ADMIN_CHANGE_USER_PASSWORD",
+            cible="user",
+            description=f"Changement de mot de passe pour l'utilisateur: {user.email} (par admin)",
+            ip=request.client.host if request.client else None
+        )
+        
+        logger.info(f"✅ Mot de passe changé pour l'utilisateur {user.email} par admin {current_user.email}")
+        
+        return {
+            "success": True,
+            "message": "Mot de passe modifié avec succès",
+            "user_id": str(user.id),
+            "user_email": user.email
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Erreur lors du changement de mot de passe: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur lors du changement de mot de passe: {str(e)}"
+        )
+
+@router.post("/{user_id}/reset-password", status_code=status.HTTP_200_OK)
+def admin_reset_user_password(
+    user_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin_user),
+):
+    """
+    Réinitialise le mot de passe d'un utilisateur avec un mot de passe temporaire.
+    """
+    import secrets
+    import string
+    
+    if not is_valid_uuid(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Format d'ID utilisateur invalide"
+        )
+    
+    user_uuid = UUID(user_id)
+    
+    user = db.query(User).filter(
+        User.id == user_uuid,
+        User.tenant_id == current_user.tenant_id
+    ).first()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Utilisateur non trouvé"
+        )
+    
+    if user.id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Utilisez l'endpoint /me/change-password pour modifier votre propre mot de passe"
+        )
+    
+    # Générer un mot de passe temporaire
+    alphabet = string.ascii_letters + string.digits
+    temp_password = ''.join(secrets.choice(alphabet) for _ in range(12))
+    
+    try:
+        user.password_hash = hash_password(temp_password)
+        db.commit()
+        
+        log_action(
+            db=db,
+            tenant_id=current_user.tenant_id,
+            user_id=current_user.id,
+            action="RESET_USER_PASSWORD",
+            cible="user",
+            description=f"Réinitialisation mot de passe pour: {user.email}",
+            ip=request.client.host if request.client else None
+        )
+        
+        return {
+            "success": True,
+            "message": "Mot de passe réinitialisé avec succès",
+            "temporary_password": temp_password,
+            "user_id": str(user.id),
+            "user_email": user.email,
+            "instructions": "Communiquez ce mot de passe temporaire à l'utilisateur. Il devra le changer à sa première connexion."
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Erreur réinitialisation: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur lors de la réinitialisation: {str(e)}"
+        )
 # =========================
 # ENDPOINTS PAR USER_ID
 # =========================
@@ -769,34 +856,31 @@ def create_user(
 def get_user(
     user_id: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_active_user),
 ):
-    """
-    Récupère les détails d'un utilisateur spécifique du tenant.
-    """
-    # Vérifier si c'est un UUID valide
+    """Récupère les détails d'un utilisateur spécifique du tenant."""
     if not is_valid_uuid(user_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Format d'ID utilisateur invalide"
         )
     
+    user_uuid = UUID(user_id)
+    
     # Les admins peuvent voir tous les utilisateurs, les autres seulement leur propre profil
-    if current_user.role not in ["admin", "super_admin"] and str(current_user.id) != user_id:
+    if current_user.role not in ["admin", "super_admin"] and current_user.id != user_uuid:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Vous ne pouvez voir que votre propre profil"
         )
 
-    # Si c'est un admin, vérifier que l'utilisateur est dans le même tenant
     if current_user.role in ["admin", "super_admin"]:
         user = db.query(User).filter(
-            User.id == user_id,
+            User.id == user_uuid,
             User.tenant_id == current_user.tenant_id
         ).first()
     else:
-        # L'utilisateur voit son propre profil
-        user = db.query(User).filter(User.id == user_id).first()
+        user = db.query(User).filter(User.id == user_uuid).first()
 
     if not user:
         raise HTTPException(
@@ -813,18 +897,10 @@ def update_user(
     user_data: UserUpdateRequest,
     request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_admin_user),  # ← Déjà bon, utilise get_current_admin_user
 ):
-    """
-    Met à jour un utilisateur du tenant courant.
-    """
-    # Vérifier les permissions
-    if current_user.role not in ["admin", "super_admin"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Accès refusé"
-        )
-
+    """Met à jour un utilisateur du tenant courant."""
+    
     # Vérifier que c'est un UUID valide
     if not is_valid_uuid(user_id):
         raise HTTPException(
@@ -832,9 +908,9 @@ def update_user(
             detail="Format d'ID utilisateur invalide"
         )
 
-    # Récupérer l'utilisateur à modifier
+    user_uuid = UUID(user_id)
     user = db.query(User).filter(
-        User.id == user_id,
+        User.id == user_uuid,
         User.tenant_id == current_user.tenant_id
     ).first()
     
@@ -856,7 +932,7 @@ def update_user(
         existing_user = db.query(User).filter(
             User.email == user_data.email.lower().strip(),
             User.tenant_id == current_user.tenant_id,
-            User.id != user_id
+            User.id != user_uuid
         ).first()
         
         if existing_user:
@@ -865,69 +941,68 @@ def update_user(
                 detail="Cet email est déjà utilisé dans votre pharmacie"
             )
 
-    # Vérifier les rôles si modification
-    if user_data.role and user_data.role != user.role:
+    # =================================================================
+    # CORRECTION ICI : Permettre aux admins de modifier n'importe quel rôle
+    # =================================================================
+    
+    # Si l'utilisateur courant est admin ou super_admin, il peut modifier n'importe quel rôle
+    if current_user.role in ["admin", "super_admin", "superadmin"]:
+        # L'admin a tous les droits, pas de restriction sur les rôles
+        allowed_roles_for_update = ["admin", "pharmacien", "vendeur", "caissier", "gestionnaire", "comptable", "preparateur", "stockiste"]
+        
+        if user_data.role and user_data.role != user.role:
+            if user_data.role not in allowed_roles_for_update:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Rôle non autorisé. Rôles autorisés pour les admins: {', '.join(allowed_roles_for_update)}"
+                )
+    else:
+        # Pour les non-admins (cas normalement impossible car get_current_admin_user est utilisé)
+        # mais on garde la logique par sécurité
         allowed_roles = ["pharmacien", "vendeur", "caissier", "gestionnaire", "comptable", "preparateur", "stockiste"]
         if current_user.role != "super_admin":
             allowed_roles = [role for role in allowed_roles if role != "admin"]
         
-        if user_data.role not in allowed_roles:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Rôle non autorisé. Rôles autorisés: {', '.join(allowed_roles)}"
-            )
-
-    # Vérifier la pharmacie active si elle est modifiée
-    if user_data.active_pharmacy_id:
-        # Vérifier que l'utilisateur a accès à cette pharmacie
-        if not user.has_access_to_pharmacy(user_data.active_pharmacy_id):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="L'utilisateur n'a pas accès à cette pharmacie"
-            )
+        if user_data.role and user_data.role != user.role:
+            if user_data.role not in allowed_roles:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Rôle non autorisé. Rôles autorisés: {', '.join(allowed_roles)}"
+                )
 
     try:
         # Mise à jour des champs
         if user_data.nom_complet is not None:
             user.nom_complet = user_data.nom_complet
-            
         if user_data.email is not None:
             user.email = user_data.email.lower().strip()
-            
         if user_data.telephone is not None:
             user.telephone = user_data.telephone
-            
         if user_data.adresse is not None:
             user.adresse = user_data.adresse
-            
         if user_data.role is not None:
             user.role = user_data.role
             # Mettre à jour les permissions si le rôle change
             user.permissions = get_default_permissions(user_data.role)
-            
         if user_data.actif is not None:
             user.actif = user_data.actif
-            
         if user_data.password is not None:
             user.password_hash = hash_password(user_data.password)
-            
-        if user_data.active_pharmacy_id is not None:
-            user.active_pharmacy_id = user_data.active_pharmacy_id
-            
-        if user_data.active_branch_id is not None:
-            user.active_branch_id = user_data.active_branch_id
+        if user_data.active_pharmacy_id is not None and is_valid_uuid(user_data.active_pharmacy_id):
+            user.active_pharmacy_id = UUID(user_data.active_pharmacy_id)
+        if user_data.active_branch_id is not None and is_valid_uuid(user_data.active_branch_id):
+            user.active_branch_id = UUID(user_data.active_branch_id)
 
         db.commit()
         db.refresh(user)
 
-        # Audit log
         log_action(
             db=db,
             tenant_id=current_user.tenant_id,
             user_id=current_user.id,
             action="UPDATE_USER",
             cible="user",
-            description=f"Mise à jour utilisateur: {user.email}",
+            description=f"Mise à jour utilisateur: {user.email} (rôle: {user.role}) par admin",
             ip=request.client.host if request.client else None
         )
 
@@ -944,32 +1019,23 @@ def update_user(
             detail=f"Erreur lors de la mise à jour: {str(e)}"
         )
 
-
 @router.patch("/{user_id}/toggle", status_code=status.HTTP_200_OK)
 def toggle_user(
     user_id: str,
     request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_admin_user),  # ← Utiliser admin_user
 ):
-    """
-    Active ou désactive un utilisateur.
-    """
-    if current_user.role not in ["admin", "super_admin"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Accès refusé"
-        )
-
-    # Vérifier que c'est un UUID valide
+    """Active ou désactive un utilisateur."""
     if not is_valid_uuid(user_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Format d'ID utilisateur invalide"
         )
 
+    user_uuid = UUID(user_id)
     user = db.query(User).filter(
-        User.id == user_id,
+        User.id == user_uuid,
         User.tenant_id == current_user.tenant_id
     ).first()
     
@@ -979,7 +1045,6 @@ def toggle_user(
             detail="Utilisateur introuvable dans votre pharmacie"
         )
 
-    # Empêcher de se désactiver soi-même
     if user.id == current_user.id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -987,12 +1052,10 @@ def toggle_user(
         )
 
     try:
-        # Basculer l'état
         user.actif = not user.actif
         db.commit()
         db.refresh(user)
 
-        # Log d'audit
         action = "ACTIVATE_USER" if user.actif else "DEACTIVATE_USER"
         status_text = "activé" if user.actif else "désactivé"
         
@@ -1025,26 +1088,18 @@ def reset_user_password(
     user_id: str,
     request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_admin_user),  # ← Utiliser admin_user
 ):
-    """
-    Réinitialise le mot de passe d'un utilisateur (admin seulement).
-    """
-    if current_user.role not in ["admin", "super_admin"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Accès refusé"
-        )
-
-    # Vérifier que c'est un UUID valide
+    """Réinitialise le mot de passe d'un utilisateur (admin seulement)."""
     if not is_valid_uuid(user_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Format d'ID utilisateur invalide"
         )
 
+    user_uuid = UUID(user_id)
     user = db.query(User).filter(
-        User.id == user_id,
+        User.id == user_uuid,
         User.tenant_id == current_user.tenant_id
     ).first()
     
@@ -1054,7 +1109,6 @@ def reset_user_password(
             detail="Utilisateur introuvable dans votre pharmacie"
         )
 
-    # Générer un mot de passe temporaire
     import secrets
     import string
     
@@ -1062,11 +1116,9 @@ def reset_user_password(
     temp_password = ''.join(secrets.choice(alphabet) for _ in range(10))
     
     try:
-        # Mettre à jour le mot de passe
         user.password_hash = hash_password(temp_password)
         db.commit()
 
-        # Audit log
         log_action(
             db=db,
             tenant_id=current_user.tenant_id,
@@ -1097,11 +1149,10 @@ def reset_user_password(
         )
 
 
-# Récupérer tous les users (super_admin seulement)
 @router.get("/all", status_code=status.HTTP_200_OK)
 def get_all_users(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin_user),  # ← Utiliser admin_user
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=100)
 ):
@@ -1109,10 +1160,10 @@ def get_all_users(
     if current_user.role != "super_admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Accès refusé"
+            detail="Accès réservé aux super administrateurs"
         )
     
-    users = db.query(User).order_by(User.date_creation.desc()).offset((page-1)*limit).limit(limit).all()
+    users = db.query(User).order_by(User.created_at.desc()).offset((page-1)*limit).limit(limit).all()
     return [user.to_dict(include_tenant=True, include_pharmacies=True) for user in users]
 
 
@@ -1123,18 +1174,11 @@ def get_all_users(
 @router.get("/statistics/overview", status_code=status.HTTP_200_OK)
 def get_user_statistics(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_admin_user),  # ← Utiliser admin_user
 ):
-    """
-    Retourne des statistiques sur les utilisateurs du tenant.
-    """
-    if current_user.role not in ["admin", "super_admin"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Accès refusé"
-        )
+    """Retourne des statistiques sur les utilisateurs du tenant."""
+    from sqlalchemy import func
     
-    # Compter les utilisateurs par statut
     total = db.query(User).filter(User.tenant_id == current_user.tenant_id).count()
     active = db.query(User).filter(
         User.tenant_id == current_user.tenant_id,
@@ -1142,24 +1186,22 @@ def get_user_statistics(
     ).count()
     inactive = total - active
     
-    # Compter par rôle
     roles = db.query(User.role, func.count(User.id)).filter(
         User.tenant_id == current_user.tenant_id
     ).group_by(User.role).all()
     
     role_distribution = {role: count for role, count in roles}
     
-    # Derniers utilisateurs créés
     recent_users = db.query(User).filter(
         User.tenant_id == current_user.tenant_id
-    ).order_by(User.date_creation.desc()).limit(5).all()
+    ).order_by(User.created_at.desc()).limit(5).all()  # ← created_at
     
     recent_users_data = [{
         "id": str(u.id),
         "nom_complet": u.nom_complet,
         "email": u.email,
         "role": u.role,
-        "date_creation": u.date_creation.isoformat() if u.date_creation else None
+        "created_at": u.created_at.isoformat() if u.created_at else None  # ← created_at
     } for u in recent_users]
     
     return {
@@ -1172,53 +1214,6 @@ def get_user_statistics(
     }
 
 
-@router.get("/health", status_code=status.HTTP_200_OK)
-def health_check():
-    """
-    Endpoint de vérification de santé de l'API users.
-    """
-    return {
-        "status": "healthy",
-        "service": "users-api",
-        "timestamp": datetime.utcnow().isoformat(),
-        "endpoints": [
-            "POST /users/ - Créer un utilisateur",
-            "GET /users/ - Lister les utilisateurs",
-            "GET /users/online-users - Utilisateurs en ligne",
-            "GET /users/{id} - Voir un utilisateur",
-            "PUT /users/{id} - Modifier un utilisateur",
-            "PATCH /users/{id}/toggle - Activer/désactiver",
-            "POST /users/{id}/reset-password - Réinitialiser mot de passe",
-            "GET /users/me/profile - Mon profil",
-            "POST /users/me/change-password - Changer mon mot de passe",
-            "GET /users/statistics/overview - Statistiques"
-        ]
-    }
-
-@router.get("/", status_code=status.HTTP_200_OK)
-def list_users_with_slash(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-    page: int = Query(1, ge=1),
-    limit: int = Query(10, ge=1, le=100),
-    search: Optional[str] = Query(None),
-    role: Optional[str] = Query(None),
-    actif: Optional[bool] = Query(None)
-):
-    """Alias pour GET /users avec slash"""
-    return list_users(db, current_user, page, limit, search, role, actif)
-
-
-@router.get("/me/profile/", status_code=status.HTTP_200_OK)
-def get_my_profile_with_slash(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Alias pour GET /users/me/profile avec slash"""
-    return get_my_profile(db, current_user)
-
-# Dans app/api/v1/users.py, ajoutez ou corrigez l'endpoint:
-
 @router.get("/sellers")
 async def get_sellers(
     branch_id: Optional[str] = Query(None, description="Filtrer par branche (UUID)"),
@@ -1226,27 +1221,21 @@ async def get_sellers(
     current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_user: User = Depends(get_current_active_user),
 ):
-    """
-    Récupère la liste des vendeurs/caissiers.
-    """
+    """Récupère la liste des vendeurs/caissiers."""
     try:
-        tenant_id = current_tenant.id if current_tenant else None
+        tenant_id = current_tenant.id if current_tenant else current_user.tenant_id
         
-        # Convertir branch_id en UUID si fourni
         branch_uuid = None
         if branch_id:
-            try:
-                branch_uuid = UUID(branch_id)
-            except ValueError:
+            if not is_valid_uuid(branch_id):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Format d'ID de branche invalide: {branch_id}"
                 )
+            branch_uuid = UUID(branch_id)
         
-        # Rôles autorisés pour la vente
         allowed_roles = ["vendeur", "caissier", "gerant", "admin", "super_admin", "superadmin"]
         
-        # Requête de base
         query = db.query(User).filter(
             User.actif == True,
             User.role.in_(allowed_roles)
@@ -1255,12 +1244,10 @@ async def get_sellers(
         if tenant_id:
             query = query.filter(User.tenant_id == tenant_id)
         
-        # Filtrer par branche si spécifiée
         if branch_uuid:
-            from app.models.user_branch import UserBranch
             query = query.filter(
                 or_(
-                    User.branch_id == branch_uuid,
+                    User.active_branch_id == branch_uuid,
                     User.id.in_(
                         db.query(UserBranch.user_id).filter(
                             UserBranch.branch_id == branch_uuid,
@@ -1295,3 +1282,27 @@ async def get_sellers(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur récupération vendeurs: {str(e)}"
         )
+
+
+@router.get("/health", status_code=status.HTTP_200_OK)
+def health_check():
+    """Endpoint de vérification de santé de l'API users."""
+    return {
+        "status": "healthy",
+        "service": "users-api",
+        "timestamp": datetime.utcnow().isoformat(),
+        "endpoints": [
+            "POST /users/ - Créer un utilisateur",
+            "GET /users/ - Lister les utilisateurs",
+            "GET /users/online-users - Utilisateurs en ligne",
+            "GET /users/sessions/stats - Statistiques de sessions",
+            "GET /users/statistics/overview - Statistiques",
+            "GET /users/{id} - Voir un utilisateur",
+            "PUT /users/{id} - Modifier un utilisateur",
+            "PATCH /users/{id}/toggle - Activer/désactiver",
+            "POST /users/{id}/reset-password - Réinitialiser mot de passe",
+            "GET /users/me/profile - Mon profil",
+            "POST /users/me/change-password - Changer mon mot de passe",
+            "GET /users/sellers - Liste des vendeurs"
+        ]
+    }

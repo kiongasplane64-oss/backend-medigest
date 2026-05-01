@@ -326,6 +326,16 @@ class UserUpdate(BaseModel):
         }
     )
 
+class AdminChangePasswordRequest(BaseModel):
+    """Schéma pour le changement de mot de passe par un admin"""
+    new_password: str = Field(..., min_length=8, description="Nouveau mot de passe")
+    
+    @field_validator('new_password')
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError('Le mot de passe doit contenir au moins 8 caractères')
+        return v
 
 # =========================
 # Authentification
