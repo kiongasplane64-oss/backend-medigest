@@ -1142,7 +1142,7 @@ def _get_expense_stats_by_branch(
     daily_expenses = db.query(Expense).filter(
         Expense.tenant_id == tenant_id,
         Expense.branch_id == branch_id,
-        Expense.approval_status == "approved",
+        #Expense.approval_status == "approved",
         Expense.created_at >= today_start,
         Expense.created_at <= today_end
     ).all()
