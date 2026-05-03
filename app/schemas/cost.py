@@ -1,5 +1,5 @@
 # app/schemas/cost.py
-from pydantic import BaseModel, Field, validator, root_validator
+from pydantic import BaseModel, Field, validator, model_validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime, date
 from uuid import UUID
@@ -124,7 +124,7 @@ class CostAllocationBase(BaseModel):
 
 class CostAllocationCreate(CostAllocationBase):
     """Création d'une allocation de coût"""
-    @root_validator
+    @model_validator(mode='after')
     def validate_allocation(cls, values):
         department_id = values.get('department_id')
         project_id = values.get('project_id')

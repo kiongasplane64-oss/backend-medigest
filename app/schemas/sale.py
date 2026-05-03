@@ -161,6 +161,7 @@ class SaleUpdate(BaseModel):
 # ============================
 class SaleFilter(BaseModel):
     pharmacy_id: Optional[UUID] = Field(None, description="Filtrer par pharmacie spécifique")
+    branch_id: Optional[UUID] = Field(None, description="Filtrer par branche spécifique")
     status: Optional[SaleStatus] = None
     payment_method: Optional[PaymentMethod] = None
     is_credit: Optional[bool] = None
@@ -216,6 +217,8 @@ class SaleInDB(BaseModel):
     pharmacy_id: UUID
     pharmacy_name: Optional[str] = None
     pharmacy_code: Optional[str] = None
+    branch_id: Optional[UUID] = None
+    branch_name: Optional[str] = None
     reference: str
     customer_id: Optional[UUID]
     customer_name: str
@@ -247,6 +250,7 @@ class SaleInDB(BaseModel):
     cancelled_at: Optional[datetime]
     cancelled_by: Optional[UUID]
     cancel_reason: Optional[str]
+    items: Optional[List[SaleItemResponse]] = Field(default=None, description="Articles de la vente")
     
     @computed_field
     @property
@@ -320,24 +324,97 @@ class SaleListResponse(BaseModel):
     page: int
     size: int
     has_more: bool
+    page_size: int
     pharmacies_summary: Optional[Dict[str, Any]] = None
-    
 
 
 # ============================
 # SALE DETAIL RESPONSE
 # ============================
 class SaleDetailResponse(BaseModel):
-    sale: SaleInDB
+    """Réponse détaillée pour une vente spécifique"""
+    id: UUID
+    tenant_id: UUID
+    pharmacy_id: UUID
+    pharmacy_name: Optional[str] = None
+    branch_id: Optional[UUID] = None
+    branch_name: Optional[str] = None
+    reference: str
+    customer_id: Optional[UUID]
+    customer_name: str
+    customer_phone: Optional[str]
+    created_by: UUID
+    seller_name: str
+    created_at: datetime
+    updated_at: datetime
+    payment_method: str
+    reference_payment: Optional[str]
+    payment_date: Optional[datetime]
+    is_credit: bool
+    credit_due_date: Optional[date]
+    guarantee_deposit: float
+    guarantor_name: Optional[str]
+    guarantor_phone: Optional[str]
+    global_discount: float
+    notes: Optional[str]
+    subtotal: float
+    total_discount: float
+    total_tva: float
+    total_amount: float
+    status: str
+    validated_by: Optional[UUID]
+    validated_at: Optional[datetime]
+    cancelled_at: Optional[datetime]
+    cancelled_by: Optional[UUID]
+    cancel_reason: Optional[str]
+    invoice_number: Optional[str]
+    receipt_path: Optional[str]
+    invoice_path: Optional[str]
     items: List[SaleItemResponse]
-    pharmacy: Dict[str, Any]
-    client: Optional[Dict[str, Any]] = None
-    creator: Dict[str, Any]
-    payments: List[Dict[str, Any]] = []
-    refunds: List[Dict[str, Any]] = []
-    can_refund: bool
-    can_cancel: bool
-    can_validate: bool
+    
+    @computed_field
+    @property
+    def amount_paid(self) -> float:
+        """Montant total payé"""
+        if not self.is_credit:
+            return float(self.total_amount)
+        if self.guarantee_deposit:
+            return float(self.guarantee_deposit)
+        return 0.0
+    
+    @computed_field
+    @property
+    def amount_due(self) -> float:
+        """Montant restant à payer"""
+        total = float(self.total_amount)
+        paid = self.amount_paid
+        return max(0.0, total - paid)
+    
+    @computed_field
+    @property
+    def is_paid(self) -> bool:
+        """Vérifie si la vente est entièrement payée"""
+        return self.amount_due <= 0.01
+    
+    @computed_field
+    @property
+    def can_refund(self) -> bool:
+        """Vérifie si la vente peut être remboursée"""
+        return self.status in ["completed", "pending"] and self.total_amount > 0
+    
+    @computed_field
+    @property
+    def can_cancel(self) -> bool:
+        """Vérifie si la vente peut être annulée"""
+        return self.status in ["pending", "completed"] and not self.is_credit
+    
+    @computed_field
+    @property
+    def can_validate(self) -> bool:
+        """Vérifie si la vente peut être validée"""
+        return self.status == "pending"
+    
+    model_config = ConfigDict(from_attributes=True)
 
 
 # ============================
@@ -510,6 +587,7 @@ class SaleExportRequest(BaseModel):
     start_date: date
     end_date: date
     pharmacy_id: Optional[UUID] = None
+    branch_id: Optional[UUID] = None
     format: str = Field("xlsx", pattern="^(xlsx|csv|pdf)$")
     include_details: bool = False
     

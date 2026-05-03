@@ -22,6 +22,7 @@ class User(Base):
     telephone = Column(String(20), nullable=True)
     adresse = Column(String(200), nullable=True)
     permissions = Column(JSON, nullable=True)
+    department_id = Column(UUID(as_uuid=True), ForeignKey("departments.id", ondelete="SET NULL"), nullable=True)
 
     # =========================
     # Sécurité & Contrôle accès
@@ -124,6 +125,19 @@ class User(Base):
         back_populates="user", 
         cascade="all, delete-orphan",
         foreign_keys="UserBranch.user_id"
+    )
+    department = relationship(
+        "Department", 
+        foreign_keys=[department_id],  # Ajoutez ceci
+        back_populates="employees"
+    )
+    managed_departments = relationship("Department", foreign_keys="[Department.manager_id]", back_populates="manager")
+    assisted_departments = relationship("Department", foreign_keys="[Department.assistant_manager_id]", back_populates="assistant_manager")
+    managed_projects = relationship(
+        "Project", 
+        foreign_keys="[Project.manager_id]", 
+        back_populates="manager",
+        cascade="all, delete-orphan"
     )
     
     # =========================

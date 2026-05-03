@@ -14,13 +14,14 @@ from sqlalchemy import and_, or_, func
 from app.models.supplier_credit import (
     SupplierCreditConfig, SupplierDebt, PurchaseCredit, 
     ProductCreditItem, SaleCreditAllocation, SupplierCreditTransaction,
-    AdjustedCapital, CreditStatus, PaymentFrequency, ProductOwnershipStatus
+     CreditStatus, PaymentFrequency, ProductOwnershipStatus
 )
 from app.models.cost import Supplier
 from app.models.purchase import Purchase, PurchaseItem
 from app.models.product import Product
 from app.models.sale import Sale, SaleItem
 from app.models.finance import Expense
+from app.models.capital import AdjustedCapital
 
 
 class SupplierCreditService:

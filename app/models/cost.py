@@ -67,6 +67,15 @@ class BudgetPeriod(str, PyEnum):
     ANNUEL = "annuel"
     PERSONNALISE = "personnalise"
 
+class AllocationStatus(str, PyEnum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+    PARTIALLY_ALLOCATED = "partially_allocated"
+    FULLY_ALLOCATED = "fully_allocated"
+
+
 # =====================================
 # MODÈLE COST (DÉPENSE)
 # =====================================
@@ -87,7 +96,7 @@ class Cost(Base):
                       comment="Référence unique de la dépense")
     
     category = Column(
-        String(50),  # Changé de ENUM à String pour éviter les problèmes
+        String(50),
         nullable=False, 
         default=CostCategory.DIVERSE.value
     )
@@ -105,10 +114,7 @@ class Cost(Base):
     # =====================================
     # PAIEMENT
     # =====================================
-    payment_method = Column(
-        String(20),  # Changé de ENUM à String
-        default=PaymentMethod.CASH.value
-    )
+    payment_method = Column(String(20), default=PaymentMethod.CASH.value)
     payment_date = Column(Date, nullable=False, default=date.today)
     due_date = Column(Date, nullable=True)
     is_paid = Column(Boolean, default=True)
@@ -122,10 +128,7 @@ class Cost(Base):
     # =====================================
     # RÉCURRENCE
     # =====================================
-    frequency = Column(
-        String(20),  # Changé de ENUM à String
-        default=CostFrequency.UNIQUE.value
-    )
+    frequency = Column(String(20), default=CostFrequency.UNIQUE.value)
     is_recurring = Column(Boolean, default=False)
     recurring_until = Column(Date, nullable=True)
     next_payment_date = Column(Date, nullable=True)
@@ -169,6 +172,12 @@ class Cost(Base):
                            comment="Différence entre budget alloué et dépense réelle")
     
     # =====================================
+    # DÉPARTEMENT ET PROJET
+    # =====================================
+    department_id = Column(UUID(as_uuid=True), ForeignKey("departments.id"), nullable=True)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id"), nullable=True)
+    
+    # =====================================
     # MÉTADONNÉES
     # =====================================
     cost_metadata = Column(JSON, default=dict)
@@ -181,14 +190,20 @@ class Cost(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     
     # =====================================
-    # RELATIONS (avec back_populates cohérents)
+    # RELATIONS
+    # =====================================
+    # =====================================
+    # RELATIONS
     # =====================================
     tenant = relationship("Tenant", back_populates="costs")
     supplier = relationship("Supplier", back_populates="costs")
     creator = relationship("User", foreign_keys=[created_by], back_populates="costs_created")
     approver = relationship("User", foreign_keys=[approved_by], back_populates="costs_approved")
     budget = relationship("Budget", back_populates="costs")
-    
+    department = relationship("Department", back_populates="costs", lazy='select')
+    project = relationship("Project", back_populates="costs", lazy='select')
+    allocations = relationship("CostAllocation", back_populates="cost", cascade="all, delete-orphan")
+        
     # =====================================
     # INDEXES
     # =====================================
@@ -199,6 +214,8 @@ class Cost(Base):
         Index('ix_costs_tenant_supplier', 'tenant_id', 'supplier_id'),
         Index('ix_costs_tenant_budget', 'tenant_id', 'budget_id'),
         Index('ix_costs_tenant_created_by', 'tenant_id', 'created_by'),
+        Index('ix_costs_tenant_department', 'tenant_id', 'department_id'),
+        Index('ix_costs_tenant_project', 'tenant_id', 'project_id'),
         CheckConstraint('amount >= 0', name='check_amount_positive'),
         CheckConstraint('total_amount >= 0', name='check_total_amount_positive'),
     )
@@ -208,14 +225,12 @@ class Cost(Base):
     # =====================================
     @validates('amount', 'tax_amount', 'total_amount')
     def validate_amounts(self, key, value):
-        """Valide que les montants ne sont pas négatifs"""
         if value < 0:
             raise ValueError(f"{key} ne peut pas être négatif")
         return value
     
     @validates('payment_date', 'due_date')
     def validate_dates(self, key, value):
-        """Valide les dates"""
         if value and value > date.today() and key == 'payment_date':
             raise ValueError("La date de paiement ne peut pas être dans le futur")
         return value
@@ -225,7 +240,6 @@ class Cost(Base):
     # =====================================
     @property
     def days_overdue(self) -> int:
-        """Jours de retard si paiement en attente"""
         if not self.is_paid and self.due_date:
             today = date.today()
             if today > self.due_date:
@@ -234,14 +248,12 @@ class Cost(Base):
     
     @property
     def tax_percentage(self) -> float:
-        """Pourcentage de taxe par rapport au montant"""
         if self.amount == 0:
             return 0.0
         return float((self.tax_amount / self.amount) * 100)
     
     @property
     def payment_status(self) -> str:
-        """Statut de paiement détaillé"""
         if self.is_paid:
             return "paid"
         if self.due_date and date.today() > self.due_date:
@@ -250,14 +262,30 @@ class Cost(Base):
             return "pending"
         return "unplanned"
     
+    @property
+    def total_allocated(self) -> Decimal:
+        """Montant total alloué à ce coût"""
+        total = sum(a.allocated_amount for a in self.allocations if a.status == AllocationStatus.APPROVED.value)
+        return Decimal(str(total))
+    
+    @property
+    def remaining_to_allocate(self) -> Decimal:
+        """Montant restant à allouer"""
+        return self.total_amount - self.total_allocated
+    
+    @property
+    def allocation_percentage(self) -> float:
+        """Pourcentage alloué"""
+        if self.total_amount == 0:
+            return 0.0
+        return float((self.total_allocated / self.total_amount) * 100)
+    
     # =====================================
     # MÉTHODES
     # =====================================
     def calculate_totals(self) -> 'Cost':
-        """Calcule les totaux automatiquement"""
         self.total_amount = self.amount + (self.tax_amount or 0)
         
-        # Calcul de la variance budgétaire si lié à un budget
         if self.budget and self.is_budgeted:
             allocated = self.budget.allocated_amount
             if allocated > 0:
@@ -266,7 +294,6 @@ class Cost(Base):
         return self
     
     def mark_as_paid(self, user_id: uuid.UUID, payment_date: date = None) -> 'Cost':
-        """Marque la dépense comme payée"""
         self.is_paid = True
         self.status = "paid"
         self.approved_by = user_id
@@ -275,19 +302,16 @@ class Cost(Base):
         return self
     
     def submit_for_approval(self) -> 'Cost':
-        """Soumet la dépense pour approbation"""
         self.status = "submitted"
         return self
     
     def approve(self, user_id: uuid.UUID) -> 'Cost':
-        """Approuve la dépense"""
         self.status = "approved"
         self.approved_by = user_id
         self.approval_date = datetime.utcnow()
         return self
     
     def reject(self, user_id: uuid.UUID, reason: str) -> 'Cost':
-        """Rejette la dépense"""
         self.status = "rejected"
         self.approved_by = user_id
         self.approval_date = datetime.utcnow()
@@ -295,7 +319,6 @@ class Cost(Base):
         return self
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convertit en dictionnaire"""
         return {
             "id": str(self.id),
             "tenant_id": str(self.tenant_id),
@@ -315,10 +338,201 @@ class Cost(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "payment_status": self.payment_status,
             "days_overdue": self.days_overdue,
+            "total_allocated": float(self.total_allocated),
+            "remaining_to_allocate": float(self.remaining_to_allocate),
+            "allocation_percentage": self.allocation_percentage
         }
     
     def __repr__(self) -> str:
         return f"<Cost {self.reference} | {self.total_amount} {self.currency} | {self.category}>"
+
+
+# =====================================
+# MODÈLE COST ALLOCATION
+# =====================================
+class CostAllocation(Base):
+    """
+    Allocation des coûts entre différents départements, projets ou centres de coût.
+    Permet de répartir un coût sur plusieurs entités.
+    """
+    __tablename__ = "cost_allocations"
+
+    # =====================================
+    # IDENTIFIANTS
+    # =====================================
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True)
+    cost_id = Column(UUID(as_uuid=True), ForeignKey("costs.id"), nullable=False, index=True)
+    
+    # =====================================
+    # ENTITÉS D'ALLOCATION
+    # =====================================
+    department_id = Column(UUID(as_uuid=True), ForeignKey("departments.id"), nullable=True, index=True)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id"), nullable=True, index=True)
+    
+    # =====================================
+    # MONTANTS
+    # =====================================
+    allocated_amount = Column(DECIMAL(15, 2), nullable=False, comment="Montant alloué")
+    allocation_percentage = Column(DECIMAL(5, 2), nullable=True, comment="Pourcentage d'allocation (si répartition proportionnelle)")
+    
+    # =====================================
+    # STATUT
+    # =====================================
+    status = Column(String(20), default=AllocationStatus.PENDING.value, 
+                   comment="pending, approved, rejected, cancelled")
+    
+    # =====================================
+    # DESCRIPTION
+    # =====================================
+    notes = Column(Text, nullable=True, comment="Justification de l'allocation")
+    allocation_reference = Column(String(100), nullable=True, comment="Référence externe")
+    
+    # =====================================
+    # APPROBATION
+    # =====================================
+    approved_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    approved_at = Column(DateTime, nullable=True)
+    
+    # =====================================
+    # PÉRIODE
+    # =====================================
+    allocation_date = Column(Date, nullable=False, default=date.today, comment="Date d'allocation")
+    start_date = Column(Date, nullable=True, comment="Date de début de validité")
+    end_date = Column(Date, nullable=True, comment="Date de fin de validité")
+    
+    # =====================================
+    # MÉTADONNÉES
+    # =====================================
+    allocation_metadata = Column(JSON, default=dict, comment="Métadonnées supplémentaires")
+    
+    # =====================================
+    # TIMESTAMPS
+    # =====================================
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    
+    # =====================================
+    # RELATIONS
+    # =====================================
+    tenant = relationship("Tenant", back_populates="cost_allocations")
+    cost = relationship("Cost", back_populates="allocations")
+    department = relationship("Department", back_populates="cost_allocations")
+    project = relationship("Project", back_populates="cost_allocations")
+    approver = relationship("User", foreign_keys=[approved_by])
+    creator = relationship("User", foreign_keys=[created_by])
+    
+    # =====================================
+    # INDEXES
+    # =====================================
+    __table_args__ = (
+        Index('ix_cost_allocations_cost', 'cost_id'),
+        Index('ix_cost_allocations_department', 'department_id'),
+        Index('ix_cost_allocations_project', 'project_id'),
+        Index('ix_cost_allocations_status', 'status'),
+        Index('ix_cost_allocations_date', 'allocation_date'),
+        Index('ix_cost_allocations_tenant_cost', 'tenant_id', 'cost_id'),
+        CheckConstraint('allocated_amount >= 0', name='check_allocated_amount_positive'),
+        CheckConstraint('allocation_percentage IS NULL OR (allocation_percentage >= 0 AND allocation_percentage <= 100)', 
+                       name='check_allocation_percentage_range'),
+    )
+    
+    # =====================================
+    # VALIDATIONS
+    # =====================================
+    @validates('allocated_amount')
+    def validate_allocated_amount(self, key, value):
+        if value < 0:
+            raise ValueError("Le montant alloué ne peut pas être négatif")
+        return value
+    
+    @validates('allocation_percentage')
+    def validate_percentage(self, key, value):
+        if value is not None and (value < 0 or value > 100):
+            raise ValueError("Le pourcentage d'allocation doit être entre 0 et 100")
+        return value
+    
+    @validates('status')
+    def validate_status(self, key, value):
+        allowed = ["pending", "approved", "rejected", "cancelled", "partially_allocated", "fully_allocated"]
+        if value not in allowed:
+            raise ValueError(f"Status doit être l'un des: {allowed}")
+        return value
+    
+    # =====================================
+    # PROPRIÉTÉS
+    # =====================================
+    @property
+    def is_approved(self) -> bool:
+        return self.status == AllocationStatus.APPROVED.value
+    
+    @property
+    def is_pending(self) -> bool:
+        return self.status == AllocationStatus.PENDING.value
+    
+    @property
+    def is_active(self) -> bool:
+        """Vérifie si l'allocation est active (approuvée et dans la période)"""
+        if not self.is_approved:
+            return False
+        today = date.today()
+        if self.start_date and today < self.start_date:
+            return False
+        if self.end_date and today > self.end_date:
+            return False
+        return True
+    
+    # =====================================
+    # MÉTHODES
+    # =====================================
+    def approve(self, user_id: uuid.UUID) -> 'CostAllocation':
+        """Approuve l'allocation"""
+        self.status = AllocationStatus.APPROVED.value
+        self.approved_by = user_id
+        self.approved_at = datetime.utcnow()
+        return self
+    
+    def reject(self, user_id: uuid.UUID, reason: str = None) -> 'CostAllocation':
+        """Rejette l'allocation"""
+        self.status = AllocationStatus.REJECTED.value
+        self.approved_by = user_id
+        self.approved_at = datetime.utcnow()
+        if reason:
+            self.notes = reason
+        return self
+    
+    def cancel(self) -> 'CostAllocation':
+        """Annule l'allocation"""
+        self.status = AllocationStatus.CANCELLED.value
+        return self
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convertit en dictionnaire"""
+        return {
+            "id": str(self.id),
+            "tenant_id": str(self.tenant_id),
+            "cost_id": str(self.cost_id),
+            "department_id": str(self.department_id) if self.department_id else None,
+            "project_id": str(self.project_id) if self.project_id else None,
+            "allocated_amount": float(self.allocated_amount),
+            "allocation_percentage": float(self.allocation_percentage) if self.allocation_percentage else None,
+            "status": self.status,
+            "notes": self.notes,
+            "allocation_reference": self.allocation_reference,
+            "allocation_date": self.allocation_date.isoformat() if self.allocation_date else None,
+            "start_date": self.start_date.isoformat() if self.start_date else None,
+            "end_date": self.end_date.isoformat() if self.end_date else None,
+            "is_approved": self.is_approved,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "created_by": str(self.created_by) if self.created_by else None,
+            "approved_by": str(self.approved_by) if self.approved_by else None,
+            "approved_at": self.approved_at.isoformat() if self.approved_at else None,
+        }
+    
+    def __repr__(self) -> str:
+        return f"<CostAllocation {self.id} | Cost: {self.cost_id} | Amount: {self.allocated_amount}>"
 
 
 # =====================================
@@ -337,11 +551,11 @@ class Budget(Base):
     code = Column(String(50), unique=True, nullable=False, index=True)
     
     # Catégorie
-    category = Column(String(50), nullable=False)  # Changé de ENUM à String
+    category = Column(String(50), nullable=False)
     subcategory = Column(String(100), nullable=True)
     
     # Période
-    period_type = Column(String(20), nullable=False)  # Changé de ENUM à String
+    period_type = Column(String(20), nullable=False)
     start_date = Column(Date, nullable=False)
     end_date = Column(Date, nullable=False)
     
@@ -354,6 +568,10 @@ class Budget(Base):
     # Seuils d'alerte
     warning_threshold = Column(DECIMAL(5, 2), default=80.0, comment="Seuil d'avertissement en %")
     critical_threshold = Column(DECIMAL(5, 2), default=95.0, comment="Seuil critique en %")
+    
+    # Département/Projet
+    department_id = Column(UUID(as_uuid=True), ForeignKey("departments.id"), nullable=True)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id"), nullable=True)
     
     # Responsable
     owner_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
@@ -375,12 +593,16 @@ class Budget(Base):
     tenant = relationship("Tenant", back_populates="budgets")
     owner = relationship("User", foreign_keys=[owner_id], back_populates="budgets_owned")
     costs = relationship("Cost", back_populates="budget")
+    department = relationship("Department", back_populates="budgets")
+    project = relationship("Project", back_populates="budgets")
     
     # Indexes
     __table_args__ = (
         Index('ix_budgets_tenant_period', 'tenant_id', 'start_date', 'end_date'),
         Index('ix_budgets_tenant_category', 'tenant_id', 'category'),
         Index('ix_budgets_tenant_status', 'tenant_id', 'status'),
+        Index('ix_budgets_department', 'department_id'),
+        Index('ix_budgets_project', 'project_id'),
         CheckConstraint('allocated_amount >= 0', name='check_budget_amount_positive'),
         CheckConstraint('start_date <= end_date', name='check_budget_dates'),
     )
@@ -388,14 +610,12 @@ class Budget(Base):
     # Propriétés
     @property
     def spending_percentage(self) -> float:
-        """Pourcentage de dépense par rapport au budget alloué"""
         if self.allocated_amount == 0:
             return 0.0
         return float((self.spent_amount / self.allocated_amount) * 100)
     
     @property
     def commitment_percentage(self) -> float:
-        """Pourcentage d'engagement (dépenses + engagements)"""
         if self.allocated_amount == 0:
             return 0.0
         total_committed = self.spent_amount + self.committed_amount
@@ -403,7 +623,6 @@ class Budget(Base):
     
     @property
     def days_remaining(self) -> int:
-        """Jours restants dans la période du budget"""
         today = date.today()
         if today > self.end_date:
             return 0
@@ -411,7 +630,6 @@ class Budget(Base):
     
     @property
     def alert_level(self) -> str:
-        """Niveau d'alerte basé sur les seuils"""
         percentage = self.spending_percentage
         if percentage >= self.critical_threshold:
             return "critical"
@@ -420,42 +638,37 @@ class Budget(Base):
         return "normal"
     
     # Méthodes
-    def update_amounts(self, db_session) -> 'Budget':
+    def update_spent_amount(self, db_session) -> 'Budget':
         """Met à jour les montants dépensés et engagés"""
         from sqlalchemy import func
         
-        # Calcul des dépenses payées
         spent_result = db_session.query(func.sum(Cost.total_amount)).filter(
             Cost.tenant_id == self.tenant_id,
             Cost.budget_id == self.id,
             Cost.is_paid == True,
             Cost.status == 'paid'
         ).scalar()
-        self.spent_amount = spent_result or 0.0
+        self.spent_amount = spent_result or Decimal('0')
         
-        # Calcul des engagements (dépenses approuvées mais non payées)
         committed_result = db_session.query(func.sum(Cost.total_amount)).filter(
             Cost.tenant_id == self.tenant_id,
             Cost.budget_id == self.id,
             Cost.is_paid == False,
             Cost.status.in_(['approved', 'submitted'])
         ).scalar()
-        self.committed_amount = committed_result or 0.0
+        self.committed_amount = committed_result or Decimal('0')
         
-        # Calcul du montant restant
         self.remaining_amount = self.allocated_amount - self.spent_amount
         
         return self
     
     def close_budget(self) -> 'Budget':
-        """Ferme le budget"""
         self.status = "closed"
         self.closed_at = datetime.utcnow()
         self.is_active = False
         return self
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convertit en dictionnaire"""
         return {
             "id": str(self.id),
             "tenant_id": str(self.tenant_id),
@@ -569,7 +782,6 @@ class Supplier(Base):
     notes = Column(Text, nullable=True)
     supplier_metadata = Column(JSON, default=dict)
     
-    
     # =====================================
     # TIMESTAMPS
     # =====================================
@@ -620,7 +832,6 @@ class Supplier(Base):
     # =====================================
     @property
     def full_address(self) -> str:
-        """Adresse complète formatée"""
         parts = []
         if self.address:
             parts.append(self.address)
@@ -634,7 +845,6 @@ class Supplier(Base):
     
     @property
     def overall_score(self) -> float:
-        """Score global"""
         weights = {'reliability': 0.4, 'delivery': 0.3, 'quality': 0.3}
         total = (
             self.reliability_score * weights['reliability'] +
@@ -645,7 +855,6 @@ class Supplier(Base):
     
     @property
     def days_since_last_order(self) -> Optional[int]:
-        """Jours depuis la dernière commande"""
         if self.last_order_date:
             return (date.today() - self.last_order_date).days
         return None
@@ -655,7 +864,6 @@ class Supplier(Base):
     # =====================================
     def update_rating(self, new_rating: float, reliability: float = None, 
                      delivery: float = None, quality: float = None) -> 'Supplier':
-        """Met à jour les évaluations"""
         self.rating_count += 1
         current_total = self.rating * (self.rating_count - 1)
         self.rating = (current_total + new_rating) / self.rating_count
@@ -670,14 +878,12 @@ class Supplier(Base):
         return self
     
     def blacklist(self, reason: str) -> 'Supplier':
-        """Met le fournisseur sur liste noire"""
         self.is_blacklisted = True
         self.status = "blacklisted"
         self.blacklist_reason = reason
         return self
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convertit en dictionnaire"""
         return {
             "id": str(self.id),
             "tenant_id": str(self.tenant_id),

@@ -123,9 +123,14 @@ class Department(Base):
     children = relationship("Department", back_populates="parent")
     manager = relationship("User", foreign_keys=[manager_id], back_populates="managed_departments")
     assistant_manager = relationship("User", foreign_keys=[assistant_manager_id], back_populates="assisted_departments")
-    employees = relationship("User", back_populates="department")
+    employees = relationship(
+        "User", 
+        foreign_keys="[User.department_id]",  # Spécifiez explicitement
+        back_populates="department"
+    )
     projects = relationship("Project", back_populates="department")
-    costs = relationship("Cost", back_populates="department")
+    costs = relationship("Cost", back_populates="department", lazy='select')
+    cost_allocations = relationship("CostAllocation", back_populates="department")
     budgets = relationship("Budget", back_populates="department")
     
     # =====================================

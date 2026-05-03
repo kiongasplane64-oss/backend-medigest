@@ -6,54 +6,58 @@ Objectif: importer les modèles pour enregistrer les tables dans Base.metadata
 """
 
 # =========================
-# Modèles SaaS / Core
+# 1. MODÈLES DE BASE (sans dépendances externes)
 # =========================
-from app.models.user_subscription import UserSubscription 
 from .tenant import Tenant
 from .user import User
 from .subscription import Subscription
 from .pharmacy import Pharmacy
 from .user_pharmacy import UserPharmacy
 from .sync_log import SyncLog
+from .branch import Branch
+from .category import Category
+from .customer import Customer
 
 # =========================
-# Gestion / Business
+# 2. MODÈLES DE STRUCTURE (dépendent des modèles de base)
+# =========================
+from .department import Department  
+from .project import Project        
+from .user_branch import UserBranch
+from .branch_subscription import BranchSubscription
+from .user_subscription import UserSubscription
+
+# =========================
+# 3. MODÈLES FINANCIERS (dépendent des modèles de structure)
+# =========================
+from .cost import Cost, Budget, Supplier, CostAllocation
+from .finance import FinancialPeriod, FinancialTransaction, Expense
+from .capital import Capital, CapitalAccount, CapitalTransaction, Turnover, AdjustedCapital
+
+# =========================
+# 4. MODÈLES DE PRODUITS ET STOCK
 # =========================
 from .product import Product, ProductStock
-from .sale import Sale
-
-from .invoice import Invoice
-from .invoice_payment import InvoicePayment
-
-from .purchase import Purchase, PurchaseItem, PurchasePayment
-
+from .stock_movement import StockMovement, InventoryCount, InventoryCountItem
+from .stock_adjustment import StockAdjustment, StockAdjustmentItem
 from .inventory import PhysicalInventory, InventoryItem, InventorySchedule
 
-from .finance import FinancialPeriod, FinancialTransaction, Expense
-from .cost import Cost, Budget, Supplier
-
-from .audit_log import AuditLog
-from .refund import Refund
+# =========================
+# 5. MODÈLES DE TRANSACTIONS
+# =========================
+from .sale import Sale
+from .purchase import Purchase, PurchaseItem, PurchasePayment
+from .invoice import Invoice
+from .invoice_payment import InvoicePayment
+from .payment import Payment
 from .debt import Debt
 from .debt_payment import DebtPayment
-from .payment import Payment
-from app.models.pharmacy import Pharmacy, PharmacyConfig
-from .transfert import ProductTransfer, TransferItem, TransferStatus, TransferType, TransferPriority
-from .stock_movement import StockMovement, InventoryCount, InventoryCountItem
-from app.models.stock_adjustment import StockAdjustment, StockAdjustmentItem
-from app.models.customer import Customer  
-from app.models.branch import Branch 
-from app.models.branch_subscription import BranchSubscription
-from app.models.subscription_code import SubscriptionCode, SubscriptionCodeStatus
-from app.models.category import Category
-from app.models.user_session import UserSession
-from app.models.order import Order, OrderStatus, PaymentStatus
-from app.models.capital import Capital, CapitalAccount, CapitalTransaction, Turnover
-from app.models.user_history import UserHistory
-from app.models.trash_bin import TrashBin
-from app.models.user_expense import UserExpense 
-from app.models.return_product import Return, ReturnItem
-from app.models.user_branch import UserBranch
+from .refund import Refund
+from .order import Order, OrderStatus, PaymentStatus
+
+# =========================
+# 6. MODÈLES DE CRÉDIT FOURNISSEUR
+# =========================
 from .supplier_credit import (
     SupplierCreditConfig,
     SupplierDebt,
@@ -61,11 +65,26 @@ from .supplier_credit import (
     ProductCreditItem,
     SaleCreditAllocation,
     SupplierCreditTransaction,
-    AdjustedCapital,
     CreditStatus,
     PaymentFrequency,
     ProductOwnershipStatus
 )
+
+# =========================
+# 7. TRANSFERTS ET RETOURS
+# =========================
+from .transfert import ProductTransfer, TransferItem, TransferStatus, TransferType, TransferPriority
+from .return_product import Return, ReturnItem
+
+# =========================
+# 8. AUTRES MODÈLES
+# =========================
+from .audit_log import AuditLog
+from .user_session import UserSession
+from .user_history import UserHistory
+from .trash_bin import TrashBin
+from .user_expense import UserExpense
+from .subscription_code import SubscriptionCode, SubscriptionCodeStatus
 
 __all__ = [
     # Core
@@ -75,69 +94,85 @@ __all__ = [
     "Pharmacy",
     "UserPharmacy",
     "SyncLog",
-    # Business
-    "Product",
-    "Sale",
-    "Invoice",
-    "InvoicePayment",
-    "InventoryCount",
-    "InventoryCountItem",
-    "Purchase",
-    "PurchaseItem",
-    "PurchasePayment",
-    "PhysicalInventory",
-    "InventoryItem",
-    "InventorySchedule",
-    "FinancialPeriod",
-    "FinancialTransaction",
-    "Capital",
-    "Expense",
+    "Branch",
+    "Category",
+    "Customer",
+    
+    # Structure
+    "Department",
+    "Project",
+    "UserBranch",
+    "BranchSubscription",
+    "UserSubscription",
+    
+    # Finance
     "Cost",
     "Budget",
     "Supplier",
-    "AuditLog",
-    "Refund",
-    "Debt",
-    "DebtPayment",
-    "Payment",
-    "ProductTransfer",
-    "TransferItem",
-    "TransferStatus",
-    "TransferType",
-    "Customer",
-    "Branch",
-    "UserSubscription",
-    "SubscriptionCode",
-    "SubscriptionCodeStatus",
-    "Category",
+    "CostAllocation",
+    "FinancialPeriod",
+    "FinancialTransaction",
+    "Expense",
+    "Capital",
+    "CapitalAccount",
+    "CapitalTransaction",
+    "Turnover",
+    "AdjustedCapital",
+    
+    # Produits
+    "Product",
+    "ProductStock",
+    "StockMovement",
+    "InventoryCount",
+    "InventoryCountItem",
     "StockAdjustment",
     "StockAdjustmentItem",
-    "UserSession",
-    "TransferPriority",
-    "StockMovement",
-    "ProductStock",
+    "PhysicalInventory",
+    "InventoryItem",
+    "InventorySchedule",
+    
+    # Transactions
+    "Sale",
+    "Purchase",
+    "PurchaseItem",
+    "PurchasePayment",
+    "Invoice",
+    "InvoicePayment",
+    "Payment",
+    "Debt",
+    "DebtPayment",
+    "Refund",
     "Order",
     "OrderStatus",
     "PaymentStatus",
-    "CapitalAccount", 
-    "CapitalTransaction",
-    "Turnover",
-    "UserHistory",
-    "TrashBin",
-    "PharmacyConfig",
-    "BranchSubscription",
-    "UserExpense",
-    "Return",
-    "ReturnItem",
-    "UserBranch",
+    
+    # Crédit
     "SupplierCreditConfig",
     "SupplierDebt",
     "PurchaseCredit",
     "ProductCreditItem",
     "SaleCreditAllocation",
     "SupplierCreditTransaction",
-    "AdjustedCapital",
     "CreditStatus",
     "PaymentFrequency",
-    "ProductOwnershipStatus"
+    "ProductOwnershipStatus",
+    
+    # Transferts
+    "ProductTransfer",
+    "TransferItem",
+    "TransferStatus",
+    "TransferType",
+    "TransferPriority",
+    "Return",
+    "ReturnItem",
+    
+    # Autres
+    "AuditLog",
+    "UserSession",
+    "UserHistory",
+    "TrashBin",
+    "UserExpense",
+    "SubscriptionCode",
+    "SubscriptionCodeStatus",
+    "PharmacyConfig",  # Si importé ailleurs
 ]

@@ -119,6 +119,7 @@ class Customer(Base):
     debts = relationship("Debt", back_populates="customer", cascade="all, delete-orphan")
     debt_payments = relationship("DebtPayment", back_populates="customer")
     orders = relationship("Order", back_populates="customer", cascade="all, delete-orphan")
+    projects = relationship("Project", back_populates="customer")
 
     # =======================
     # Indexes

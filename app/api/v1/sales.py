@@ -1908,11 +1908,18 @@ async def get_sale_by_id(
         # Récupérer la pharmacie
         pharmacy = db.query(Pharmacy).filter(Pharmacy.id == sale.pharmacy_id).first()
         
+        # Récupérer la branche si présente
+        branch = None
+        if sale.branch_id:
+            branch = db.query(Branch).filter(Branch.id == sale.branch_id).first()
+        
         return SaleDetailResponse(
             id=sale.id,
             tenant_id=sale.tenant_id,
             pharmacy_id=sale.pharmacy_id,
             pharmacy_name=pharmacy.name if pharmacy else None,
+            branch_id=sale.branch_id,
+            branch_name=branch.name if branch else None,
             reference=sale.reference,
             customer_id=sale.customer_id,
             customer_name=sale.customer_name,
@@ -1943,9 +1950,14 @@ async def get_sale_by_id(
             cancel_reason=sale.cancel_reason,
             invoice_number=sale.invoice_number,
             receipt_path=sale.receipt_path,
+            invoice_path=getattr(sale, 'invoice_path', None),
             items=[
                 SaleItemResponse(
                     id=item.id,
+                    sale_id=item.sale_id,
+                    tenant_id=item.tenant_id,
+                    pharmacy_id=item.pharmacy_id,
+                    created_at=item.created_at,
                     product_id=item.product_id,
                     product_name=item.product_name,
                     product_code=item.product_code,
@@ -1972,7 +1984,7 @@ async def get_sale_by_id(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur récupération de la vente: {str(e)}"
         )
-
+    
 @property
 def nom_complet(self):
     return self.full_name

@@ -152,7 +152,9 @@ class Tenant(Base):
     )
 
     payments = relationship("Payment", back_populates="tenant", cascade="all, delete-orphan")
+    departments = relationship("Department", back_populates="tenant", cascade="all, delete-orphan")
     costs = relationship("Cost", back_populates="tenant", lazy="noload")
+    cost_allocations = relationship("CostAllocation", back_populates="tenant", cascade="all, delete-orphan")
     budgets = relationship("Budget", back_populates="tenant", lazy="noload")
     suppliers = relationship("Supplier", back_populates="tenant", lazy="noload")
     subscriptions = relationship("Subscription", back_populates="tenant", lazy="noload")
@@ -180,6 +182,7 @@ class Tenant(Base):
     orders = relationship("Order", back_populates="tenant", cascade="all, delete-orphan")
     user_expenses = relationship("UserExpense", back_populates="tenant")
     returns = relationship("Return", back_populates="tenant", cascade="all, delete-orphan")
+    projects = relationship("Project", back_populates="tenant", cascade="all, delete-orphan")
 
     # =========================
     # INDEXES

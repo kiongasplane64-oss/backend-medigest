@@ -177,10 +177,11 @@ class Project(Base):
     manager = relationship("User", foreign_keys=[manager_id], back_populates="managed_projects")
     department = relationship("Department", back_populates="projects")
     customer = relationship("Customer", back_populates="projects")
-    team_members = relationship("ProjectMember", back_populates="project")
-    tasks = relationship("ProjectTask", back_populates="project")
-    milestones = relationship("ProjectMilestone", back_populates="project")
+    #team_members = relationship("ProjectMember")
+    #tasks = relationship("ProjectTask")
+    #milestones = relationship("ProjectMilestone")
     costs = relationship("Cost", back_populates="project")
+    cost_allocations = relationship("CostAllocation", back_populates="project")
     budgets = relationship("Budget", back_populates="project")
     
     # =====================================

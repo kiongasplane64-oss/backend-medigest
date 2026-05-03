@@ -1128,7 +1128,7 @@ def _get_expense_stats_by_branch(
     expenses = db.query(Expense).filter(
         Expense.tenant_id == tenant_id,
         Expense.branch_id == branch_id,
-        Expense.approval_status == "approved",
+        #Expense.approval_status == "approved",
         Expense.expense_date >= start_dt.date(),
         Expense.expense_date <= end_dt.date()
     ).all()
@@ -1441,7 +1441,7 @@ def _get_expense_categories_by_branch(
     ).filter(
         Expense.tenant_id == tenant_id,
         Expense.branch_id == branch_id,
-        Expense.approval_status == "approved",
+        #Expense.approval_status == "approved",
         Expense.expense_date >= start_dt.date(),
         Expense.expense_date <= end_dt.date()
     ).group_by(Expense.expense_type).order_by(desc("total")).limit(limit).all()

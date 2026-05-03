@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import Optional, List, Dict, Any
 from uuid import UUID
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class SupplierCreditConfigCreate(BaseModel):
@@ -33,7 +33,8 @@ class SupplierCreditConfigCreate(BaseModel):
     notes: Optional[str] = None
     meta_data: Dict[str, Any] = Field(default_factory=dict)
 
-    @validator("payment_frequency")
+    @field_validator("payment_frequency")
+    @classmethod
     def validate_frequency(cls, v):
         allowed = ["per_sale", "per_day", "per_week", "per_month", "fixed_date", "custom"]
         if v not in allowed:
@@ -70,6 +71,67 @@ class ManualRepaymentRequest(BaseModel):
     notes: Optional[str] = None
 
 
+# ==============================================
+# SCHÉMA PURCHASE CREDIT
+# ==============================================
+
+class PurchaseCreditCreate(BaseModel):
+    """
+    Schéma pour la création d'un achat à crédit
+    """
+    purchase_id: UUID
+    config_id: Optional[UUID] = None
+    notes: Optional[str] = None
+    meta_data: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("purchase_id")
+    @classmethod
+    def validate_purchase_id(cls, v):
+        if not v:
+            raise ValueError("purchase_id est requis")
+        return v
+
+
+class PurchaseCreditResponse(BaseModel):
+    id: UUID
+    purchase_id: str
+    supplier_id: str
+    supplier_name: Optional[str] = None
+    credit_amount: float
+    repaid_amount: float
+    remaining_amount: float
+    repayment_percentage: float
+    interest_rate_applied: float
+    payment_frequency: str
+    due_date: date
+    status: str
+    repayment_progress: float
+    created_at: datetime
+    notes: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class PurchaseCreditUpdate(BaseModel):
+    """Schéma pour la mise à jour d'un achat à crédit"""
+    status: Optional[str] = None
+    notes: Optional[str] = None
+    repaid_amount: Optional[Decimal] = Field(None, ge=0)
+    due_date: Optional[date] = None
+
+
+class PurchaseCreditListResponse(BaseModel):
+    """Réponse pour la liste des achats à crédit"""
+    total: int
+    items: List[PurchaseCreditResponse]
+    summary: Dict[str, Any] = Field(default_factory=dict)
+
+
+# ==============================================
+# AUTRES SCHÉMAS
+# ==============================================
+
 class SupplierBalanceResponse(BaseModel):
     supplier_id: str
     supplier_name: Optional[str] = None
@@ -100,6 +162,9 @@ class AdjustedCapitalResponse(BaseModel):
     equity_capital: float
     calculation_date: date
 
+    class Config:
+        from_attributes = True
+
 
 class RealProfitRequest(BaseModel):
     start_date: date
@@ -124,6 +189,7 @@ class SaleRepaymentResponse(BaseModel):
     id: UUID
     sale_id: str
     supplier_id: str
+    supplier_name: Optional[str] = None
     allocated_repayment: float
     capital_portion: float
     quantity_sold: int
@@ -133,17 +199,82 @@ class SaleRepaymentResponse(BaseModel):
         from_attributes = True
 
 
-class PurchaseCreditResponse(BaseModel):
+# ==============================================
+# SCHÉMAS POUR LES TRANSACTIONS
+# ==============================================
+
+class SupplierCreditTransactionResponse(BaseModel):
+    """Schéma pour une transaction de crédit"""
     id: UUID
-    purchase_id: str
-    supplier_id: str
-    credit_amount: float
-    repaid_amount: float
-    remaining_amount: float
-    repayment_percentage: float
-    due_date: date
-    status: str
-    repayment_progress: float
+    debt_id: UUID
+    supplier_id: UUID
+    supplier_name: Optional[str] = None
+    transaction_type: str
+    amount: float
+    amount_applied_to_principal: float
+    amount_applied_to_interest: float
+    amount_applied_to_fees: float
+    balance_before: float
+    balance_after: float
+    description: Optional[str]
+    reference: Optional[str]
+    transaction_date: date
+    created_at: datetime
+    created_by: Optional[UUID]
 
     class Config:
         from_attributes = True
+
+
+class SupplierDebtResponse(BaseModel):
+    """Schéma pour la dette d'un fournisseur"""
+    id: UUID
+    supplier_id: UUID
+    supplier_name: Optional[str] = None
+    total_credit_amount: float
+    total_repaid_amount: float
+    current_debt: float
+    accrued_interest: float
+    late_fees: float
+    debt_ratio: float
+    status: str
+    first_credit_date: Optional[date]
+    last_repayment_date: Optional[date]
+    next_due_date: Optional[date]
+
+    class Config:
+        from_attributes = True
+
+
+# ==============================================
+# SCHÉMAS POUR LE DASHBOARD
+# ==============================================
+
+class CreditDashboardSummary(BaseModel):
+    """Résumé du tableau de bord crédit"""
+    total_supplier_debt: float
+    active_credits: int
+    overdue_credits: int
+    suppliers_with_debt: int
+
+
+class AdjustedCapitalSummary(BaseModel):
+    """Résumé du capital ajusté"""
+    gross_capital: float
+    adjusted_capital: float
+    equity_capital: float
+    total_supplier_debt: float
+    formula: str
+
+
+class DashboardAlerts(BaseModel):
+    """Alertes du tableau de bord"""
+    overdue_alert: bool
+    high_debt_ratio: float
+
+
+class CreditDashboardResponse(BaseModel):
+    """Réponse complète du tableau de bord crédit"""
+    summary: CreditDashboardSummary
+    adjusted_capital: AdjustedCapitalSummary
+    alerts: DashboardAlerts

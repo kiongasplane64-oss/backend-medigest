@@ -21,19 +21,18 @@ from sqlalchemy import (
     Text,
     Date,
     Index,
+    Boolean,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship, validates
+from sqlalchemy.sql import func
 
 from app.db.base import Base
 
-# Import des modèles pour les relations
-#from app.models.tenant import Tenant
-##from app.models.pharmacy import Pharmacy
-#from app.models.branch import Branch
-#from app.models.user import User
 
-
+# =====================================
+# MODÈLE CAPITAL
+# =====================================
 class Capital(Base):
     """
     Capital d'une pharmacie ou succursale.
@@ -88,6 +87,7 @@ class Capital(Base):
     pharmacy = relationship("Pharmacy", back_populates="capitals")
     branch = relationship("Branch", back_populates="capitals")
     transactions = relationship("CapitalTransaction", back_populates="capital", cascade="all, delete-orphan")
+    adjusted_capitals = relationship("AdjustedCapital", back_populates="capital", cascade="all, delete-orphan")
 
     # =====================================
     # INDEXES ET CONFIGURATION
@@ -97,7 +97,6 @@ class Capital(Base):
         Index("ix_capitals_tenant_branch", "tenant_id", "branch_id"),
         Index("ix_capitals_start_date", "start_date"),
         Index("ix_capitals_last_update", "last_update_date"),
-        {"extend_existing": True},  # TOUJOURS EN DERNIER
     )
 
     # =====================================
@@ -105,7 +104,6 @@ class Capital(Base):
     # =====================================
     @validates("initial_capital", "current_capital", "cash_capital", "stock_capital", "equipment_capital", "other_capital")
     def validate_capital_amounts(self, key, value):
-        """Valide que les montants de capital ne sont pas négatifs"""
         if value is None:
             return Decimal('0')
         dec_value = Decimal(str(value))
@@ -115,7 +113,6 @@ class Capital(Base):
 
     @validates("start_date")
     def validate_start_date(self, key, value):
-        """Valide la date de début"""
         if value is None:
             return date.today()
         return value
@@ -125,17 +122,14 @@ class Capital(Base):
     # =====================================
     @property
     def total_capital(self) -> Decimal:
-        """Total du capital"""
         return self.cash_capital + self.stock_capital + self.equipment_capital + self.other_capital
 
     @property
     def capital_variation(self) -> Decimal:
-        """Variation du capital (actuel - initial)"""
         return self.current_capital - self.initial_capital
 
     @property
     def capital_growth_rate(self) -> float:
-        """Taux de croissance du capital en pourcentage"""
         if self.initial_capital == 0:
             return 0.0
         return float((self.capital_variation / self.initial_capital) * 100)
@@ -159,17 +153,10 @@ class Capital(Base):
         elif category == "other":
             self.other_capital += amount
 
-        self.current_capital = (
-            self.cash_capital +
-            self.stock_capital +
-            self.equipment_capital +
-            self.other_capital
-        )
-
+        self.current_capital = self.total_capital
         self.last_update_date = date.today()
 
     def remove_capital(self, amount: Decimal, category: str, description: str = None) -> None:
-        """Retire du capital"""
         amount = Decimal(str(amount))
         if amount > self.current_capital:
             raise ValueError("Montant à retirer supérieur au capital actuel")
@@ -196,13 +183,11 @@ class Capital(Base):
         self.last_update_date = date.today()
 
     def sync_stock_capital(self, stock_value: Decimal) -> None:
-        """Synchronise le capital en stock avec la valeur réelle du stock"""
         self.stock_capital = Decimal(str(stock_value))
-        self.current_capital = self.cash_capital + self.stock_capital + self.equipment_capital + self.other_capital
+        self.current_capital = self.total_capital
         self.last_update_date = date.today()
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convertit le modèle en dictionnaire"""
         return {
             "id": str(self.id),
             "tenant_id": str(self.tenant_id) if self.tenant_id else None,
@@ -226,6 +211,9 @@ class Capital(Base):
         return f"<Capital {self.pharmacy_id}: {self.current_capital} (Initial: {self.initial_capital})>"
 
 
+# =====================================
+# MODÈLE CAPITAL TRANSACTION
+# =====================================
 class CapitalTransaction(Base):
     """
     Transactions sur le capital.
@@ -310,15 +298,12 @@ class CapitalTransaction(Base):
     # =====================================
     @validates("amount")
     def validate_amount(self, key, value):
-        """Valide le montant de la transaction"""
         if value is None:
             return Decimal('0')
-        dec_value = Decimal(str(value))
-        return dec_value
+        return Decimal(str(value))
 
     @validates("transaction_type")
     def validate_transaction_type(self, key, value):
-        """Valide le type de transaction"""
         allowed_types = ["initial", "increase", "decrease", "profit_added", "loss_deducted"]
         if value not in allowed_types:
             raise ValueError(f"transaction_type doit être l'un des: {allowed_types}")
@@ -326,17 +311,12 @@ class CapitalTransaction(Base):
 
     @validates("transaction_category")
     def validate_transaction_category(self, key, value):
-        """Valide la catégorie de transaction"""
         allowed_categories = ["cash", "stock", "equipment", "other", "turnover", "expense", "all"]
         if value not in allowed_categories:
             raise ValueError(f"transaction_category doit être l'un des: {allowed_categories}")
         return value
 
-    # =====================================
-    # MÉTHODES
-    # =====================================
     def to_dict(self) -> Dict[str, Any]:
-        """Convertit le modèle en dictionnaire"""
         return {
             "id": str(self.id),
             "capital_id": str(self.capital_id),
@@ -361,6 +341,9 @@ class CapitalTransaction(Base):
         return f"<CapitalTransaction {self.transaction_type}: {self.amount} (Capital: {self.previous_capital} -> {self.new_capital})>"
 
 
+# =====================================
+# MODÈLE CAPITAL ACCOUNT (Comptes SYSCOHADA)
+# =====================================
 class CapitalAccount(Base):
     """
     Comptes selon la nomenclature SYSCOHADA.
@@ -428,21 +411,18 @@ class CapitalAccount(Base):
     # =====================================
     @validates("account_code")
     def validate_account_code(self, key, value):
-        """Valide le code du compte"""
         if not value or not value.strip():
             raise ValueError("Le code du compte est obligatoire")
         return value.strip()
 
     @validates("account_name")
     def validate_account_name(self, key, value):
-        """Valide le nom du compte"""
         if not value or not value.strip():
             raise ValueError("Le nom du compte est obligatoire")
         return value.strip()
 
     @validates("account_type")
     def validate_account_type(self, key, value):
-        """Valide le type de compte"""
         allowed_types = ["asset", "liability", "equity", "income", "expense"]
         if value not in allowed_types:
             raise ValueError(f"account_type doit être l'un des: {allowed_types}")
@@ -450,7 +430,6 @@ class CapitalAccount(Base):
 
     @validates("balance", "debit", "credit")
     def validate_numeric_values(self, key, value):
-        """Valide les valeurs numériques"""
         if value is None:
             return Decimal('0')
         return Decimal(str(value))
@@ -459,19 +438,16 @@ class CapitalAccount(Base):
     # MÉTHODES
     # =====================================
     def debit_account(self, amount: Decimal, description: str = None) -> None:
-        """Débite le compte"""
         amount = Decimal(str(amount))
         self.debit += amount
         self.balance += amount
 
     def credit_account(self, amount: Decimal, description: str = None) -> None:
-        """Crédite le compte"""
         amount = Decimal(str(amount))
         self.credit += amount
         self.balance -= amount
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convertit le modèle en dictionnaire"""
         return {
             "id": str(self.id),
             "tenant_id": str(self.tenant_id) if self.tenant_id else None,
@@ -493,6 +469,9 @@ class CapitalAccount(Base):
         return f"<CapitalAccount {self.account_code} - {self.account_name}: {self.balance}>"
 
 
+# =====================================
+# MODÈLE TURNOVER (Chiffre d'affaires)
+# =====================================
 class Turnover(Base):
     """
     Chiffre d'affaires par période.
@@ -556,7 +535,6 @@ class Turnover(Base):
     # =====================================
     @validates("total_turnover", "net_turnover", "tax_amount", "discount_amount")
     def validate_amounts(self, key, value):
-        """Valide les montants"""
         if value is None:
             return Decimal('0')
         dec_value = Decimal(str(value))
@@ -566,7 +544,6 @@ class Turnover(Base):
 
     @validates("sales_count", "items_sold")
     def validate_counts(self, key, value):
-        """Valide les compteurs"""
         if value is None:
             return 0
         if value < 0:
@@ -575,7 +552,6 @@ class Turnover(Base):
 
     @validates("period_type")
     def validate_period_type(self, key, value):
-        """Valide le type de période"""
         allowed_types = ["day", "week", "month", "year"]
         if value not in allowed_types:
             raise ValueError(f"period_type doit être l'un des: {allowed_types}")
@@ -585,7 +561,6 @@ class Turnover(Base):
     # MÉTHODES
     # =====================================
     def add_turnover(self, amount: Decimal, tax: Decimal = None, discount: Decimal = None) -> None:
-        """Ajoute du chiffre d'affaires"""
         amount = Decimal(str(amount))
         self.total_turnover += amount
         self.net_turnover += amount - (tax or Decimal('0'))
@@ -596,12 +571,10 @@ class Turnover(Base):
             self.discount_amount += Decimal(str(discount))
 
     def increment_sales(self, count: int = 1, items: int = 1) -> None:
-        """Incrémente le nombre de ventes et d'articles"""
         self.sales_count += count
         self.items_sold += items
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convertit le modèle en dictionnaire"""
         return {
             "id": str(self.id),
             "tenant_id": str(self.tenant_id) if self.tenant_id else None,
@@ -621,6 +594,230 @@ class Turnover(Base):
 
     def __repr__(self) -> str:
         return f"<Turnover {self.period_type} {self.period_date}: {self.total_turnover}>"
+
+
+# =====================================
+# MODÈLE ADJUSTED CAPITAL (Capital ajusté)
+# =====================================
+class AdjustedCapital(Base):
+    """
+    Capital ajusté prenant en compte les dettes fournisseurs.
+    Capital réel = Actif total - Dettes fournisseurs
+    Conforme aux normes SYSCOHADA
+    """
+    __tablename__ = "adjusted_capitals"
+
+    # =====================================
+    # IDENTIFIANTS
+    # =====================================
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, index=True)
+    pharmacy_id = Column(UUID(as_uuid=True), ForeignKey("pharmacies.id"), nullable=False, index=True)
+    branch_id = Column(UUID(as_uuid=True), ForeignKey("branches.id"), nullable=True, index=True)
+    capital_id = Column(UUID(as_uuid=True), ForeignKey("capitals.id"), nullable=True, index=True)
+
+    # =====================================
+    # ACTIFS (Ce que possède l'entreprise)
+    # =====================================
+    cash_in_hand = Column(Numeric(15, 2), nullable=False, default=Decimal('0'), comment="Argent en caisse (531)")
+    bank_balance = Column(Numeric(15, 2), nullable=False, default=Decimal('0'), comment="Solde bancaire (57)")
+    total_liquidities = Column(Numeric(15, 2), nullable=False, default=Decimal('0'), comment="Total liquidités")
+    
+    stock_value = Column(Numeric(15, 2), nullable=False, default=Decimal('0'), comment="Valeur du stock (31)")
+    equipment_value = Column(Numeric(15, 2), nullable=False, default=Decimal('0'), comment="Valeur de l'équipement (23)")
+    other_assets = Column(Numeric(15, 2), nullable=False, default=Decimal('0'), comment="Autres actifs")
+    
+    # =====================================
+    # PASSIFS (Ce que l'entreprise doit)
+    # =====================================
+    total_supplier_debt = Column(Numeric(15, 2), nullable=False, default=Decimal('0'), comment="Total dettes fournisseurs (40)")
+    other_liabilities = Column(Numeric(15, 2), nullable=False, default=Decimal('0'), comment="Autres dettes")
+    
+    # =====================================
+    # CAPITAUX CALCULÉS
+    # =====================================
+    gross_capital = Column(Numeric(15, 2), nullable=False, default=Decimal('0'), 
+                          comment="Capital brut = Total actifs")
+    adjusted_capital = Column(Numeric(15, 2), nullable=False, default=Decimal('0'), 
+                             comment="Capital réel = Actif total - Dettes")
+    equity_capital = Column(Numeric(15, 2), nullable=False, default=Decimal('0'), 
+                           comment="Capitaux propres")
+    
+    # =====================================
+    # RATIOS FINANCIERS
+    # =====================================
+    debt_ratio = Column(Numeric(5, 2), nullable=False, default=Decimal('0'), 
+                       comment="Ratio d'endettement (Dettes/Actif) en %")
+    liquidity_ratio = Column(Numeric(5, 2), nullable=False, default=Decimal('0'), 
+                            comment="Ratio de liquidité (Liquidités/Dettes à court terme)")
+    
+    # =====================================
+    # PÉRIODE DE CALCUL
+    # =====================================
+    calculation_date = Column(Date, nullable=False, default=date.today, index=True)
+    period_start = Column(Date, nullable=True)
+    period_end = Column(Date, nullable=True)
+    
+    # =====================================
+    # STATUT
+    # =====================================
+    is_current = Column(Boolean, default=True, comment="Est-ce la version la plus récente?")
+    calculation_version = Column(Integer, default=1, comment="Version du calcul")
+    
+    # =====================================
+    # MÉTADONNÉES
+    # =====================================
+    notes = Column(Text, nullable=True)
+    calculation_method = Column(String(50), default="auto", comment="auto, manual")
+    meta_data = Column(JSONB, default=dict)
+    
+    # =====================================
+    # TIMESTAMPS
+    # =====================================
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    calculated_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+
+    # =====================================
+    # RELATIONS
+    # =====================================
+    tenant = relationship("Tenant", foreign_keys=[tenant_id])
+    pharmacy = relationship("Pharmacy", foreign_keys=[pharmacy_id])
+    branch = relationship("Branch", foreign_keys=[branch_id])
+    capital = relationship("Capital", back_populates="adjusted_capitals")
+    calculator = relationship("User", foreign_keys=[calculated_by])
+
+    # =====================================
+    # INDEXES
+    # =====================================
+    __table_args__ = (
+        Index("ix_adjusted_capitals_pharmacy_date", "pharmacy_id", "calculation_date"),
+        Index("ix_adjusted_capitals_tenant_date", "tenant_id", "calculation_date"),
+        Index("ix_adjusted_capitals_current", "tenant_id", "pharmacy_id", "is_current"),
+        Index("ix_adjusted_capitals_capital", "capital_id"),
+        Index("ix_adjusted_capitals_period", "period_start", "period_end"),
+    )
+
+    # =====================================
+    # VALIDATIONS
+    # =====================================
+    @validates("cash_in_hand", "bank_balance", "stock_value", "equipment_value", "other_assets")
+    def validate_assets(self, key, value):
+        if value is None:
+            return Decimal('0')
+        dec_value = Decimal(str(value))
+        if dec_value < 0:
+            raise ValueError(f"{key} ne peut pas être négatif")
+        return dec_value
+
+    @validates("total_supplier_debt", "other_liabilities")
+    def validate_liabilities(self, key, value):
+        if value is None:
+            return Decimal('0')
+        dec_value = Decimal(str(value))
+        if dec_value < 0:
+            raise ValueError(f"{key} ne peut pas être négatif")
+        return dec_value
+
+    # =====================================
+    # PROPRIÉTÉS CALCULÉES
+    # =====================================
+    @property
+    def total_assets(self) -> Decimal:
+        """Total des actifs"""
+        return (self.cash_in_hand + self.bank_balance + self.stock_value + 
+                self.equipment_value + self.other_assets)
+
+    @property
+    def total_liabilities(self) -> Decimal:
+        """Total des dettes"""
+        return self.total_supplier_debt + self.other_liabilities
+
+    @property
+    def net_liquidities(self) -> Decimal:
+        """Liquidités nettes après déduction des dettes fournisseurs"""
+        return self.total_liquidities - self.total_supplier_debt
+
+    @property
+    def working_capital(self) -> Decimal:
+        """Fonds de roulement = Actif courant - Passif courant"""
+        current_assets = self.cash_in_hand + self.bank_balance + self.stock_value
+        current_liabilities = self.total_supplier_debt
+        return current_assets - current_liabilities
+
+    # =====================================
+    # MÉTHODES
+    # =====================================
+    def calculate(self) -> 'AdjustedCapital':
+        """
+        Calcule tous les indicateurs financiers selon les normes SYSCOHADA
+        """
+        # Calcul des totaux
+        self.total_liquidities = self.cash_in_hand + self.bank_balance
+        self.gross_capital = self.total_assets
+        self.equity_capital = self.total_assets - self.total_liabilities
+        self.adjusted_capital = self.gross_capital - self.total_supplier_debt
+        
+        # Calcul des ratios
+        if self.gross_capital > 0:
+            self.debt_ratio = (self.total_supplier_debt / self.gross_capital) * 100
+        else:
+            self.debt_ratio = Decimal('0')
+        
+        if self.total_supplier_debt > 0:
+            self.liquidity_ratio = (self.total_liquidities / self.total_supplier_debt) * 100
+        else:
+            self.liquidity_ratio = Decimal('100')
+        
+        self.updated_at = datetime.utcnow()
+        return self
+
+    def mark_as_current(self) -> 'AdjustedCapital':
+        """Marque cette entrée comme la version actuelle"""
+        # Désactiver les autres versions courantes pour cette pharmacie
+        from sqlalchemy.orm import Session
+        # Cette partie doit être exécutée avec une session
+        self.is_current = True
+        return self
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convertit le modèle en dictionnaire"""
+        return {
+            "id": str(self.id),
+            "tenant_id": str(self.tenant_id) if self.tenant_id else None,
+            "pharmacy_id": str(self.pharmacy_id) if self.pharmacy_id else None,
+            "branch_id": str(self.branch_id) if self.branch_id else None,
+            "capital_id": str(self.capital_id) if self.capital_id else None,
+            "cash_in_hand": float(self.cash_in_hand),
+            "bank_balance": float(self.bank_balance),
+            "total_liquidities": float(self.total_liquidities),
+            "stock_value": float(self.stock_value),
+            "equipment_value": float(self.equipment_value),
+            "other_assets": float(self.other_assets),
+            "total_supplier_debt": float(self.total_supplier_debt),
+            "other_liabilities": float(self.other_liabilities),
+            "gross_capital": float(self.gross_capital),
+            "adjusted_capital": float(self.adjusted_capital),
+            "equity_capital": float(self.equity_capital),
+            "debt_ratio": float(self.debt_ratio),
+            "liquidity_ratio": float(self.liquidity_ratio),
+            "total_assets": float(self.total_assets),
+            "total_liabilities": float(self.total_liabilities),
+            "net_liquidities": float(self.net_liquidities),
+            "working_capital": float(self.working_capital),
+            "calculation_date": self.calculation_date.isoformat() if self.calculation_date else None,
+            "period_start": self.period_start.isoformat() if self.period_start else None,
+            "period_end": self.period_end.isoformat() if self.period_end else None,
+            "is_current": self.is_current,
+            "calculation_method": self.calculation_method,
+            "notes": self.notes,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "calculated_by": str(self.calculated_by) if self.calculated_by else None,
+        }
+
+    def __repr__(self) -> str:
+        return f"<AdjustedCapital {self.pharmacy_id}: Gross={self.gross_capital}, Adjusted={self.adjusted_capital}, Date={self.calculation_date}>"
 
 
 # =====================================
