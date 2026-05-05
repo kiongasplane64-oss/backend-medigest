@@ -2259,3 +2259,62 @@ async def get_sellers_by_pharmacy(
         current_user=current_user,
         pharmacy_id=pharmacy_id
     )
+
+@router.get("/test-invoices")
+async def test_invoices_endpoint(
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+    branch_id: Optional[UUID] = Query(None, description="ID de la branche"),
+    start_date: Optional[str] = Query(None, description="Date de début YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="Date de fin YYYY-MM-DD"),
+):
+    """
+    Endpoint de test pour vérifier que le client peut récupérer les factures.
+    Point d'entrée temporaire pour debug.
+    """
+    tenant_id = current_tenant.id if current_tenant else None
+    
+    # Construire la requête
+    query = db.query(Sale).filter(Sale.tenant_id == tenant_id, Sale.status == "completed")
+    
+    if branch_id:
+        query = query.filter(Sale.branch_id == branch_id)
+    
+    if start_date:
+        try:
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            query = query.filter(Sale.created_at >= start_dt)
+        except:
+            pass
+    
+    if end_date:
+        try:
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+            end_dt = end_dt.replace(hour=23, minute=59, second=59)
+            query = query.filter(Sale.created_at <= end_dt)
+        except:
+            pass
+    
+    sales = query.order_by(desc(Sale.created_at)).limit(100).all()
+    
+    # Format simplifié pour test
+    result = []
+    for sale in sales:
+        result.append({
+            "id": str(sale.id),
+            "invoice_number": sale.invoice_number,
+            "reference": sale.reference,
+            "customer_name": sale.customer_name,
+            "total_amount": float(sale.total_amount) if sale.total_amount else 0,
+            "created_at": sale.created_at.isoformat() if sale.created_at else None,
+            "payment_method": sale.payment_method,
+            "status": sale.status,
+        })
+    
+    return {
+        "success": True,
+        "count": len(result),
+        "sales": result,
+        "message": "Utilisez /sales pour les données complètes"
+    }
