@@ -126,6 +126,47 @@ async def get_branch(
     
     return branch
 
+@router.get("/current", response_model=BranchResponse)
+async def get_current_branch(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant)
+):
+    """Récupère la branche de l'utilisateur connecté"""
+    
+    # Vérifier si l'utilisateur a une branche assignée
+    if current_user.branch_id:
+        branch = db.query(Branch).filter(
+            Branch.id == current_user.branch_id,
+            Branch.is_active == True
+        ).first()
+        
+        if branch:
+            # Corriger les valeurs NULL
+            if branch.is_main_branch is None:
+                branch.is_main_branch = False
+            if branch.is_active is None:
+                branch.is_active = True
+            return branch
+    
+    # Si pas de branche directe, chercher la première branche active du tenant
+    if current_tenant:
+        branch = db.query(Branch).filter(
+            Branch.tenant_id == current_tenant.id,
+            Branch.is_active == True
+        ).first()
+        
+        if branch:
+            if branch.is_main_branch is None:
+                branch.is_main_branch = False
+            if branch.is_active is None:
+                branch.is_active = True
+            return branch
+    
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Aucune branche trouvée pour cet utilisateur"
+    )
 
 @router.get("/{branch_id}/statistics")
 async def get_branch_statistics(

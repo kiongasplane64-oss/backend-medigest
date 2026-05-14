@@ -1,18 +1,23 @@
 # app/api/v1/endpoints/expenses.py
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
-from datetime import date
+from datetime import datetime, date
+import uuid
 
 from app.api import deps
 from app.db.session import get_db
 from app.models.user import User
+from app.models.pharmacy import Pharmacy
 from app.schemas.expense import (
     ExpenseCreate, ExpenseUpdate, ExpenseResponse, ExpenseListResponse,
     ExpenseApprove, ExpenseByBranchResponse, ExpenseByUserResponse,
     ExpenseSummaryResponse, ExpenseFilters
 )
 from app.services.expense_service import ExpenseService
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -306,3 +311,79 @@ def get_expense_details(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dépense non trouvée")
     
     return details
+
+
+@router.post("/batch", response_model=Dict[str, Any])
+async def batch_create_expenses(
+    batch_data: Dict[str, Any],
+    db: Session = Depends(get_db),
+    current_user: User = Depends(deps.get_current_user),
+    current_pharmacy: Optional[Pharmacy] = Depends(deps.get_current_pharmacy_entity),
+):
+    """
+    Endpoint batch pour synchroniser plusieurs dépenses.
+    Utilisé par le sync_manager mobile.
+    """
+    try:
+        expenses_data = batch_data.get("expenses", [])
+        branch_id = batch_data.get("branch_id")
+        batch_id = batch_data.get("batch_id", str(uuid.uuid4()))
+        
+        if not current_pharmacy:
+            return {
+                "success": False,
+                "error": "Aucune pharmacie active",
+                "synced_ids": []
+            }
+        
+        synced_ids = []
+        errors = []
+        
+        for expense_data in expenses_data:
+            try:
+                # Valider et convertir les données
+                expense_create = ExpenseCreate(
+                    expense_type=expense_data.get("expense_type", "other"),
+                    amount=float(expense_data.get("amount", 0)),
+                    description=expense_data.get("description", ""),
+                    expense_date=expense_data.get("expense_date", datetime.now().date().isoformat()),
+                    supplier=expense_data.get("supplier"),
+                    payment_method=expense_data.get("payment_method", "cash"),
+                    notes=expense_data.get("notes", ""),
+                    invoice_number=expense_data.get("invoice_number"),
+                    branch_id=branch_id or expense_data.get("branch_id")
+                )
+                
+                expense = ExpenseService.create_expense(
+                    db=db,
+                    tenant_id=current_user.tenant_id,
+                    user_id=current_user.id,
+                    expense_data=expense_create
+                )
+                
+                synced_ids.append(expense_data.get("local_id", str(expense.id)))
+                
+            except Exception as e:
+                errors.append({
+                    "local_id": expense_data.get("local_id"),
+                    "error": str(e)
+                })
+        
+        db.commit()
+        
+        return {
+            "success": True,
+            "synced_ids": synced_ids,
+            "errors": errors,
+            "batch_id": batch_id,
+            "total_synced": len(synced_ids),
+            "total_errors": len(errors)
+        }
+        
+    except Exception as e:
+        logger.error(f"Erreur batch expenses: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e),
+            "synced_ids": []
+        }

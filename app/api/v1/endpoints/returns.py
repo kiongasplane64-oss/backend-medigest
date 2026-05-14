@@ -37,6 +37,8 @@ from app.api.deps import (
     require_permission
 )
 
+import uuid
+
 router = APIRouter(prefix="/returns", tags=["Retours produits"])
 logger = logging.getLogger(__name__)
 
@@ -1244,6 +1246,120 @@ async def cancel_return(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur annulation: {str(e)}"
         )
+
+# À ajouter dans returns.py après les routes existantes
+
+@router.post("/batch", response_model=Dict[str, Any])
+async def batch_create_returns(
+    batch_data: Dict[str, Any],
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    Endpoint batch pour synchroniser plusieurs retours.
+    Utilisé par le sync_manager mobile.
+    """
+    try:
+        returns_data = batch_data.get("returns", [])
+        batch_id = batch_data.get("batch_id", str(uuid.uuid4()))
+        
+        if not current_pharmacy:
+            return {
+                "success": False,
+                "error": "Aucune pharmacie active",
+                "synced_ids": []
+            }
+        
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        synced_ids = []
+        errors = []
+        
+        for return_data in returns_data:
+            try:
+                # Vérifier si le retour existe déjà
+                existing = db.query(Return).filter(
+                    Return.return_number == return_data.get("return_number"),
+                    Return.tenant_id == tenant_id
+                ).first()
+                
+                if existing:
+                    synced_ids.append(return_data.get("local_id"))
+                    continue
+                
+                # Créer le retour
+                return_obj = Return(
+                    tenant_id=tenant_id,
+                    pharmacy_id=current_pharmacy.id,
+                    branch_id=return_data.get("branch_id"),
+                    return_number=return_data.get("return_number", f"RET-{datetime.now().strftime('%Y%m%d')}-{len(synced_ids)+1:04d}"),
+                    reference=return_data.get("reference"),
+                    return_type=return_data.get("return_type", "customer"),
+                    status=ReturnStatus.PENDING,
+                    reason=return_data.get("reason", "other"),
+                    sale_id=return_data.get("sale_id"),
+                    invoice_number=return_data.get("invoice_number"),
+                    customer_name=return_data.get("customer_name"),
+                    customer_phone=return_data.get("customer_phone"),
+                    return_date=datetime.fromisoformat(return_data.get("return_date")) if return_data.get("return_date") else datetime.utcnow(),
+                    requested_date=datetime.utcnow(),
+                    notes=return_data.get("notes"),
+                    created_by=current_user.id,
+                    total_amount=Decimal(str(return_data.get("total_price", 0))),
+                    subtotal=Decimal(str(return_data.get("subtotal", return_data.get("total_price", 0)))),
+                )
+                
+                db.add(return_obj)
+                db.flush()
+                
+                # Créer les items
+                quantity = return_data.get("quantity", 1)
+                unit_price = Decimal(str(return_data.get("unit_price", 0)))
+                
+                return_item = ReturnItem(
+                    tenant_id=tenant_id,
+                    return_id=return_obj.id,
+                    product_id=return_data.get("product_id"),
+                    product_name=return_data.get("product_name", "Produit"),
+                    quantity=quantity,
+                    unit_price=unit_price,
+                    subtotal=unit_price * quantity,
+                    total=unit_price * quantity,
+                    reason=return_data.get("reason", "other")
+                )
+                
+                db.add(return_item)
+                
+                synced_ids.append(return_data.get("local_id"))
+                
+            except Exception as e:
+                errors.append({
+                    "local_id": return_data.get("local_id"),
+                    "error": str(e)
+                })
+        
+        db.commit()
+        
+        return {
+            "success": True,
+            "synced_ids": synced_ids,
+            "errors": errors,
+            "batch_id": batch_id,
+            "total_synced": len(synced_ids),
+            "total_errors": len(errors)
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Erreur batch returns: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e),
+            "synced_ids": []
+        }
 
 
 # Endpoint de test

@@ -3634,3 +3634,125 @@ async def export_stock_by_branch(
         logger.exception("Erreur export stock par branche")
         raise HTTPException(status_code=500, detail=f"Erreur export: {exc}")
 
+# À ajouter dans stock.py après les routes existantes
+
+@router.get("/with-versions", response_model=List[Dict[str, Any]])
+async def get_products_with_versions(
+    branch_id: Optional[UUID] = Query(None, description="ID de la branche"),
+    include_versions: bool = Query(True, description="Inclure les versions"),
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Endpoint pour récupérer les produits avec leurs versions.
+    Utilisé par le sync_manager mobile pour la gestion des conflits.
+    """
+    try:
+        _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant", "pharmacien", "vendeur"])
+        
+        pharmacy = _ensure_pharmacy_in_tenant(current_tenant, current_pharmacy)
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        # Déterminer la branche effective
+        effective_branch_id = None
+        if branch_id:
+            effective_branch_id = branch_id
+        elif current_user.active_branch_id:
+            effective_branch_id = current_user.active_branch_id
+        
+        # Requête des produits
+        query = _base_product_query(db, tenant_id, pharmacy.id, effective_branch_id)
+        
+        products = query.order_by(Product.name).all()
+        
+        # Formater la réponse avec versions
+        result = []
+        for product in products:
+            product_dict = _serialize_product(product, include_details=False)
+            product_dict["stock_version"] = getattr(product, 'stock_version', 1)
+            product_dict["synced_quantity"] = getattr(product, 'synced_quantity', product.quantity or 0)
+            result.append(product_dict)
+        
+        logger.info(f"Products with versions: {len(result)} produits retournés")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Erreur get_products_with_versions: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/batch/stock-update")
+async def batch_stock_update(
+    updates: List[Dict[str, Any]],
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Endpoint pour mettre à jour les stocks en batch.
+    Utilisé par le sync_manager mobile.
+    """
+    try:
+        _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant"])
+        
+        pharmacy = _ensure_pharmacy_in_tenant(current_tenant, current_pharmacy)
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        updated_count = 0
+        errors = []
+        
+        for update in updates:
+            try:
+                product_id = UUID(update.get("product_id"))
+                new_quantity = int(update.get("new_quantity", 0))
+                sync_version = update.get("sync_version", 1)
+                
+                product = db.query(Product).filter(
+                    Product.id == product_id,
+                    Product.tenant_id == tenant_id,
+                    Product.pharmacy_id == pharmacy.id
+                ).first()
+                
+                if product:
+                    old_quantity = product.quantity
+                    product.quantity = new_quantity
+                    product.synced_quantity = new_quantity
+                    product.stock_version = sync_version
+                    product.last_sync_at = datetime.utcnow()
+                    product.refresh_statuses()
+                    
+                    updated_count += 1
+                else:
+                    errors.append({
+                        "product_id": str(product_id),
+                        "error": "Produit non trouvé"
+                    })
+                    
+            except Exception as e:
+                errors.append({
+                    "product_id": update.get("product_id"),
+                    "error": str(e)
+                })
+        
+        db.commit()
+        
+        return {
+            "success": True,
+            "updated_count": updated_count,
+            "errors": errors
+        }
+        
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Erreur batch_stock_update: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e),
+            "updated_count": 0,
+            "errors": [{"error": str(e)}]
+        }
+

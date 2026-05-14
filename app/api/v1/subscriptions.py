@@ -1075,6 +1075,98 @@ async def force_subscription_sync(
         "timestamp": utc_now_iso()
     }
 
+@router.get("/sync/subscription/status", response_model=Dict[str, Any])
+async def sync_subscription_status(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+    branch_id: Optional[str] = Query(None, description="ID de la branche (optionnel)"),
+) -> Dict[str, Any]:
+    """
+    Endpoint de synchronisation pour l'abonnement.
+    Utilisé par le sync_manager mobile.
+    """
+    logger.info(f"Sync subscription status pour {current_user.email}, branch_id={branch_id}")
+    
+    # Utiliser la branche active ou celle spécifiée
+    effective_branch_id = branch_id or str(current_user.active_branch_id) if current_user.active_branch_id else None
+    
+    if not effective_branch_id:
+        return {
+            "success": True,
+            "has_subscription": False,
+            "is_active": False,
+            "access_mode": "read_only",
+            "subscription": None,
+            "message": "Aucune branche active",
+            "synced_at": utc_now_iso()
+        }
+    
+    try:
+        # Récupérer l'abonnement de la branche
+        subscription = get_branch_subscription_by_id(db, UUID(effective_branch_id))
+        
+        if not subscription:
+            return {
+                "success": True,
+                "has_subscription": False,
+                "is_active": False,
+                "access_mode": "read_only",
+                "subscription": None,
+                "branch_id": effective_branch_id,
+                "message": "Aucun abonnement trouvé pour cette branche",
+                "synced_at": utc_now_iso()
+            }
+        
+        is_active = subscription.is_active()
+        plan_config = get_plan_config(subscription.plan.value if hasattr(subscription.plan, 'value') else str(subscription.plan))
+        
+        return {
+            "success": True,
+            "has_subscription": True,
+            "is_active": is_active,
+            "access_mode": "full" if is_active else "read_only",
+            "branch_id": effective_branch_id,
+            "subscription": {
+                "id": str(subscription.id),
+                "branch_id": str(subscription.branch_id),
+                "plan_name": subscription.plan_name or plan_config.get("name"),
+                "plan_type": subscription.plan.value if hasattr(subscription.plan, 'value') else str(subscription.plan),
+                "status": subscription.status.value if hasattr(subscription.status, 'value') else str(subscription.status),
+                "current_period_start": subscription.start_date.isoformat() if subscription.start_date else None,
+                "current_period_end": subscription.end_date.isoformat() if subscription.end_date else None,
+                "days_remaining": subscription.days_remaining(),
+                "max_products": subscription.max_products if subscription.max_products > 0 else "Illimité",
+                "max_users": subscription.max_users if subscription.max_users > 0 else "Illimité",
+                "max_storage_mb": subscription.max_storage_mb if subscription.max_storage_mb > 0 else "Illimité",
+                "is_trial": subscription.plan == SubscriptionPlan.TRIAL,
+                "trial_days_remaining": subscription.days_remaining() if subscription.plan == SubscriptionPlan.TRIAL else 0,
+                "auto_renew": True,
+                "billing_cycle": subscription.billing_cycle,
+                "price": float(subscription.price) if subscription.price else 0,
+                "currency": "EUR"
+            },
+            "limits": {
+                "max_products": subscription.max_products if subscription.max_products > 0 else "Illimité",
+                "max_users": subscription.max_users if subscription.max_users > 0 else "Illimité",
+            },
+            "usage": {
+                "current_products": 0,
+                "current_users": 0,
+            },
+            "synced_at": utc_now_iso()
+        }
+        
+    except Exception as e:
+        logger.error(f"Erreur sync_subscription_status: {e}", exc_info=True)
+        return {
+            "success": False,
+            "has_subscription": False,
+            "is_active": False,
+            "access_mode": "read_only",
+            "error": str(e),
+            "synced_at": utc_now_iso()
+        }
+
 
 # =============================================================================
 # ENDPOINTS TECHNIQUES
