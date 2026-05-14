@@ -130,11 +130,12 @@ async def get_branch(
 async def get_current_branch(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    current_tenant: Optional[Tenant] = Depends(get_current_tenant)
+    # Rendre current_tenant complètement optionnel
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant)  # Maintenant cette fonction existe
 ):
     """Récupère la branche de l'utilisateur connecté"""
     
-    # Vérifier si l'utilisateur a une branche assignée
+    # ✅ PRIORITÉ 1: Utiliser branch_id de l'utilisateur DIRECTEMENT
     if current_user.branch_id:
         branch = db.query(Branch).filter(
             Branch.id == current_user.branch_id,
@@ -149,7 +150,31 @@ async def get_current_branch(
                 branch.is_active = True
             return branch
     
-    # Si pas de branche directe, chercher la première branche active du tenant
+    # ✅ PRIORITÉ 2: Chercher via la table UserBranch
+    from app.models.user_branch import UserBranch
+    
+    user_branch_assoc = db.query(UserBranch).filter(
+        UserBranch.user_id == current_user.id,
+        UserBranch.is_active == True
+    ).first()
+    
+    if user_branch_assoc:
+        branch = db.query(Branch).filter(
+            Branch.id == user_branch_assoc.branch_id,
+            Branch.is_active == True
+        ).first()
+        
+        if branch:
+            if branch.is_main_branch is None:
+                branch.is_main_branch = False
+            if branch.is_active is None:
+                branch.is_active = True
+            # Mettre à jour branch_id de l'utilisateur pour les prochaines fois
+            current_user.branch_id = branch.id
+            db.commit()
+            return branch
+    
+    # ✅ PRIORITÉ 3: Chercher via tenant (si existant)
     if current_tenant:
         branch = db.query(Branch).filter(
             Branch.tenant_id == current_tenant.id,
@@ -163,9 +188,15 @@ async def get_current_branch(
                 branch.is_active = True
             return branch
     
+    # ❌ Aucune branche trouvée
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
-        detail="Aucune branche trouvée pour cet utilisateur"
+        detail={
+            "error": "no_branch_found",
+            "message": "Aucune branche trouvée pour cet utilisateur",
+            "user_id": str(current_user.id),
+            "has_branch_id": current_user.branch_id is not None
+        }
     )
 
 @router.get("/{branch_id}/statistics")

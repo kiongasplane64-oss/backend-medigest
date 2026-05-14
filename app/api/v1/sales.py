@@ -2188,6 +2188,55 @@ async def get_sale_by_id(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Erreur récupération de la vente: {str(e)}"
         )
+
+@router.get("/available-hours")
+async def get_available_hours(
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+    branch_id: Optional[UUID] = Query(None, description="ID de la branche"),
+    start_date: Optional[date] = Query(None, description="Date de début"),
+    end_date: Optional[date] = Query(None, description="Date de fin"),
+):
+    """
+    Récupère les heures où des ventes ont été effectuées.
+    Utile pour le filtre par heure.
+    """
+    try:
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        query = db.query(
+            func.extract('hour', Sale.created_at).label("hour"),
+            func.extract('minute', Sale.created_at).label("minute"),
+            func.count(Sale.id).label("count")
+        ).filter(
+            Sale.tenant_id == tenant_id,
+            Sale.status == "completed"
+        )
+        
+        if branch_id:
+            query = query.filter(Sale.branch_id == branch_id)
+        
+        if start_date:
+            query = query.filter(func.date(Sale.created_at) >= start_date)
+        if end_date:
+            query = query.filter(func.date(Sale.created_at) <= end_date)
+        
+        results = query.group_by("hour", "minute").order_by("hour", "minute").all()
+        
+        hours = {}
+        for r in results:
+            hour_str = f"{int(r.hour):02d}:{int(r.minute):02d}"
+            hours[hour_str] = r.count
+        
+        return {
+            "available_hours": list(hours.keys()),
+            "hours_with_counts": hours
+        }
+        
+    except Exception as e:
+        logger.error(f"Erreur récupération heures disponibles: {str(e)}")
+        return {"available_hours": [], "hours_with_counts": {}}
     
 @property
 def nom_complet(self):
@@ -2463,6 +2512,120 @@ async def get_sellers_by_pharmacy(
         current_user=current_user,
         pharmacy_id=pharmacy_id
     )
+
+@router.post("/refund", status_code=status.HTTP_200_OK)
+async def refund_sale(
+    refund_data: dict,
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    Annule une vente et rembourse le client.
+    RESTAURE LE STOCK AUTOMATIQUEMENT.
+    """
+    try:
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        # Vérifier les permissions
+        if current_user.role.lower() not in ["super_admin", "superadmin", "admin", "gerant"]:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Seuls les administrateurs peuvent annuler des ventes"
+            )
+        
+        sale_id = refund_data.get("sale_id")
+        if not sale_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="sale_id requis"
+            )
+        
+        # Récupérer la vente
+        sale = db.query(Sale).filter(
+            Sale.id == sale_id,
+            Sale.tenant_id == tenant_id
+        ).first()
+        
+        if not sale:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Vente non trouvée"
+            )
+        
+        if sale.status == "cancelled":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cette vente est déjà annulée"
+            )
+        
+        # Restaurer le stock pour chaque article
+        sale_items = db.query(SaleItem).filter(SaleItem.sale_id == sale.id).all()
+        
+        for item in sale_items:
+            product = db.query(Product).filter(
+                Product.id == item.product_id,
+                Product.tenant_id == tenant_id
+            ).first()
+            
+            if product:
+                old_quantity = product.quantity
+                product.quantity += item.quantity
+                product.available_quantity = max(0, product.quantity - (product.reserved_quantity or 0))
+                product.refresh_statuses()
+                
+                # Créer un mouvement de stock pour l'annulation
+                movement = StockMovement(
+                    tenant_id=tenant_id,
+                    product_id=product.id,
+                    pharmacy_id=sale.pharmacy_id,
+                    branch_id=sale.branch_id,
+                    quantity_before=old_quantity,
+                    quantity_after=product.quantity,
+                    quantity_change=item.quantity,
+                    movement_type="sale_cancellation",
+                    reason=f"Annulation vente - {refund_data.get('reason', 'Raison non spécifiée')}",
+                    reference=sale.reference,
+                    sale_id=sale.id,
+                    created_by=current_user.id
+                )
+                db.add(movement)
+        
+        # Mettre à jour le statut de la vente
+        sale.status = "cancelled"
+        sale.cancelled_at = datetime.utcnow()
+        sale.cancelled_by = current_user.id
+        sale.cancel_reason = refund_data.get("reason", "Annulation par administrateur")
+        
+        # Mettre à jour le crédit client si applicable
+        if sale.is_credit and sale.customer_id:
+            customer = db.query(Customer).filter(Customer.id == sale.customer_id).first()
+            if customer:
+                customer.dette_actuelle = max(0, (customer.dette_actuelle or 0) - sale.total_amount)
+        
+        db.commit()
+        
+        logger.info(f"Vente annulée: {sale.reference} par {current_user.email}")
+        
+        return {
+            "success": True,
+            "message": f"Vente {sale.invoice_number} annulée avec succès",
+            "sale_id": str(sale.id),
+            "restored_items": len(sale_items)
+        }
+        
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Erreur annulation vente: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erreur annulation: {str(e)}"
+        )
 
 @router.get("/test-invoices")
 async def test_invoices_endpoint(

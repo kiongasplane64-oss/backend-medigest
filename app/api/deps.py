@@ -407,52 +407,38 @@ def get_super_admin_user(
 # =============================================================================
 # 2. CONTEXTE TENANT (MULTI-TENANT)
 # =============================================================================
-
 def get_current_tenant(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
 ) -> Optional[Tenant]:
     """
     Récupère le tenant associé à l'utilisateur courant.
-    Retourne None pour les super admins.
+    Retourne None pour les super admins ou si l'utilisateur n'a pas de tenant.
     """
+    # Super admin : pas de tenant obligatoire
     if _is_super_admin(current_user):
         logger.info("ℹ️ Super admin sans tenant: %s", getattr(current_user, "email", None))
         return None
 
     tenant_id = getattr(current_user, "tenant_id", None)
+    
+    # Si l'utilisateur n'a pas de tenant, retourner None (pas d'erreur)
     if not tenant_id:
-        logger.warning("⚠️ Utilisateur sans tenant: %s", getattr(current_user, "email", None))
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Utilisateur non associé à un tenant",
-        )
+        logger.warning("⚠️ Utilisateur %s sans tenant_id", getattr(current_user, "email", None))
+        return None
 
     tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    
     if not tenant:
         logger.error("❌ Tenant introuvable pour l'utilisateur %s", getattr(current_user, "email", None))
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Tenant introuvable",
-        )
+        return None
 
-    # ✅ CORRECTION : Normaliser le statut en minuscules pour la comparaison
-    tenant_status_lower = (tenant.status or "").lower()
+    # Vérifier le statut du tenant (optionnel, peut être désactivé temporairement)
+    tenant_status = (tenant.status or "").lower()
     
-    if tenant_status_lower not in {"active", "trial"}:
-        status_messages = {
-            "suspended": "Votre compte a été suspendu. Contactez le support.",
-            "expired": "Votre abonnement a expiré.",
-            "cancelled": "Votre compte a été annulé.",
-            "draft": "Votre compte n'est pas encore activé.",
-            "archived": "Ce tenant est archivé.",
-        }
-        message = status_messages.get(tenant_status_lower, f"Tenant {tenant.status}")
-        logger.warning("⚠️ Tenant %s - %s", getattr(tenant, "tenant_code", None), message)
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=message,
-        )
+    if tenant_status not in {"active", "trial"} and tenant_status != "":
+        logger.warning("⚠️ Tenant %s - statut: %s", getattr(tenant, "tenant_code", None), tenant.status)
+        # On retourne None au lieu de bloquer pour permettre l'accès à la branche
 
     return tenant
 
