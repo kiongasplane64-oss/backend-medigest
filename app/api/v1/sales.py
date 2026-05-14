@@ -1245,131 +1245,335 @@ async def get_sale_stock_movements(
 # Endpoint: Ventes par produit
 # =======================
 
-@router.get("/by-product/{product_id}")
+@router.get("/by-product", response_model=None)
+@router.get("/by-product/{product_id}", response_model=None)
 async def get_sales_by_product(
-    product_id: UUID,
+    product_id: Optional[UUID] = None,
     db: Session = Depends(get_db),
     current_tenant: Optional[Tenant] = Depends(get_current_tenant),
     current_user: User = Depends(get_current_active_user),
-    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie"),
-    start_date: Optional[date] = Query(None, description="Date de début"),
-    end_date: Optional[date] = Query(None, description="Date de fin"),
-    limit: int = Query(100, ge=1, le=1000)
+    # Nouveaux paramètres (pour l'onglet Par Produit)
+    branch_id: Optional[UUID] = Query(None, description="ID de la branche (nouveau mode)"),
+    start_date: Optional[datetime] = Query(None, description="Date de début (ISO format)"),
+    end_date: Optional[datetime] = Query(None, description="Date de fin (ISO format)"),
+    # Anciens paramètres (pour compatibilité)
+    pharmacy_id: Optional[UUID] = Query(None, description="Filtrer par pharmacie (ancien mode)"),
+    start_date_only: Optional[date] = Query(None, description="Date de début (ancien mode)"),
+    end_date_only: Optional[date] = Query(None, description="Date de fin (ancien mode)"),
+    limit: int = Query(100, ge=1, le=1000, description="Limite de résultats (ancien mode)")
 ):
     """
-    Récupère toutes les ventes pour un produit spécifique
-    Utile pour l'analyse des ventes par produit
+    Récupère les ventes par produit.
+    
+    DEUX MODES D'UTILISATION:
+    
+    1. MODE NOUVEAU (groupé par produit pour tableau de bord):
+       - Utiliser branch_id + start_date + end_date (datetime)
+       - Retourne les données groupées par produit avec détails par vendeur
+       - Exemple: GET /sales/by-product?branch_id=xxx&start_date=2024-01-01T00:00:00&end_date=2024-12-31T23:59:59
+    
+    2. MODE ANCIEN (ventes détaillées pour un produit spécifique):
+       - Utiliser product_id dans l'URL + pharmacy_id + start_date_only/end_date_only (date)
+       - Retourne la liste des ventes pour un produit spécifique
+       - Exemple: GET /sales/by-product/123e4567-e89b-12d3-a456-426614174000
     """
-    try:
-        tenant_id = current_tenant.id if current_tenant else None
-        
-        # Vérifier que le produit existe
-        product_query = db.query(Product).filter(Product.id == product_id)
-        if tenant_id:
-            product_query = product_query.filter(Product.tenant_id == tenant_id)
-        
-        product = product_query.first()
-        
-        if not product:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Produit non trouvé"
-            )
-        
-        # Déterminer les pharmacies accessibles
-        if current_user.role in ["super_admin", "superadmin", "admin"]:
-            if pharmacy_id:
-                pharmacies = [pharmacy_id]
-            else:
-                pharmacies_query = db.query(Pharmacy.id).filter(Pharmacy.is_active == True)
-                if tenant_id:
-                    pharmacies_query = pharmacies_query.filter(Pharmacy.tenant_id == tenant_id)
-                pharmacies = [p.id for p in pharmacies_query.all()]
-        else:
-            accessible_pharmacies = get_user_accessible_pharmacies(db, current_user.id, tenant_id)
-            if pharmacy_id and pharmacy_id not in accessible_pharmacies:
+    tenant_id = current_tenant.id if current_tenant else None
+    
+    # ========================
+    # MODE NOUVEAU: Groupé par produit (pour l'onglet Par Produit)
+    # ========================
+    if branch_id and start_date and end_date:
+        try:
+            # Vérifier l'accès à la branche
+            branch = db.query(Branch).filter(
+                Branch.id == branch_id,
+                Branch.is_active == True
+            ).first()
+            
+            if not branch:
                 raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Accès non autorisé à cette pharmacie"
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Branche non trouvée"
                 )
-            pharmacies = [pharmacy_id] if pharmacy_id else accessible_pharmacies
-        
-        if not pharmacies:
+            
+            # Si un product_id est spécifié, on filtre sur ce produit
+            # (permet d'avoir le détail groupé pour un seul produit)
+            filter_product_id = product_id  # product_id peut venir de l'URL ou du query param
+            
+            # Construire la requête de base
+            query = db.query(
+                SaleItem.product_id,
+                Product.code.label("product_code"),
+                Product.name.label("product_name"),
+                func.sum(SaleItem.quantity).label("total_quantity"),
+                func.sum(SaleItem.total).label("total_revenue"),
+                func.count(distinct(Sale.id)).label("sale_count"),
+                func.avg(SaleItem.unit_price).label("average_price"),
+                func.max(Sale.created_at).label("last_sale_date")
+            ).join(
+                Sale, Sale.id == SaleItem.sale_id
+            ).join(
+                Product, Product.id == SaleItem.product_id
+            ).filter(
+                Sale.branch_id == branch_id,
+                Sale.status == "completed",
+                Sale.created_at >= start_date,
+                Sale.created_at <= end_date
+            )
+            
+            if tenant_id:
+                query = query.filter(Sale.tenant_id == tenant_id)
+            
+            if filter_product_id:
+                query = query.filter(SaleItem.product_id == filter_product_id)
+            
+            # Grouper par produit
+            results = query.group_by(
+                SaleItem.product_id,
+                Product.code,
+                Product.name
+            ).order_by(
+                desc("total_quantity")
+            ).all()
+            
+            # Si un produit spécifique est demandé et qu'aucun résultat n'est trouvé
+            if filter_product_id and not results:
+                # Vérifier que le produit existe
+                product = db.query(Product).filter(Product.id == filter_product_id).first()
+                if product:
+                    return [{
+                        "productId": str(product.id),
+                        "productCode": product.code,
+                        "productName": product.name,
+                        "totalQuantity": 0,
+                        "totalRevenue": 0,
+                        "saleCount": 0,
+                        "averagePrice": 0,
+                        "lastSaleDate": None,
+                        "sellers": []
+                    }]
+            
+            # Pour chaque produit, récupérer les détails par vendeur
+            sales_by_product = []
+            
+            for row in results:
+                # Récupérer les ventes par vendeur pour ce produit
+                seller_query = db.query(
+                    User.id.label("user_id"),
+                    User.nom_complet.label("user_name"),
+                    func.sum(SaleItem.quantity).label("quantity"),
+                    func.sum(SaleItem.total).label("revenue"),
+                    func.count(distinct(Sale.id)).label("sale_count")
+                ).join(
+                    Sale, Sale.id == SaleItem.sale_id
+                ).join(
+                    User, User.id == Sale.created_by
+                ).filter(
+                    SaleItem.product_id == row.product_id,
+                    Sale.branch_id == branch_id,
+                    Sale.status == "completed",
+                    Sale.created_at >= start_date,
+                    Sale.created_at <= end_date
+                ).group_by(
+                    User.id, User.nom_complet
+                ).all()
+                
+                # Récupérer les détails individuels des ventes
+                sales_detail = db.query(
+                    Sale.id,
+                    Sale.reference,
+                    Sale.created_at,
+                    Sale.customer_name,
+                    User.nom_complet.label("seller_name"),
+                    SaleItem.quantity,
+                    SaleItem.unit_price,
+                    SaleItem.total.label("amount")
+                ).join(
+                    Sale, Sale.id == SaleItem.sale_id
+                ).join(
+                    User, User.id == Sale.created_by
+                ).filter(
+                    SaleItem.product_id == row.product_id,
+                    Sale.branch_id == branch_id,
+                    Sale.status == "completed",
+                    Sale.created_at >= start_date,
+                    Sale.created_at <= end_date
+                ).order_by(
+                    desc(Sale.created_at)
+                ).all()
+                
+                sellers_data = []
+                for seller in seller_query:
+                    seller_sales = [
+                        {
+                            "id": str(sale.id),
+                            "reference": sale.reference,
+                            "created_at": sale.created_at.isoformat(),
+                            "customer_name": sale.customer_name,
+                            "seller_name": sale.seller_name,
+                            "quantity": int(sale.quantity),
+                            "unit_price": float(sale.unit_price),
+                            "amount": float(sale.amount)
+                        }
+                        for sale in sales_detail
+                        if sale.seller_name == seller.user_name
+                    ]
+                    
+                    sellers_data.append({
+                        "userId": str(seller.user_id),
+                        "userName": seller.user_name,
+                        "quantity": int(seller.quantity),
+                        "revenue": float(seller.revenue),
+                        "saleCount": seller.sale_count,
+                        "sales": seller_sales
+                    })
+                
+                sales_by_product.append({
+                    "productId": str(row.product_id),
+                    "productCode": row.product_code,
+                    "productName": row.product_name,
+                    "totalQuantity": int(row.total_quantity),
+                    "totalRevenue": float(row.total_revenue),
+                    "saleCount": row.sale_count,
+                    "averagePrice": float(row.average_price or 0),
+                    "lastSaleDate": row.last_sale_date.isoformat() if row.last_sale_date else None,
+                    "sellers": sellers_data
+                })
+            
+            return sales_by_product
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Erreur récupération ventes groupées par produit: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Erreur récupération des données: {str(e)}"
+            )
+    
+    # ========================
+    # MODE ANCIEN: Ventes détaillées pour un produit spécifique (avec product_id dans l'URL)
+    # ========================
+    elif product_id:
+        try:
+            # Vérifier que le produit existe
+            product_query = db.query(Product).filter(Product.id == product_id)
+            if tenant_id:
+                product_query = product_query.filter(Product.tenant_id == tenant_id)
+            
+            product = product_query.first()
+            
+            if not product:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Produit non trouvé"
+                )
+            
+            # Déterminer les pharmacies accessibles
+            if current_user.role in ["super_admin", "superadmin", "admin"]:
+                if pharmacy_id:
+                    pharmacies = [pharmacy_id]
+                else:
+                    pharmacies_query = db.query(Pharmacy.id).filter(Pharmacy.is_active == True)
+                    if tenant_id:
+                        pharmacies_query = pharmacies_query.filter(Pharmacy.tenant_id == tenant_id)
+                    pharmacies = [p.id for p in pharmacies_query.all()]
+            else:
+                accessible_pharmacies = get_user_accessible_pharmacies(db, current_user.id, tenant_id)
+                if pharmacy_id and pharmacy_id not in accessible_pharmacies:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Accès non autorisé à cette pharmacie"
+                    )
+                pharmacies = [pharmacy_id] if pharmacy_id else accessible_pharmacies
+            
+            if not pharmacies:
+                return {
+                    "product_id": str(product_id),
+                    "product_name": product.name,
+                    "product_code": product.code,
+                    "sales": [],
+                    "total_sales": 0,
+                    "total_quantity": 0,
+                    "total_revenue": 0
+                }
+            
+            # Construire la requête
+            query = db.query(
+                Sale.id,
+                Sale.reference,
+                Sale.created_at,
+                Sale.client_name,
+                Sale.seller_name,
+                SaleItem.quantity,
+                SaleItem.unit_price,
+                SaleItem.total,
+                Sale.pharmacy_id
+            ).join(
+                SaleItem, SaleItem.sale_id == Sale.id
+            ).filter(
+                SaleItem.product_id == product_id,
+                Sale.status == "completed",
+                Sale.pharmacy_id.in_(pharmacies)
+            )
+            
+            if tenant_id:
+                query = query.filter(Sale.tenant_id == tenant_id)
+                query = query.filter(SaleItem.tenant_id == tenant_id)
+            
+            # Utiliser start_date_only et end_date_only (anciens paramètres)
+            if start_date_only:
+                query = query.filter(func.date(Sale.created_at) >= start_date_only)
+            if end_date_only:
+                query = query.filter(func.date(Sale.created_at) <= end_date_only)
+            
+            results = query.order_by(desc(Sale.created_at)).limit(limit).all()
+            
+            total_quantity = sum(r.quantity for r in results)
+            total_revenue = sum(float(r.total) for r in results)
+            
             return {
                 "product_id": str(product_id),
                 "product_name": product.name,
                 "product_code": product.code,
-                "sales": [],
-                "total_sales": 0,
-                "total_quantity": 0,
-                "total_revenue": 0
+                "sales": [
+                    {
+                        "sale_id": str(r.id),
+                        "reference": r.reference,
+                        "date": r.created_at.isoformat() if r.created_at else None,
+                        "client_name": r.client_name,
+                        "seller_name": r.seller_name,
+                        "quantity": int(r.quantity),
+                        "unit_price": float(r.unit_price),
+                        "total": float(r.total),
+                        "pharmacy_id": str(r.pharmacy_id) if r.pharmacy_id else None
+                    }
+                    for r in results
+                ],
+                "total_sales": len(results),
+                "total_quantity": int(total_quantity),
+                "total_revenue": float(total_revenue)
             }
-        
-        # Construire la requête
-        query = db.query(
-            Sale.id,
-            Sale.reference,
-            Sale.created_at,
-            Sale.client_name,
-            Sale.seller_name,
-            SaleItem.quantity,
-            SaleItem.unit_price,
-            SaleItem.total,
-            Sale.pharmacy_id
-        ).join(
-            SaleItem, SaleItem.sale_id == Sale.id
-        ).filter(
-            SaleItem.product_id == product_id,
-            Sale.status == "completed",
-            Sale.pharmacy_id.in_(pharmacies)
-        )
-        
-        if tenant_id:
-            query = query.filter(Sale.tenant_id == tenant_id)
-            query = query.filter(SaleItem.tenant_id == tenant_id)
-        
-        if start_date:
-            query = query.filter(func.date(Sale.created_at) >= start_date)
-        if end_date:
-            query = query.filter(func.date(Sale.created_at) <= end_date)
-        
-        results = query.order_by(desc(Sale.created_at)).limit(limit).all()
-        
-        total_quantity = sum(r.quantity for r in results)
-        total_revenue = sum(float(r.total) for r in results)
-        
-        return {
-            "product_id": str(product_id),
-            "product_name": product.name,
-            "product_code": product.code,
-            "sales": [
-                {
-                    "sale_id": str(r.id),
-                    "reference": r.reference,
-                    "date": r.created_at.isoformat() if r.created_at else None,
-                    "client_name": r.client_name,
-                    "seller_name": r.seller_name,
-                    "quantity": int(r.quantity),
-                    "unit_price": float(r.unit_price),
-                    "total": float(r.total),
-                    "pharmacy_id": str(r.pharmacy_id) if r.pharmacy_id else None
-                }
-                for r in results
-            ],
-            "total_sales": len(results),
-            "total_quantity": int(total_quantity),
-            "total_revenue": float(total_revenue)
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Erreur récupération ventes pour produit {product_id}: {str(e)}")
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Erreur récupération ventes pour produit {product_id}: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Erreur récupération ventes: {str(e)}"
+            )
+    
+    # ========================
+    # AUCUN MODE DÉTECTÉ
+    # ========================
+    else:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erreur récupération ventes: {str(e)}"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Paramètres invalides. Utilisez soit:\n"
+                   "- branch_id + start_date + end_date (mode groupé)\n"
+                   "- product_id dans l'URL (mode détaillé)"
         )
-
 
 # =======================
 # Endpoint: Statistiques quotidiennes
