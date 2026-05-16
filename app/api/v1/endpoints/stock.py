@@ -3756,3 +3756,439 @@ async def batch_stock_update(
             "errors": [{"error": str(e)}]
         }
 
+@router.post("/reports/stock-pdf", summary="Générer un rapport PDF du stock")
+async def generate_stock_pdf(
+    report_data: Dict[str, Any],
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Génère un rapport PDF du stock par catégorie.
+    """
+    try:
+        _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant", "pharmacien"])
+        
+        from fastapi.responses import Response
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import cm, mm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        import io
+        from datetime import datetime
+        
+        # Données du rapport
+        branch = report_data.get("branch", {})
+        user_info = report_data.get("user", {})
+        categories = report_data.get("categories", [])
+        uncategorized = report_data.get("uncategorized", {})
+        global_totals = report_data.get("globalTotals", {})
+        pharmacy_id = report_data.get("pharmacy_id")
+        branch_id = report_data.get("branch_id")
+        
+        # Nom de la branche
+        branch_name = branch.get("name", "Toutes les branches")
+        if branch_id:
+            # Récupérer le nom de la branche depuis la base
+            branch_obj = db.query(Branch).filter(Branch.id == UUID(branch_id)).first()
+            if branch_obj:
+                branch_name = branch_obj.name
+        
+        # Créer le PDF en mémoire
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=A4, 
+                                rightMargin=72, leftMargin=72,
+                                topMargin=72, bottomMargin=72)
+        
+        # Styles
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=16,
+            textColor=colors.HexColor('#1a237e'),
+            spaceAfter=30,
+            alignment=1  # Center
+        )
+        heading_style = ParagraphStyle(
+            'CustomHeading',
+            parent=styles['Heading2'],
+            fontSize=12,
+            textColor=colors.HexColor('#0d47a1'),
+            spaceAfter=12,
+            spaceBefore=6
+        )
+        normal_style = styles['Normal']
+        
+        story = []
+        
+        # En-tête
+        story.append(Paragraph(f"Rapport de Stock - {branch_name}", title_style))
+        story.append(Paragraph(f"Généré le {datetime.now().strftime('%d/%m/%Y à %H:%M')}", normal_style))
+        story.append(Paragraph(f"Généré par: {user_info.get('name', current_user.email)}", normal_style))
+        story.append(Spacer(1, 20))
+        
+        # Résumé global
+        story.append(Paragraph("Résumé Global", heading_style))
+        
+        summary_data = [
+            ["Total Produits", "Unités Totales", "Valeur Achat", "Valeur Vente", "Profit"],
+            [
+                str(global_totals.get('productCount', 0)),
+                str(global_totals.get('totalQuantity', 0)),
+                f"{global_totals.get('totalPurchaseValue', 0):,.0f} FC",
+                f"{global_totals.get('totalSellingValue', 0):,.0f} FC",
+                f"{global_totals.get('totalProfit', 0):,.0f} FC"
+            ]
+        ]
+        
+        summary_table = Table(summary_data, colWidths=[80, 80, 100, 100, 100])
+        summary_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a237e')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.grey),
+        ]))
+        story.append(summary_table)
+        story.append(Spacer(1, 20))
+        
+        # Alertes de stock
+        story.append(Paragraph("Alertes de Stock", heading_style))
+        
+        # Récupérer les alertes réelles
+        inventory_service = get_inventory_service(db, current_tenant.id if current_tenant else None)
+        alerts = inventory_service.get_stock_alerts(pharmacy_id) if pharmacy_id else {"critical_alerts": [], "warning_alerts": []}
+        
+        if alerts.get("critical_alerts") or alerts.get("warning_alerts"):
+            alert_data = [["Type", "Produit", "Code", "Message"]]
+            for alert in alerts.get("critical_alerts", [])[:10]:
+                alert_data.append([
+                    "⚠️ Rupture",
+                    alert.get("name", ""),
+                    alert.get("code", ""),
+                    alert.get("message", "")
+                ])
+            for alert in alerts.get("warning_alerts", [])[:10]:
+                alert_data.append([
+                    "⚠️ Stock faible",
+                    alert.get("name", ""),
+                    alert.get("code", ""),
+                    alert.get("message", "")
+                ])
+            
+            alert_table = Table(alert_data, colWidths=[60, 150, 80, 200])
+            alert_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#e65100')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 9),
+                ('GRID', (0, 0), (-1, -1), 1, colors.lightgrey),
+            ]))
+            story.append(alert_table)
+        else:
+            story.append(Paragraph("Aucune alerte de stock actuellement.", normal_style))
+        
+        story.append(Spacer(1, 20))
+        
+        # Produits par catégorie
+        story.append(Paragraph("Détail par Catégorie", heading_style))
+        
+        all_categories = list(categories) + ([uncategorized] if uncategorized.get("products") else [])
+        
+        for category in all_categories:
+            category_name = category.get("categoryName", "Sans catégorie")
+            products = category.get("products", [])
+            
+            if not products:
+                continue
+            
+            story.append(Paragraph(f"<b>{category_name}</b>", heading_style))
+            
+            # Données des produits
+            product_data = [
+                ["Code", "Produit", "Qté", "Prix Achat", "Prix Vente", "Val Achat", "Val Vente", "Profit"]
+            ]
+            
+            for product in products[:20]:  # Limiter à 20 produits par catégorie
+                quantity = product.get("quantity", 0)
+                purchase_price = product.get("purchase_price", 0)
+                selling_price = product.get("selling_price", 0)
+                purchase_value = quantity * purchase_price
+                selling_value = quantity * selling_price
+                profit = selling_value - purchase_value
+                
+                product_data.append([
+                    product.get("code", "")[:15],
+                    product.get("name", "")[:30],
+                    str(quantity),
+                    f"{purchase_price:,.0f}",
+                    f"{selling_price:,.0f}",
+                    f"{purchase_value:,.0f}",
+                    f"{selling_value:,.0f}",
+                    f"{profit:,.0f}"
+                ])
+            
+            # Total de la catégorie
+            product_data.append([
+                "", "", "",
+                f"<b>Total: {category.get('totalQuantity', 0)}</b>",
+                "",
+                f"<b>{category.get('totalPurchaseValue', 0):,.0f}</b>",
+                f"<b>{category.get('totalSellingValue', 0):,.0f}</b>",
+                f"<b>{category.get('totalProfit', 0):,.0f}</b>"
+            ])
+            
+            category_table = Table(product_data, colWidths=[60, 120, 40, 70, 70, 80, 80, 80])
+            category_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1565c0')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('ALIGN', (2, 1), (-1, -1), 'RIGHT'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 8),
+                ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#e3f2fd')),
+                ('GRID', (0, 0), (-1, -2), 0.5, colors.lightgrey),
+            ]))
+            story.append(category_table)
+            story.append(Spacer(1, 15))
+        
+        # Pied de page
+        story.append(Spacer(1, 30))
+        story.append(Paragraph(
+            f"Rapport généré automatiquement - Pharmacie {branch_name} - {datetime.now().strftime('%Y')}",
+            ParagraphStyle('Footer', parent=normal_style, fontSize=8, textColor=colors.grey, alignment=1)
+        ))
+        
+        # Générer le PDF
+        doc.build(story)
+        buffer.seek(0)
+        
+        return Response(
+            content=buffer.getvalue(),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=rapport_stock_{datetime.now().strftime('%Y%m%d')}.pdf"}
+        )
+        
+    except HTTPException:
+        raise
+    except ImportError as e:
+        logger.error(f"Erreur import reportlab: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="La bibliothèque reportlab n'est pas installée. Exécutez: pip install reportlab"
+        )
+    except Exception as exc:
+        logger.exception("Erreur génération PDF")
+        raise HTTPException(status_code=500, detail=f"Erreur génération PDF: {exc}")
+
+@router.get("/by-category", summary="Récupérer les produits groupés par catégorie")
+async def get_products_grouped_by_category(
+    branch_id: Optional[UUID] = Query(None, description="ID de la branche (optionnel)"),
+    include_empty_categories: bool = Query(False, description="Inclure les catégories sans produit"),
+    limit_per_category: int = Query(50, ge=1, le=500, description="Nombre max de produits par catégorie"),
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
+    current_branch: Optional[Branch] = Depends(get_current_branch_entity),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Récupère tous les produits groupés par leur catégorie.
+    Retourne une structure avec pour chaque catégorie la liste de ses produits.
+    """
+    try:
+        _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant", "pharmacien", "vendeur"])
+        
+        pharmacy = _ensure_pharmacy_in_tenant(current_tenant, current_pharmacy)
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        # Déterminer la branche
+        is_admin = current_user.role in ["super_admin", "superadmin", "admin", "gerant"]
+        effective_branch_id = None
+        
+        if branch_id:
+            effective_branch_id = branch_id
+        elif not is_admin:
+            effective_branch_id = current_user.active_branch_id
+        else:
+            effective_branch_id = current_branch.id if current_branch else None
+        
+        # Requête de base
+        query = db.query(Product).filter(
+            Product.tenant_id == tenant_id,
+            Product.pharmacy_id == pharmacy.id,
+            Product.is_active == True
+        )
+        
+        if effective_branch_id:
+            query = query.filter(Product.branch_id == effective_branch_id)
+        
+        # Récupérer tous les produits avec leur catégorie
+        products = query.order_by(Product.name).all()
+        
+        # Récupérer toutes les catégories actives
+        categories_query = db.query(Category).filter(
+            Category.tenant_id == tenant_id,
+            Category.is_active == True
+        ).order_by(Category.name)
+        
+        categories = categories_query.all()
+        
+        # Créer un mapping catégorie ID -> nom
+        category_map = {str(c.id): c.name for c in categories}
+        category_map[None] = "Sans catégorie"
+        
+        # Grouper les produits par catégorie
+        products_by_category = {}
+        
+        # Initialiser avec toutes les catégories si demandé
+        if include_empty_categories:
+            for cat in categories:
+                products_by_category[str(cat.id)] = {
+                    "category_id": str(cat.id),
+                    "category_name": cat.name,
+                    "parent_id": str(cat.parent_id) if cat.parent_id else None,
+                    "product_count": 0,
+                    "products": []
+                }
+            products_by_category[None] = {
+                "category_id": None,
+                "category_name": "Sans catégorie",
+                "parent_id": None,
+                "product_count": 0,
+                "products": []
+            }
+        
+        # Remplir avec les produits
+        for product in products:
+            cat_id = str(product.category_id) if product.category_id else None
+            
+            if cat_id not in products_by_category:
+                # Récupérer le nom de la catégorie
+                cat_name = category_map.get(cat_id, "Sans catégorie")
+                cat_parent = None
+                if cat_id and cat_id in [str(c.id) for c in categories]:
+                    cat = next((c for c in categories if str(c.id) == cat_id), None)
+                    cat_parent = str(cat.parent_id) if cat and cat.parent_id else None
+                
+                products_by_category[cat_id] = {
+                    "category_id": cat_id,
+                    "category_name": cat_name,
+                    "parent_id": cat_parent,
+                    "product_count": 0,
+                    "products": []
+                }
+            
+            # Ajouter le produit
+            product_dict = _serialize_product(product, include_details=False)
+            
+            # Limiter le nombre de produits par catégorie
+            if len(products_by_category[cat_id]["products"]) < limit_per_category:
+                products_by_category[cat_id]["products"].append(product_dict)
+            
+            products_by_category[cat_id]["product_count"] += 1
+        
+        # Convertir en liste ordonnée
+        result = []
+        
+        # D'abord les catégories avec ID
+        for cat_id, data in products_by_category.items():
+            if cat_id is not None:
+                result.append(data)
+        
+        # Ensuite "Sans catégorie" à la fin
+        if None in products_by_category:
+            result.append(products_by_category[None])
+        
+        # Statistiques globales
+        total_products = len(products)
+        total_categories = len([c for c in result if c["category_id"] is not None])
+        
+        return {
+            "pharmacy": {
+                "id": str(pharmacy.id),
+                "name": pharmacy.name
+            },
+            "branch": {
+                "id": str(effective_branch_id) if effective_branch_id else None,
+                "name": current_branch.name if current_branch else "Toutes les branches"
+            } if effective_branch_id else None,
+            "total_products": total_products,
+            "total_categories": total_categories,
+            "categories": result
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Erreur récupération produits par catégorie")
+        raise HTTPException(status_code=500, detail=f"Erreur interne du serveur: {exc}")
+
+
+@router.get("/by-category/{category_name}", summary="Produits d'une catégorie spécifique")
+async def get_products_by_category(
+    category_name: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    branch_id: Optional[UUID] = Query(None, description="ID de la branche"),
+    db: Session = Depends(get_db),
+    current_tenant: Optional[Tenant] = Depends(get_current_tenant),
+    current_pharmacy: Optional[Pharmacy] = Depends(get_current_pharmacy_entity),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Récupère tous les produits d'une catégorie spécifique.
+    """
+    try:
+        _check_permission(current_user, ["super_admin", "superadmin", "admin", "gerant", "pharmacien", "vendeur"])
+        
+        pharmacy = _ensure_pharmacy_in_tenant(current_tenant, current_pharmacy)
+        tenant_id = current_tenant.id if current_tenant else None
+        
+        # Déterminer la branche
+        effective_branch_id = branch_id or current_user.active_branch_id
+        
+        # Normaliser le nom de la catégorie
+        # Mettre la première lettre en majuscule, le reste en minuscule
+        normalized_category = category_name.capitalize()
+        
+        # Requête
+        query = db.query(Product).filter(
+            Product.tenant_id == tenant_id,
+            Product.pharmacy_id == pharmacy.id,
+            Product.branch_id == effective_branch_id,
+            Product.category == normalized_category,
+            Product.is_active == True
+        )
+        
+        total = query.count()
+        products = query.order_by(Product.name).offset(skip).limit(limit).all()
+        
+        # Statistiques de la catégorie
+        total_quantity = sum(p.quantity or 0 for p in products)
+        total_value = sum((p.selling_price or 0) * (p.quantity or 0) for p in products)
+        
+        return {
+            "category": normalized_category,
+            "branch_id": str(effective_branch_id) if effective_branch_id else None,
+            "total_products": total,
+            "total_quantity": total_quantity,
+            "total_value": float(total_value),
+            "skip": skip,
+            "limit": limit,
+            "products": [_serialize_product(p, include_details=False) for p in products]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(f"Erreur récupération produits de la catégorie {category_name}")
+        raise HTTPException(status_code=500, detail=f"Erreur: {exc}")
