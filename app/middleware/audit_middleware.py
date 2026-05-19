@@ -218,7 +218,7 @@ class UnifiedAuthSubscriptionMiddleware(BaseHTTPMiddleware):
     async def _check_subscription(self, branch_id: str, path: str, method: str) -> bool:
         """
         Vérifie l'abonnement d'une branche avec cache.
-        Retourne True si actif, False sinon.
+        Retourne True si actif False sinon.
         """
         # Vérifier le cache
         cached_result = self._get_subscription_from_cache(branch_id)
