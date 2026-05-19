@@ -1,142 +1,251 @@
+# app/middleware/auth_middleware.py (remplace les deux fichiers)
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
-from app.services.audit_service import log_action
-from app.db.session import get_db
-from app.core.constants import SYSTEM_TENANT_ID  
+from starlette.responses import JSONResponse
+from sqlalchemy.orm import Session
+from app.db.session import SessionLocal
+from app.models.branch_subscription import BranchSubscription
+from app.core.security import decode_token
+from jose import jwt, ExpiredSignatureError
+from app.core.config import settings
 import logging
+import re
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-class AuditMiddleware(BaseHTTPMiddleware):
+
+class UnifiedAuthSubscriptionMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware unifié qui gère :
+    1. Authentification (décodage token)
+    2. Vérification d'abonnement
+    3. Mode lecture seule pour abonnements expirés
+    
+    Optimisations :
+    - Cache des vérifications d'abonnement
+    - Une seule requête DB par requête
+    - Pattern matching optimisé
+    """
+    
+    # Endpoints exemptés (toujours autorisés sans vérification)
+    EXEMPT_PATHS = {
+        "/api/v1/auth/login",
+        "/api/v1/auth/refresh",
+        "/api/v1/auth/tenants/register",
+        "/api/v1/auth/password/reset",
+        "/api/v1/auth/health",
+        "/api/v1/auth/api-status",
+        "/api/v1/auth/verify-subscription",
+        "/api/v1/auth/subscription/readonly-status",
+        "/api/v1/auth/reset-active-branch",
+        "/health",
+        "/",
+    }
+    
+    # Endpoints de docs (toujours autorisés)
+    DOCS_PATHS = {"/docs", "/redoc", "/openapi.json"}
+    
+    # Patterns pour endpoints autorisés en lecture seule (compilés une fois)
+    READONLY_PATTERNS = [
+        re.compile(r'^/api/v1/auth/.*$'),
+        re.compile(r'^/api/v1/subscriptions/status$'),
+        re.compile(r'^/api/v1/subscriptions/usage$'),
+        re.compile(r'^/api/v1/subscriptions/plans$'),
+        re.compile(r'^/api/v1/subscriptions/billing-history$'),
+        re.compile(r'^/api/v1/health$'),
+        re.compile(r'^/api/v1/me$'),
+        re.compile(r'^/api/v1/tenants/me$'),
+        re.compile(r'^/api/v1/session/.*$'),
+        re.compile(r'^/api/v1/pharmacies/.*/service-status$'),
+        re.compile(r'^/api/v1/pharmacies/active$'),
+        re.compile(r'^/api/v1/branches/.*$'),
+        re.compile(r'^/api/v1/stock/alerts/.*$'),
+        re.compile(r'^/api/v1/dashboard/.*$'),
+        re.compile(r'^/api/v1/transfers/?$'),
+        re.compile(r'^/api/v1/categories/.*$'),
+        re.compile(r'^/api/v1/products/.*$'),
+        re.compile(r'^/api/v1/sales/.*$'),
+        re.compile(r'^/api/v1/customers/.*$'),
+        re.compile(r'^/api/v1/reports/.*$'),
+        re.compile(r'^/api/v1/inventory/.*$'),
+        re.compile(r'^/api/v1/orders/.*$'),
+        re.compile(r'^/api/v1/users/.*$'),
+        re.compile(r'^/api/v1/payments/.*$'),
+        re.compile(r'^/api/v1/sync/.*$'),
+        re.compile(r'^/api/v1/capital/.*$'),
+        re.compile(r'^/api/v1/subscription-codes/.*$'),
+    ]
+    
+    # Cache simple pour les abonnements (en mémoire, 60 secondes)
+    # Pour production, remplacer par Redis
+    _subscription_cache = {}
+    
+    def __init__(self, app, use_cache: bool = True, cache_ttl: int = 60):
+        super().__init__(app)
+        self.use_cache = use_cache
+        self.cache_ttl = cache_ttl
+    
+    def _is_exempt_path(self, path: str) -> bool:
+        """Vérifie si le chemin est exempté"""
+        if path in self.EXEMPT_PATHS:
+            return True
+        if any(path.startswith(doc_path) for doc_path in self.DOCS_PATHS):
+            return True
+        return False
+    
+    def _is_readonly_allowed(self, path: str, method: str) -> bool:
+        """Vérifie si le path est autorisé en lecture seule"""
+        # Seules les méthodes GET/HEAD sont considérées lecture seule
+        if method not in {'GET', 'HEAD'}:
+            return False
+        
+        # Vérifier les patterns
+        for pattern in self.READONLY_PATTERNS:
+            if pattern.match(path):
+                return True
+        return False
+    
+    def _get_subscription_from_cache(self, branch_id: str) -> Optional[Tuple[bool, object]]:
+        """Récupère l'abonnement du cache"""
+        if not self.use_cache:
+            return None
+        
+        cached = self._subscription_cache.get(branch_id)
+        if cached:
+            data, timestamp = cached
+            import time
+            if time.time() - timestamp < self.cache_ttl:
+                return data
+            else:
+                # Cache expiré
+                del self._subscription_cache[branch_id]
+        return None
+    
+    def _set_subscription_cache(self, branch_id: str, subscription):
+        """Met en cache l'abonnement"""
+        if self.use_cache:
+            import time
+            self._subscription_cache[branch_id] = (subscription, time.time())
+    
     async def dispatch(self, request: Request, call_next):
-        # 1. Exécuter la requête d'abord
+        path = request.url.path
+        method = request.method
+        
+        # 1. Initialiser request.state
+        request.state.user = None
+        request.state.tenant_id = None
+        request.state.branch_id = None
+        request.state.read_only_mode = False
+        
+        # 2. Toujours autoriser OPTIONS (CORS preflight)
+        if method == "OPTIONS":
+            return await call_next(request)
+        
+        # 3. Vérifier les chemins exemptés
+        if self._is_exempt_path(path):
+            return await call_next(request)
+        
+        # 4. Récupérer et décoder le token
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            # Pas de token → continuer sans authentification
+            # Les endpoints protégés utiliseront des dépendances
+            return await call_next(request)
+        
+        token = auth_header.replace("Bearer ", "")
+        
+        try:
+            # Décoder le token (une seule fois)
+            payload = decode_token(token)
+            
+            # Vérifier que c'est un token d'accès
+            if payload.get("type") != "access":
+                logger.warning(f"Invalid token type for {path}")
+                return await call_next(request)
+            
+            # Stocker les infos utilisateur dans request.state
+            request.state.user = payload
+            request.state.user_id = payload.get("sub")
+            request.state.tenant_id = payload.get("tenant_id")
+            request.state.branch_id = payload.get("branch_id")
+            
+            # 5. Vérifier l'abonnement (si branch_id présent)
+            branch_id = payload.get("branch_id")
+            if branch_id:
+                subscription_active = await self._check_subscription(branch_id, path, method)
+                
+                if not subscription_active:
+                    # Abonnement expiré → vérifier si lecture seule autorisée
+                    if self._is_readonly_allowed(path, method):
+                        logger.info(f"📖 Lecture seule autorisée: {method} {path}")
+                        request.state.read_only_mode = True
+                    else:
+                        # Opération non autorisée
+                        logger.warning(f"🔒 Blocage: {method} {path} (subscription expired)")
+                        return JSONResponse(
+                            status_code=403,
+                            content={
+                                "error": "subscription_expired_readonly",
+                                "message": "L'abonnement de votre succursale a expiré. Mode lecture seule uniquement.",
+                                "read_only_mode": True,
+                                "subscription_expired": True,
+                                "branch_id": str(branch_id),
+                                "allowed_operations": ["GET", "HEAD", "OPTIONS"],
+                                "forbidden_operations": ["POST", "PUT", "PATCH", "DELETE"],
+                                "renewal_url": "/api/v1/subscriptions/plans"
+                            }
+                        )
+            
+        except ExpiredSignatureError:
+            # Token expiré - logger debug et continuer
+            logger.debug(f"Token expiré pour {path}")
+        except Exception as e:
+            # Erreur de décodage - logger warning et continuer
+            logger.warning(f"Erreur décodage token pour {path}: {e}")
+        
+        # 6. Exécuter la requête
         response = await call_next(request)
         
-        # 2. Ne pas loguer les méthodes de lecture (GET) pour éviter de saturer la DB
-        # Optionnel : vous pouvez aussi ignorer OPTIONS et HEAD
-        if request.method in ["GET", "OPTIONS", "HEAD"]:
-            return response
-
-        try:
-            # Récupérer l'utilisateur depuis request.state (injecté par ton AuthMiddleware)
-            user_payload = getattr(request.state, "user", None)
-            
-            if not user_payload:
-                return response
-                
-            user_id = user_payload.get("sub")
-            tenant_id = user_payload.get("tenant_id")
-            user_role = user_payload.get("role")
-            
-            # 🔥 CORRECTION CRITIQUE 🔥
-            # Pour les super admins (sans tenant) qui font des actions globales,
-            # on utilise le tenant système
-            if tenant_id is None and user_role in ["super_admin", "superadmin"]:
-                tenant_id = SYSTEM_TENANT_ID
-                logger.debug(f"Using SYSTEM_TENANT_ID for super admin action: {request.method} {request.url.path}")
-            
-            # Pour les autres utilisateurs, si tenant_id est None, on logge quand même
-            # avec SYSTEM_TENANT_ID pour ne pas casser la contrainte NOT NULL
-            if tenant_id is None:
-                tenant_id = SYSTEM_TENANT_ID
-                logger.warning(f"No tenant_id found for user {user_id}, using SYSTEM_TENANT_ID")
-            
-            # Gestion propre de la session DB
-            db = next(get_db())
-            try:
-                # Déterminer l'action en fonction du rôle et du contexte
-                action = self._determine_action(request.method, user_role, request.url.path)
-                
-                # Log de l'action
-                log_action(
-                    db=db,
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    action=action,
-                    cible=self._get_entity_from_path(request.url.path),
-                    description=f"{request.method} {request.url.path} - Status: {response.status_code}",
-                    status=response.status_code,
-                    user_agent=request.headers.get("user-agent"),
-                    ip=request.client.host if request.client else None,
-                    details={
-                        "path": request.url.path,
-                        "query_params": str(request.query_params),
-                        "user_role": user_role,
-                        "method": request.method,
-                        "status_code": response.status_code
-                    }
-                )
-                db.commit()
-            except Exception as e:
-                db.rollback()
-                logger.error(f"Audit log database error: {str(e)}")
-            finally:
-                db.close()
-            
-        except Exception as e:
-            # Sécurité ultime : le middleware ne doit JAMAIS faire planter l'API
-            logger.error(f"Middleware Audit Error: {str(e)}")
+        # 7. Ajouter les headers si mode lecture seule
+        if request.state.read_only_mode:
+            response.headers["X-Read-Only-Mode"] = "true"
+            response.headers["X-Subscription-Expired"] = "true"
+            response.headers["X-Allowed-Methods"] = "GET, HEAD, OPTIONS"
         
         return response
+    
+    async def _check_subscription(self, branch_id: str, path: str, method: str) -> bool:
+        """
+        Vérifie l'abonnement d'une branche avec cache.
+        Retourne True si actif, False sinon.
+        """
+        # Vérifier le cache
+        cached_result = self._get_subscription_from_cache(branch_id)
+        if cached_result is not None:
+            return cached_result
+        
+        # Requête DB
+        db = SessionLocal()
+        try:
+            subscription = db.query(BranchSubscription).filter(
+                BranchSubscription.branch_id == branch_id
+            ).first()
+            
+            is_active = subscription.is_active() if subscription else False
+            
+            # Mettre en cache
+            self._set_subscription_cache(branch_id, is_active)
+            
+            return is_active
+        except Exception as e:
+            logger.error(f"Erreur vérification abonnement branche {branch_id}: {e}")
+            # En cas d'erreur, on suppose actif pour ne pas bloquer
+            return True
+        finally:
+            db.close()
 
-    def _determine_action(self, method: str, role: str, path: str) -> str:
-        """Détermine une action plus descriptive que juste la méthode HTTP"""
-        
-        # Actions spécifiques pour les super admins
-        if role in ["super_admin", "superadmin"]:
-            if "dashboard" in path:
-                return "VIEW_DASHBOARD"
-            elif "tenants" in path and method == "POST":
-                return "SUPER_ADMIN_CREATE_TENANT"
-            elif "tenants" in path and method == "PUT":
-                return "SUPER_ADMIN_UPDATE_TENANT"
-            elif "tenants" in path and "actions" in path:
-                return "SUPER_ADMIN_TENANT_ACTION"
-            elif "system" in path:
-                return "SYSTEM_CONFIGURATION"
-            elif "users" in path and "super-admins" in path:
-                return "CREATE_SUPER_ADMIN"
-            elif "subscriptions" in path:
-                return "VIEW_SUBSCRIPTIONS"
-            elif "analytics" in path:
-                return "VIEW_ANALYTICS"
-        
-        # Actions spécifiques pour les admins normaux
-        elif role == "admin":
-            if "users" in path and method == "POST":
-                return "CREATE_USER"
-            elif "users" in path and method == "PUT":
-                return "UPDATE_USER"
-            elif "users" in path and method == "DELETE":
-                return "DELETE_USER"
-            elif "products" in path and method == "POST":
-                return "CREATE_PRODUCT"
-            elif "products" in path and method == "PUT":
-                return "UPDATE_PRODUCT"
-            elif "sales" in path and method == "POST":
-                return "CREATE_SALE"
-        
-        # Actions standard
-        action_map = {
-            "POST": "CREATE",
-            "PUT": "UPDATE",
-            "PATCH": "UPDATE",
-            "DELETE": "DELETE",
-            "OPTIONS": "OPTIONS"
-        }
-        
-        return action_map.get(method, method)
 
-    def _get_entity_from_path(self, path: str) -> str:
-        """Extrait le nom de l'entité depuis l'URL (ex: /api/v1/inventory/alerts -> inventory)"""
-        parts = path.split('/')
-        # Cherche la partie après v1
-        if "v1" in parts:
-            idx = parts.index("v1")
-            if len(parts) > idx + 1:
-                entity = parts[idx+1]
-                # Nettoyer l'entité (enlever les paramètres)
-                if '?' in entity:
-                    entity = entity.split('?')[0]
-                return entity
-        return "system"
+# Pour garder la compatibilité avec les anciens noms
+AuthMiddleware = UnifiedAuthSubscriptionMiddleware
+SubscriptionCheckMiddleware = UnifiedAuthSubscriptionMiddleware

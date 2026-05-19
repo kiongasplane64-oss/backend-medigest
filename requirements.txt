@@ -35,3 +35,4 @@ pandas
 pytz
 python-multipart
 cryptography
+cachetools

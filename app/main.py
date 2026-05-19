@@ -62,7 +62,7 @@ from app.core.exceptions import setup_exception_handlers
 # ---------------------------------------------------------------------------
 from app.middleware.tenant_context import TenantContextMiddleware
 from app.middleware.rate_limit_middleware import RateLimitMiddleware
-from app.middleware.audit_middleware import AuditMiddleware
+from app.middleware.auth_middleware import UnifiedAuthSubscriptionMiddleware
 from app.middleware.auth_middleware import AuthMiddleware
 from app.middleware.middleware import SubscriptionMiddleware
 from app.core.middleware import SubscriptionCheckMiddleware
@@ -259,10 +259,13 @@ app.add_middleware(ForceJSONMiddleware)
 # ---------------------------------------------------------------------------
 app.add_middleware(TenantContextMiddleware)
 app.add_middleware(RateLimitMiddleware, request_limit=100, window_seconds=60)
-app.add_middleware(AuditMiddleware)
+app.add_middleware(UnifiedAuthSubscriptionMiddleware)
 app.add_middleware(AuthMiddleware)
-app.add_middleware(SubscriptionCheckMiddleware)
-app.add_middleware(SubscriptionMiddleware)
+app.add_middleware(
+    UnifiedAuthSubscriptionMiddleware,
+    use_cache=True,     # Activer le cache mémoire
+    cache_ttl=60        # Cache de 60 secondes
+)
 
 
 # ===========================================================================
