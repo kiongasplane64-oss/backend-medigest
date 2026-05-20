@@ -41,6 +41,7 @@ from app.api.v1.endpoints.profit import router as profit_router
 from app.api.v1.endpoints.returns import router as returns_router
 from app.api.v1.endpoints.invoices import router as invoices_router
 from app.api.v1.endpoints.sellers import router as sellers_router
+from app.api.v1.endpoints.supplier_credit import router as supplier_credit_router
 from app.api.v1 import users
 from app.api.v1 import session
 
@@ -354,6 +355,7 @@ include_router_auto(app, profit_router, tags=["Bénéfices"])
 include_router_auto(app, admin_sync_router, tags=["Synchronisation Admin"])
 include_router_auto(app, invoices_router, tags=["Factures"])
 include_router_auto(app, returns_router, tags=["Retours"])
+include_router_auto(app, subscription_codes_router)
 
 # Routes avec préfixe explicite
 app.include_router(session.router, prefix="/api/v1", tags=["Session"])

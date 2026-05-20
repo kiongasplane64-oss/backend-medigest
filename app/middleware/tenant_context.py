@@ -3,7 +3,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Optional, Set
-from uuid import UUID, ValueError as UUIDValueError
+from uuid import UUID
 import logging
 import re
 
@@ -129,6 +129,6 @@ class TenantContextMiddleware(BaseHTTPMiddleware):
         """Valide le format du tenant ID"""
         try:
             return UUID(tenant_id)
-        except UUIDValueError:
+        except ValueError:  # Changed from UUIDValueError to ValueError
             logger.warning(f"Tenant ID invalide: '{tenant_id}' pour {path}")
             return None
