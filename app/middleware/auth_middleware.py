@@ -30,3 +30,5 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # Continuer avec la requête
         response = await call_next(request)
         return response
+
+UnifiedAuthSubscriptionMiddleware = AuthMiddleware
