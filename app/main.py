@@ -57,6 +57,7 @@ from app.api.routes.inventory import router as inventory_router
 # ---------------------------------------------------------------------------
 from app.core.startup import init_storage
 from app.core.exceptions import setup_exception_handlers
+from app.core.config import settings
 
 # ---------------------------------------------------------------------------
 # MIDDLEWARES MÉTIER
@@ -262,8 +263,8 @@ app.add_middleware(TenantContextMiddleware)
 app.add_middleware(RateLimitMiddleware, request_limit=100, window_seconds=60)
 app.add_middleware(UnifiedAuthSubscriptionMiddleware)
 app.add_middleware(AuthMiddleware)
-app.add_middleware(SubscriptionCheckMiddleware)
-app.add_middleware(SubscriptionMiddleware)
+#app.add_middleware(SubscriptionCheckMiddleware)
+#app.add_middleware(SubscriptionMiddleware)
 
 
 # ===========================================================================
@@ -381,3 +382,6 @@ async def log_registered_routes():
         if hasattr(route, "methods"):
             methods = ", ".join(sorted(route.methods))
             logger.info(f"   {methods:<30} {route.path}")
+
+logger = logging.getLogger(__name__)
+logger.info(f"SECRET_KEY utilisée: {settings.SECRET_KEY[:10]}...")
