@@ -407,30 +407,31 @@ async def create_sale(
             )
             logger.info(f"📋 Numéro facture généré automatiquement: {final_invoice_number}")
 
-        # Génération référence vente
+        # Génération référence vente avec gestion robuste des conflits
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         pharmacy_code = getattr(pharmacy, 'pharmacy_code', 'PHARM')
-        # si reference n'est pas fournie ou est vide
+
+        # Déterminer la référence finale
         if not sale_data.reference or sale_data.reference.startswith("OFFLINE-"):
-            # Générer une référence unique
-            import uuid
-            unique_suffix = str(uuid.uuid4().hex)[:12].upper()
-            timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
-            pharmacy_code = getattr(pharmacy, 'pharmacy_code', 'PHARM')
-            reference = f"VNT-{timestamp}-{pharmacy_code}-{unique_suffix}"
+            # Aucune référence fournie ou référence offline - générer une nouvelle référence unique
+            final_reference = await generate_unique_reference(db, tenant_id, pharmacy_code)
+            logger.info(f"📋 Référence générée automatiquement: {final_reference}")
         else:
-            reference = sale_data.reference
-            # Vérifier l'unicité de la référence fournie
+            # Une référence a été fournie, vérifier si elle existe déjà
             existing = db.query(Sale).filter(
-                Sale.reference == reference,
+                Sale.reference == sale_data.reference,
                 Sale.tenant_id == tenant_id
             ).first()
+            
             if existing:
                 # Conflit - générer une nouvelle référence
-                unique_suffix = str(uuid.uuid4().hex)[:12].upper()
-                reference = f"VNT-{timestamp}-{pharmacy_code}-{unique_suffix}"
-                logger.warning(f"⚠️ Conflit référence {sale_data.reference}, nouvelle: {reference}")
-
+                logger.warning(f"⚠️ Conflit référence {sale_data.reference} - Génération automatique")
+                final_reference = await generate_unique_reference(db, tenant_id, pharmacy_code)
+                logger.info(f"📋 Nouvelle référence générée: {final_reference}")
+            else:
+                # Référence valide et unique
+                final_reference = sale_data.reference
+                logger.info(f"📋 Utilisation de la référence fournie: {final_reference}")
         # Calcul des totaux en utilisant les prix du stock
         subtotal = Decimal('0')
         total_discount = Decimal('0')
@@ -486,7 +487,7 @@ async def create_sale(
             tenant_id=tenant_id,
             pharmacy_id=pharmacy.id,
             branch_id=final_branch_id,  # ← AJOUT DE LA BRANCHE !
-            reference=reference,
+            reference=final_reference,  
             customer_id=sale_data.customer_id,
             customer_name=client.nom_complet if client else sale_data.customer_name,
             customer_phone=client.telephone if client else sale_data.customer_phone,
@@ -1077,6 +1078,36 @@ async def get_last_invoice_number(
         "next_sequence": last_sequence + 1,
         "next_invoice": f"INV-{date_str}-{last_sequence + 1:04d}"
     }
+
+# ========================
+# FONCTIONS UTILITAIRES POUR LES RÉFÉRENCES UNIQUES
+# ========================
+
+async def generate_unique_reference(
+    db: Session,
+    tenant_id: UUID,
+    pharmacy_code: str,
+    max_attempts: int = 5
+) -> str:
+    """Génère une référence de vente unique"""
+    import uuid
+    from datetime import datetime
+    
+    for attempt in range(max_attempts):
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+        unique_suffix = str(uuid.uuid4().hex)[:8].upper()
+        reference = f"VNT-{timestamp}-{pharmacy_code}-{unique_suffix}"
+        
+        existing = db.query(Sale).filter(
+            Sale.reference == reference,
+            Sale.tenant_id == tenant_id
+        ).first()
+        
+        if not existing:
+            return reference
+    
+    # Fallback ultime
+    return f"VNT-{uuid.uuid4().hex.upper()}"
 # =======================
 # Endpoint: Impact des ventes sur le stock
 # =======================
