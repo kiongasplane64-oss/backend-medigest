@@ -121,6 +121,7 @@ class SaleCreate(BaseModel):
     global_discount: Decimal = Field(Decimal('0.00'), ge=0, le=100, max_digits=5, decimal_places=2)
     notes: Optional[str] = None
     invoice_number: Optional[str] = Field(None, max_length=50)
+    reference: Optional[str] = Field(None, max_length=100, description="Référence de la vente (optionnelle, générée automatiquement si non fournie)")
     items: List[SaleItemCreate]
     
     @computed_field
