@@ -262,11 +262,8 @@ app.add_middleware(TenantContextMiddleware)
 app.add_middleware(RateLimitMiddleware, request_limit=100, window_seconds=60)
 app.add_middleware(UnifiedAuthSubscriptionMiddleware)
 app.add_middleware(AuthMiddleware)
-app.add_middleware(
-    UnifiedAuthSubscriptionMiddleware,
-    use_cache=True,     # Activer le cache mémoire
-    cache_ttl=60        # Cache de 60 secondes
-)
+app.add_middleware(SubscriptionCheckMiddleware)
+app.add_middleware(SubscriptionMiddleware)
 
 
 # ===========================================================================
