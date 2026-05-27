@@ -410,7 +410,26 @@ async def create_sale(
         # Génération référence vente
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         pharmacy_code = getattr(pharmacy, 'pharmacy_code', 'PHARM')
-        reference = f"VNT-{timestamp}-{pharmacy_code}"
+        # si reference n'est pas fournie ou est vide
+        if not sale_data.reference or sale_data.reference.startswith("OFFLINE-"):
+            # Générer une référence unique
+            import uuid
+            unique_suffix = str(uuid.uuid4().hex)[:12].upper()
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+            pharmacy_code = getattr(pharmacy, 'pharmacy_code', 'PHARM')
+            reference = f"VNT-{timestamp}-{pharmacy_code}-{unique_suffix}"
+        else:
+            reference = sale_data.reference
+            # Vérifier l'unicité de la référence fournie
+            existing = db.query(Sale).filter(
+                Sale.reference == reference,
+                Sale.tenant_id == tenant_id
+            ).first()
+            if existing:
+                # Conflit - générer une nouvelle référence
+                unique_suffix = str(uuid.uuid4().hex)[:12].upper()
+                reference = f"VNT-{timestamp}-{pharmacy_code}-{unique_suffix}"
+                logger.warning(f"⚠️ Conflit référence {sale_data.reference}, nouvelle: {reference}")
 
         # Calcul des totaux en utilisant les prix du stock
         subtotal = Decimal('0')
